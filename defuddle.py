@@ -225,12 +225,15 @@ def yt_extra(url):
 def fetch_vtt(url, vid_id):
     """Fetch VTT transcript via yt-dlp, preferring manual captions over auto-generated.
     Returns parsed transcript_body string or None."""
-    vtt_path = f'/tmp/yt_{vid_id}.en.vtt'
+    import tempfile
+    tmp_dir = tempfile.gettempdir()
+    tmp_base = os.path.join(tmp_dir, f'yt_{vid_id}')
+    vtt_path = f'{tmp_base}.en.vtt'
     try:
         # Try manual captions first (better quality)
         subprocess.run(
             ['yt-dlp', '--write-sub', '--skip-download', '--sub-format', 'vtt',
-             '--sub-langs', 'en', '-o', f'/tmp/yt_{vid_id}', url],
+             '--sub-langs', 'en', '-o', tmp_base, url],
             capture_output=True, text=True, timeout=60
         )
         if os.path.exists(vtt_path):
@@ -242,7 +245,7 @@ def fetch_vtt(url, vid_id):
         # Fall back to auto-generated captions
         subprocess.run(
             ['yt-dlp', '--write-auto-sub', '--skip-download', '--sub-format', 'vtt',
-             '--sub-langs', 'en', '-o', f'/tmp/yt_{vid_id}', url],
+             '--sub-langs', 'en', '-o', tmp_base, url],
             capture_output=True, text=True, timeout=60
         )
         if os.path.exists(vtt_path):
@@ -255,7 +258,7 @@ def fetch_vtt(url, vid_id):
     except Exception:
         return None
     finally:
-        for f in glob.glob(f'/tmp/yt_{vid_id}.*'):
+        for f in glob.glob(f'{tmp_base}.*'):
             try:
                 os.unlink(f)
             except Exception:
