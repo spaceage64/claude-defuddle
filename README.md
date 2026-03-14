@@ -197,3 +197,7 @@ You can reinforce this in your own `~/.claude/CLAUDE.md` by adding:
 - **Transcripts** — the skill tries manual captions first (better quality), then falls back to auto-generated. Rolling-window caption artefacts (duplicated lines) are detected and removed automatically.
 - **YouTube chapters** — if the video has chapter markers, they're inserted as `###` headings into the transcript at the correct timestamps. If not and Gemini is configured, it generates logical chapter breaks from the transcript. Without Gemini, videos with no chapter markers will have no chapter headings.
 - **Tags** — hashtags found in YouTube descriptions are extracted and added to frontmatter. Gemini also contributes additional content-based tags.
+
+---
+
+![](https://i.imgur.com/c7X04yN.png)
