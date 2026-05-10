@@ -1,8 +1,8 @@
 # Defuddle — Claude Code Skill
 
-A [Claude Code](https://claude.ai/code) WebFetch replacement that extracts Markdown notes from web pages, YouTube videos, Apple podcasts, and academic papers, then saves them to your [Obsidian](https://obsidian.md) vault. Reduces token usage as Claude will only read the clean Markdown output (its native format!).
+A [Claude Code](https://claude.ai/code) WebFetch replacement that turns web pages, YouTube videos, Apple podcasts, and academic papers into clean Markdown notes and saves them to your [Obsidian](https://obsidian.md) vault. Token-efficient — Claude only ever sees the finished note.
 
-Just paste any URL into your conversation with Claude — that's it.
+Just paste any URL into your conversation. That's it.
 
 ![Example](img/example.png)
 
@@ -10,33 +10,33 @@ Just paste any URL into your conversation with Claude — that's it.
 
 ## What it does
 
-**Articles & docs** — strips ads and clutter from any web page, generates an AI summary, extracts a heading index, and saves a clean Obsidian note with full frontmatter. Utilises archival services for JavaScript-rendered pages. Saved to `{project}/docs/`.
+**Articles & docs** — strips ads and clutter, generates an AI summary, pulls a heading index, and saves a clean note with frontmatter. Falls back to Wayback Machine / archive.is for JS-rendered or paywalled pages.
 
-**YouTube videos** — fetches the full transcript with timestamps (linked back to the video), pulls chapter markers, generates a summary and description via AI, and saves a structured vault note. Saved to `{project}/transcripts/`.
+**YouTube videos** — fetches the full transcript with timestamps, inserts chapter markers, generates a summary and description, and saves a structured note.
 
-**Apple podcasts** — fetches the episode transcript with timestamps, generates a summary and chapter markers, and saves a structured note. Saved to `{project}/transcripts/`. (Currently no other podcast platforms are supported.)
+**Apple podcasts** — same as YouTube, but for podcast episodes. Reads the TTML transcript cached by the macOS Podcasts app. (No other podcast platforms supported for now.)
 
-**Academic papers** — accepts DOI URLs (`https://doi.org/...`) and arXiv abstract URLs (`https://arxiv.org/abs/...`). Fetches the paper PDF (trying open-access sources, optionally a shadow library), converts it to markdown via the Datalab API or local `marker_single`, and saves a structured note with abstract, keywords as tags, and bibliography. Saved to `{project}/papers/`.
+**Academic papers** — give it a DOI URL (`https://doi.org/...`) or arXiv abstract URL (`https://arxiv.org/abs/...`). It fetches the PDF, converts it to markdown, and saves a structured note with abstract, keywords as tags, and bibliography.
 
-**Images** — when enabled, all images referenced in a saved note are downloaded and localised into an `/img` subfolder, with optional lossy compression via `pngquant` and `jpegoptim`.
+All content saves to `{vault}/{project}/defuddle/`.
 
-All files are neatly stored in your Obsidian vault, so even with later use you can always refer back to it.
+**Images** — when enabled, images in saved notes are downloaded and stored in an `img/` subfolder next to the note, with optional compression via `pngquant` and `jpegoptim`.
 
 ---
 
 ### Why this is token-efficient
 
-Claude Code's built-in `WebFetch` tool fetches a page and dumps its content directly into Claude's context window — raw HTML, navigation, ads, footers and all. Claude then has to read through it to answer your question, burning tokens on noise.
+Claude Code's built-in `WebFetch` tool dumps raw page content — ads, navigation, footers and all — straight into Claude's context window. Claude then has to wade through it, burning tokens on noise.
 
-This skill offloads the heavy lifting to dedicated tools instead:
+This skill offloads that work to dedicated tools:
 
-- **Defuddle** runs outside Claude's context and strips the page down to just the article content before Claude ever sees it. Less noise, fewer tokens.
-- **yt-dlp** fetches and parses YouTube transcripts entirely in a subprocess. Claude never processes raw VTT.
-- **Datalab / marker_single** converts paper PDFs to markdown outside Claude's context. Claude never receives raw PDF content.
-- **The Python script** handles all note formatting — frontmatter, tag extraction, keyword detection, timestamp linking, heading index, image downloading — without Claude having to reason about any of it.
-- **The AI provider** Gemini, OpenAI, Ollama handles summarisation as a separate API call. Claude doesn't summarise the content itself, so a full article or transcript never needs to fit in its context window. Default model is Gemini free tier, so no costs. If disabled, a separate Claude model (e.g., efficient Haiku) is used as a fallback.
+- **Defuddle** strips pages down to just the article before Claude sees anything
+- **yt-dlp** handles YouTube transcripts entirely in a subprocess — no raw VTT in context
+- **Datalab / marker_single** converts PDFs to markdown outside Claude's context
+- **The Python script** handles all formatting — frontmatter, tags, timestamps, indexes, image downloading — without Claude reasoning about any of it
+- **A separate AI provider** (Gemini, OpenAI, Ollama) handles summarisation as its own API call, so a full article never needs to fit in Claude's context window. Default is Gemini free tier, so no cost. If not configured, it falls back to a Claude Haiku subprocess.
 
-Claude's role is minimal: trigger the skill, receive the finished note, write it to disk. The result is a richer, more structured output than Claude could produce on its own — at a fraction of the token cost.
+Claude's job is just: trigger the skill, get the finished note, write it to disk.
 
 ---
 
@@ -84,23 +84,23 @@ A concise AI-generated summary of the article's key points...
 | [Claude Code](https://claude.ai/code) | Runs the skill | See Claude docs |
 | [defuddle](https://github.com/kepano/defuddle) | Extracts clean content from web pages | `npm install -g defuddle` |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Downloads YouTube transcripts | `brew install yt-dlp` |
-| Python 3.8+ | Runs the formatting script | Pre-installed on macOS |
+| Python 3.9+ | Runs the formatting script | Pre-installed on macOS Ventura+ |
 | [Obsidian](https://obsidian.md) | Your note vault (optional) | See Obsidian site |
 
-**Optional — 3rd party AI enrichment** (summaries, tags, descriptions):
+**Optional — AI enrichment** (summaries, tags, descriptions):
 
 | Tool | Purpose | Install |
 |---|---|---|
 | Gemini API key | AI enrichment via Google (default) | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free tier available |
-| [Ollama](https://ollama.com) | Local AI enrichment (no key needed) | `brew install ollama` |
+| [Ollama](https://ollama.com) | Local AI, no key needed | `brew install ollama` |
 
- > **Note:** AI enrichment always runs — if no provider key is configured, the skill automatically falls back to the Claude fallback model (Haiku by default). Configuring a dedicated provider (e.g. a free tier Gemini model) is optional but recommended to avoid using Claude tokens.
+> **Note:** AI enrichment always runs. If you don't configure a provider, it falls back to a Claude CLI subprocess (Haiku by default). Setting up Gemini free tier is recommended to avoid spending Claude tokens on summaries.
 
 **Optional — PDF papers:**
 
 | Tool | Purpose | Install |
 |---|---|---|
-| Datalab API key | Cloud PDF→markdown conversion | [datalab.to](https://datalab.to) — free accounts get $10 in credits (costs 10-15 cents per paper) |
+| Datalab API key | Cloud PDF→markdown conversion | [datalab.to](https://datalab.to) — free accounts get $10 in credits (roughly 10–15 cents per paper) |
 | [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→markdown fallback | `pip install marker-pdf` |
 
 **Optional — image compression:**
@@ -133,19 +133,21 @@ So you end up with:
 
 ### 2. Set your vault path
 
-Open `defuddle.py` and set the `VAULT_PATH` setting near the top of the file to your Obsidian vault path (or wherever you want notes saved):
+Open `defuddle.py` and set the `VAULT_PATH` setting near the top of the file:
 
 ```python
 VAULT_PATH = '/your/path/to/obsidian/vault'
 ```
 
-### 3. Set up your projects registry (optional)
+This is where all notes get saved. It can be your Obsidian vault, or just any folder you want.
 
-By default, notes are saved under `{vault}/{project}/docs/` etc., where `{project}` is a folder name you tell Claude when saving.
+### 3. Tell Claude the project folder when saving
+
+When you want to save a note, just tell Claude which folder to use. Notes land at `{vault}/{project}/defuddle/`. The folder is created automatically if it doesn't exist.
 
 ### 4. Allow required tools in Claude Code settings
 
-Add these lines to your `~/.claude/settings.json` under `permissions.allow`:
+Add these to your `~/.claude/settings.json` under `permissions.allow`:
 
 ```json
 "Bash(defuddle **)",
@@ -153,7 +155,7 @@ Add these lines to your `~/.claude/settings.json` under `permissions.allow`:
 "Bash(python3 ~/.claude/**)"
 ```
 
-> **Note:** `defuddle **` uses a double wildcard because URLs contain `/` characters which a single `*` won't match. Or at least that's how it seems to work...
+> **Note:** `defuddle **` uses a double wildcard because URLs contain `/` characters which a single `*` won't match.
 
 Your full `settings.json` might look like:
 
@@ -174,11 +176,11 @@ Your full `settings.json` might look like:
 
 ## AI enrichment (optional)
 
-The skill supports multiple AI providers for generating summaries, descriptions, tags, and chapter markers. Configure your preferred provider in `defuddle.py` under `AI_LLM`:
+Configure your preferred AI provider in `defuddle.py` under `AI_LLM`.
 
 ### Gemini (default)
 
-1. Go to [Google AI Studio](https://aistudio.google.com/apikey) and create a free API key
+1. Grab a free API key at [Google AI Studio](https://aistudio.google.com/apikey)
 2. Open `~/.claude/CLAUDE.md` (create it if it doesn't exist) and add:
 
 ```markdown
@@ -187,9 +189,9 @@ The skill supports multiple AI providers for generating summaries, descriptions,
 - **Gemini**: `YOUR_GEMINI_API_KEY_HERE`
 ```
 
-Uses the Gemini API. By default, `defuddle.py` uses `gemini-3.1-flash-lite-preview`, which is compatible with the free tier, but you can set the `AI_MODEL` to anything you like. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for which models are compatible with the free tier.
+Default model is `gemini-3.1-flash-lite-preview`, which is on the free tier. You can swap it for any model you like via `AI_MODEL`. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for free tier eligibility.
 
-> **Note:** When not on the free tier, just remove the billing info and it will downgrade. The free tier is perfect for our use case!
+> **Note:** To go back to the free tier later, just remove your billing info — it downgrades automatically.
 
 ### OpenAI or compatible APIs
 
@@ -199,7 +201,7 @@ Set `AI_LLM = 'openai'` in `defuddle.py` and add your key to `~/.claude/CLAUDE.m
 - **OpenAI**: `YOUR_API_KEY_HERE`
 ```
 
-Set `AI_BASE_URL` to use any OpenAI-compatible endpoint instead of standard OpenAI:
+Set `AI_BASE_URL` to use any OpenAI-compatible endpoint:
 
 ```python
 AI_BASE_URL = 'https://api.groq.com/openai/v1'   # Groq
@@ -218,18 +220,18 @@ AI_MODEL = 'llama3.2'
 
 ### Claude CLI fallback
 
-If no API key is found or the configured provider fails, the skill automatically falls back to the Claude CLI. However, it will still run separately not taking tokens from your current session. Additionally, you can configure the fallback model with `AI_FALLBACK_MODEL` in `defuddle.py`. By default, it's set to use Haiku, which is much more token efficient than Sonnet/Opus.
+If no API key is found or the provider fails, the skill falls back to the Claude CLI — running as a separate process so it doesn't eat your current session's tokens. You can configure the fallback model with `AI_FALLBACK_MODEL` in `defuddle.py` (defaults to Haiku).
 
 ---
 
 ## Academic papers
 
-When given a DOI URL (e.g. `https://doi.org/10.48550/arXiv.1706.03762`), the skill:
+Given a DOI URL (e.g. `https://doi.org/10.48550/arXiv.1706.03762`), the skill:
 
-1. Tries to fetch the arXiv LaTeX source directly (best quality rendering)
-2. Falls back to the Datalab API for cloud PDF→markdown conversion
-3. Falls back to local `marker_single` if Datalab is unavailable
-4. Optionally tries a shadow library when access is restricted.
+1. Tries to fetch the arXiv LaTeX source directly (best quality)
+2. Falls back to the Datalab API for cloud PDF→markdown
+3. Falls back to local `marker_single` if Datalab isn't available
+4. Optionally tries a shadow library for restricted papers
 
 To enable Datalab, add your key to `~/.claude/CLAUDE.md`:
 
@@ -243,9 +245,7 @@ To configure a shadow library, set `SHADOW_BASE_URL` in `defuddle.py`:
 SHADOW_BASE_URL = 'https://your-shadow-library.example'
 ```
 
-Set it to `''` to disable.
-
-> **Note:** The shadown library has to support this url format for papers or they cannot be fetched: https://example.domain/10.1103/PhysRevB.57.6107
+Set it to `''` to disable. The shadow library needs to support this URL format: `https://example.domain/10.1103/PhysRevB.57.6107`
 
 ---
 
@@ -263,7 +263,7 @@ Just share a URL in your Claude Code conversation:
 
 > "Check out this podcast: https://podcasts.apple.com/us/podcast/restitutio/id1053137114?i=1000741998143"
 
-Claude will automatically use the defuddle skill. After fetching, it will ask if you'd like to save the note to your vault.
+Claude will automatically use the defuddle skill. After fetching, it'll ask if you want to save the note to your vault.
 
 ---
 
@@ -277,7 +277,7 @@ or any standard web content.
 DO NOT use WebFetch for these — use defuddle.
 ```
 
-You can reinforce this in your own `~/.claude/CLAUDE.md` by adding:
+You can reinforce this in your own `~/.claude/CLAUDE.md`:
 
 ```markdown
 ## Tools
@@ -289,9 +289,9 @@ You can reinforce this in your own `~/.claude/CLAUDE.md` by adding:
 
 ## Notes
 
-- **Platform** — designed and tested on **macOS**. Linux should work for articles, YouTube, and papers — all dependencies are available, but it's untested. Windows may work with Claude Code for Windows and the relevant tools installed, also untested. Apple Podcasts is macOS-only regardless (TTML transcripts are stored by the macOS Podcasts app).
+- **Platform** — designed and tested on macOS. Linux should work for articles, YouTube, and papers — all dependencies are available, but it's untested. Windows may work with Claude Code for Windows and the relevant tools installed, also untested. Apple Podcasts is macOS-only regardless (TTML transcripts are stored by the macOS Podcasts app).
 - **Transcripts** — the skill tries manual captions first (better quality), then falls back to auto-generated. Rolling-window caption artefacts (duplicated lines) are detected and removed automatically.
-- **YouTube chapters** — if the video has chapter markers, they're inserted as `###` headings into the transcript at the correct timestamps. If not, the AI generates logical chapter breaks.
-- **Tags** — hashtags in YouTube descriptions and keywords in paper abstracts are extracted and added to frontmatter. The AI also contributes additional content-based tags.
-- **Images** — when `ENABLE_IMAGES = True`, images are downloaded into an `img/` subfolder next to the note. Invalid responses are detected leaving the original URL in the note instead.
-- **Obsidian compatibility** — formatting has been adjusted to work well with Obsidian. There may be slight variations when viewing in other Markdown readers.
+- **YouTube chapters** — if the video has chapter markers, they're used directly. If not, the AI generates logical chapter breaks.
+- **Tags** — hashtags in YouTube descriptions and keywords in paper abstracts are extracted and added to frontmatter. The AI also adds content-based tags.
+- **Images** — when `ENABLE_IMAGES = True`, images are downloaded into an `img/` subfolder next to the note. Invalid responses (auth errors, HTML pages served as images) are detected and the original URL is kept instead.
+- **Obsidian compatibility** — formatting is tuned for Obsidian. May look slightly different in other Markdown readers.

@@ -37,10 +37,7 @@ python3 ~/.claude/skills/defuddle/defuddle.py \
 - `--filename`: optional override; script auto-generates from the title via AI if omitted
 - `--method`: force a specific fetch method instead of the auto-cascade (articles only)
 
-Notes are saved by source type under `{vault}/{folder}/`:
-- Articles → `{vault}/{folder}/docs/`
-- YouTube & Apple podcasts → `{vault}/{folder}/transcripts/`
-- Papers → `{vault}/{folder}/papers/`
+Notes are saved to `{vault}/{folder}/defuddle/` regardless of source type.
 
 The vault path is set via `VAULT_PATH` in `defuddle.py`. See README for setup.
 

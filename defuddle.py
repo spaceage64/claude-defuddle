@@ -5,7 +5,7 @@ Reads defuddle JSON from stdin, writes formatted markdown to stdout.
 
 Usage:
     defuddle parse "<url>" --json --md | python3 defuddle.py \
-        --url "<url>" --project "<project>" --category "<Category>" --created "YYYY-MM-DD"
+        --url "<url>" --project "<project>" --created "YYYY-MM-DD"
 """
 
 import sys, json, re, argparse, subprocess, os, html, glob, shutil, tempfile, time
@@ -83,6 +83,12 @@ AI_FALLBACK_MODEL = 'claude-haiku-4-5'
 # ║  Minimum word count to consider a fetch attempt successful. Few words        ║
 # ║  indicate and error and may trigger alternative processing methods.          ║
 MIN_WORDS = 25
+# ║                                                                              ║
+# ║  Filename word count — maximum number of words the AI uses when generating   ║
+# ║  a filename from a title. Papers prepend the first author's last name;       ║
+# ║  podcasts prepend a 1–2 word show slug. Both respect this setting for the    ║
+# ║  title portion.                                                              ║
+FILENAME_WORDS = 3
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 # Derived from AI_LLM — not user-configured.
@@ -516,6 +522,11 @@ def build_index(content, min_level=2):
     return '\n'.join(lines)
 
 
+def _toc_section(toc, heading='Contents'):
+    """Wrap a TOC block with a ## heading and trailing divider, for consistent note structure."""
+    return f'## {heading}\n\n{toc}\n\n---'
+
+
 def strip_title_suffix(title):
     """Strip trailing site-name suffix when title has 3+ parts (e.g. 'Page - Section - Site').
     Two-part titles like 'Commands - Developer Documentation' are kept as-is."""
@@ -607,10 +618,15 @@ def build_youtube(d, url, project, created, method=None):
 
     # Remove hashtags from description text
     desc = remove_desc_tags(desc)
+    # Remove standalone TOC header lines (e.g. "Chapters", "Timestamps") — we build our own index
+    desc = re.sub(r'(?im)^(index|contents|chapters|toc|timestamps)\s*$\n?', '', desc)
+    # Strip all blank lines — Obsidian renders line spacing natively
+    desc = '\n'.join(line for line in desc.splitlines() if line.strip())
 
     # Build Contents from chapter headings
     contents = build_index(transcript_body) or '[Chapters to be added]'
 
+    contents_section = _toc_section(contents)
     fm_description = ai_desc if ai_desc else '[Description to be added]'
     fm = build_frontmatter('video', project, created, all_tags, [
         frontmatter_field('title', title),
@@ -641,11 +657,7 @@ def build_youtube(d, url, project, created, method=None):
 
 {desc}
 
-## Contents
-
-{contents}
-
----
+{contents_section}
 
 ## Transcript
 
@@ -946,6 +958,7 @@ def build_apple_podcast(url, project, created, ttml_path):
         has_chapters = True
 
     contents = build_index(transcript_body) or '[Chapters to be added]'
+    contents_section = _toc_section(contents)
 
     # Frontmatter
     fm_description = ai_desc if ai_desc else '[Description to be added]'
@@ -978,11 +991,7 @@ def build_apple_podcast(url, project, created, ttml_path):
 {episode_art}
 {desc}
 
-## Contents
-
-{contents}
-
----
+{contents_section}
 
 ## Transcript
 
@@ -1960,35 +1969,102 @@ def _extract_paper_keywords(content):
     return content, keywords
 
 
-def _fix_paper_structure(content, title=''):
+def _fix_paper_structure(content, title='', authors=None):
     """Fix common structural issues in publisher-formatted (PDF-converted) papers:
+    - Strip content before the paper title (publisher headers, logos, etc.)
     - Remove duplicate title headings
-    - Remove publisher boilerplate lines (journal headers, copyright, ISSN, etc.)
+    - Move AI image descriptions into alt-text; keep real captions in the body
     - Normalise abstract heading to ## Abstract and move it to the top
     Returns cleaned content."""
-    # 1. Remove duplicate title headings (any level, case-insensitive)
+    # 0. Strip publisher preamble (headers, logos, author affiliations, download links, etc.)
+    #    Preferred anchor: the Abstract heading — it's the cleanest entry point and naturally
+    #    skips all the noise that appears between the title and the body of the paper.
+    #    Fallback: search for the paper title, then first author name.
+    anchor = None
+    abs_m = re.search(r'^#{1,4}\s+\*{0,3}Abstract\*{0,3}\s*$', content, re.IGNORECASE | re.MULTILINE)
+    if abs_m:
+        anchor = abs_m.start()
+    else:
+        needles = ([title] if title else []) + ([authors[0]] if authors else [])
+        for needle in needles:
+            m = re.search(re.escape(needle), content, re.IGNORECASE)
+            if m:
+                anchor = content.rfind('\n', 0, m.start()) + 1
+                break
+    if anchor:
+        content = content[anchor:]
+
+    # 1. Move AI-generated body paragraphs between images and their real captions into the
+    #    image alt-text. Datalab/marker emits AI descriptions both as alt-text AND as a
+    #    following body paragraph (which may differ). We merge both into the alt-text so the
+    #    AI still has full context while keeping the note body clean for human readers.
+    #    Format: "Description 1: {original alt} | Description 2: {body text}"
+    lines = content.split('\n')
+    # Shared vocabulary for figure/table label terms.
+    # Require bold markers (**) before the label — Datalab always bolds real captions;
+    # plain-text "Figure 2: ..." lines are AI duplicates and must not be treated as captions.
+    _cap_vocab   = r'fig(?:ure)?|tab(?:le)?|sch(?:eme)?|pl(?:ate)?|chart|diag(?:ram)?|panel|appendix|app'
+    caption_re   = re.compile(rf'(?mi)^\W*\*+(?:{_cap_vocab})\.?\s*\d')
+    # Strip a leading bold caption label (e.g. "**Fig. 2.**") from the start of a line.
+    cap_label_re = re.compile(rf'^\W*\*+(?:{_cap_vocab})[\w.\s]*?\*+\s*', re.IGNORECASE)
+    line_updates   = {}   # line index -> replacement string
+    lines_to_remove = set()
+    img_re = re.compile(r'^(!\[)(.*?)(\]\([^)]+\))\s*$')
+    for i, line in enumerate(lines):
+        img_m = img_re.match(line)
+        if not img_m:
+            continue
+        # Find the first bolded real caption within 15 lines
+        cap_idx = None
+        for j in range(i + 1, min(i + 16, len(lines))):
+            if caption_re.search(lines[j]):
+                cap_idx = j
+                break
+        if cap_idx is None:
+            continue
+        # Collect all non-empty lines between image and caption (AI-generated; remove from body).
+        body_lines   = [lines[j].strip() for j in range(i + 1, cap_idx) if lines[j].strip()]
+        body_indices = [j                for j in range(i + 1, cap_idx) if lines[j].strip()]
+        # Also include the real caption text in the alt-text (keep it in the body too).
+        # Strip the leading bold figure label (e.g. "**Fig. 2.**") — just keep the description.
+        cap_text = cap_label_re.sub('', lines[cap_idx].strip()).strip()
+        # Merge all sources: original alt-text + AI body paragraphs + real caption.
+        # Deduplicate by normalised content (backslash escapes stripped for comparison).
+        orig_alt  = img_m.group(2).strip()
+        all_descs = ([orig_alt] if orig_alt else []) + body_lines + [cap_text]
+        seen_norm = set()
+        unique    = []
+        for desc in all_descs:
+            norm = re.sub(r'\\(.)', r'\1', desc)
+            if norm not in seen_norm:
+                seen_norm.add(norm)
+                unique.append(desc)
+        if len(unique) > 1:
+            parts   = [f'Description {n}: {desc}' for n, desc in enumerate(unique, start=1)]
+            new_alt = ' | '.join(parts)
+            line_updates[i] = f'{img_m.group(1)}{new_alt}{img_m.group(3)}'
+        for j in body_indices:
+            lines_to_remove.add(j)
+    if line_updates or lines_to_remove:
+        content = '\n'.join(
+            line_updates.get(i, l)
+            for i, l in enumerate(lines)
+            if i not in lines_to_remove
+        )
+
+    # 2. Remove duplicate title headings (any level, case-insensitive).
+    #    Strip markdown bold/italic markers before comparing so "# **Title**" matches "Title".
     if title:
-        title_norm = re.sub(r'\s+', ' ', title.strip().lower())
+        _strip_md = lambda t: re.sub(r'[*_`]', '', t)
+        title_norm = re.sub(r'\s+', ' ', _strip_md(title).strip().lower())
         def _drop_dup_title(m):
-            heading_text = re.sub(r'\s+', ' ', m.group(1).strip().lower())
+            heading_text = re.sub(r'\s+', ' ', _strip_md(m.group(1)).strip().lower())
             return '' if heading_text == title_norm else m.group(0)
         content = re.sub(r'^#{1,4}\s+(.+?)\s*$', _drop_dup_title, content, flags=re.MULTILINE)
 
-    # 2. Strip publisher boilerplate lines
-    BOILERPLATE = re.compile(
-        r'(?i)('
-        r'journal\s+homepage|Available\s+online\s+at'
-        r'|ISSN\s*[\d -]{4,}|©\s*\d{4}'
-        r'|www\.\w[\w.]+/locate/\w'
-        r'|Elsevier\s+B\.?V\.?|ScienceDirect'
-        r')'
-    )
-    lines = content.split('\n')
-    content = '\n'.join(l for l in lines if not BOILERPLATE.search(l))
-
     # 3. Normalise abstract heading and move it to the top of the content
     abs_m = re.search(
-        r'^(#{1,4})\s+Abstract\s*\n+(.*?)(?=\n#{1,4}\s|\Z)',
+        r'^(#{1,4})\s+\*{0,3}Abstract\*{0,3}\s*\n+(.*?)(?=\n#{1,4}\s|\Z)',
         content, re.DOTALL | re.MULTILINE | re.IGNORECASE
     )
     if abs_m:
@@ -2150,7 +2226,7 @@ def build_paper(url, project, created):
 
     # If the LaTeX source provided an abstract (Elsevier frontmatter etc.), prepend it
     abstract_text = meta.get('abstract', '')
-    if abstract_text and not re.search(r'#{1,4}\s+Abstract\b', content, re.IGNORECASE):
+    if abstract_text and not re.search(r'#{1,4}\s+\*{0,3}Abstract\*{0,3}\b', content, re.IGNORECASE):
         content = f'## Abstract\n\n{abstract_text}\n\n' + content
     # Normalise abstract heading: "--- Abstract" → "Abstract"
     content = re.sub(r'^(#{1,4})\s*---\s*Abstract', r'\1 Abstract', content,
@@ -2158,8 +2234,8 @@ def build_paper(url, project, created):
     # Fix reference list items: "- [N] " → "[N] " (prevents Obsidian checkbox rendering)
     content = re.sub(r'^- (\[\d+\] )', r'\1', content, flags=re.MULTILINE)
 
-    # Fix paper structure: remove duplicate titles, publisher boilerplate, move abstract to top
-    content = _fix_paper_structure(content, meta.get('title', ''))
+    # Fix paper structure: strip pre-title content, remove duplicate titles, move abstract to top
+    content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []))
     # Extract keywords from content (removed from body, added as tags below)
     content, paper_keywords = _extract_paper_keywords(content)
 
@@ -2184,14 +2260,14 @@ def build_paper(url, project, created):
         content = re.sub(r'\[(' + _keys_pat + r')([\s,][^\]]+)?\]', _replace_cite, content)
 
     # Build TOC from headings after abstract only, insert before first post-abstract section
-    abstract_end_m = re.search(r'#{1,4}\s+Abstract\b[^\n]*\n', content, re.IGNORECASE)
+    abstract_end_m = re.search(r'#{1,4}\s+\*{0,3}Abstract\*{0,3}[^\n]*\n', content, re.IGNORECASE)
     toc_source = content[abstract_end_m.end():] if abstract_end_m else content
     toc = build_index(toc_source, min_level=1)
     if toc:
-        next_sec = re.search(r'\n(#{1,4}\s+(?!Abstract\b))', content, re.IGNORECASE)
+        next_sec = re.search(r'\n(#{1,4}\s+(?!\*{0,3}Abstract\b))', content, re.IGNORECASE)
         if next_sec:
             ins = next_sec.start(1)
-            content = content[:ins] + f'## Contents\n\n{toc}\n\n' + content[ins:]
+            content = content[:ins] + _toc_section(toc) + '\n\n' + content[ins:]
 
     published = meta.get('published', '')
     journal   = meta.get('journal', '')
@@ -2268,7 +2344,7 @@ def build_article(d, url, project, created, method=None):
     ])
     summary = ai_summary if ai_summary else '[Summary to be added]'
 
-    index_section = f'\n## Index\n\n{index}\n\n---\n' if index else '\n---\n'
+    index_section = ('\n' + _toc_section(index, 'Index') + '\n') if index else '\n---\n'
 
     return f"""{fm}
 
@@ -2285,35 +2361,31 @@ def build_article(d, url, project, created, method=None):
 
 
 def get_vault_path():
-    """Return vault path: VAULT_PATH setting > projects.yaml > ~/Documents/Obsidian."""
+    """Return vault path: VAULT_PATH setting > ~/Documents/Obsidian."""
     if VAULT_PATH:
         return os.path.expanduser(VAULT_PATH)
-    try:
-        content = open(os.path.expanduser('~/.claude/projects.yaml')).read()
-        m = re.search(r'path:\s*(.+)', content)
-        return m.group(1).strip() if m else os.path.expanduser('~/Documents/Obsidian')
-    except Exception:
-        return os.path.expanduser('~/Documents/Obsidian')
+    return os.path.expanduser('~/Documents/Obsidian')
 
 
-def get_save_dir(vault, category, project, subdir):
-    """Build save directory path. category is optional."""
-    parts = [vault] + ([category] if category else []) + [project, subdir]
+def get_save_dir(vault, project):
+    """Build save directory path. project is optional."""
+    parts = [vault] + ([project] if project else []) + ['defuddle']
     return os.path.join(*parts)
 
 
-def format_saved_path(category, project, subdir, filename):
+def format_saved_path(project, filename):
     """Format the 'Saved to ...' confirmation string."""
-    parts = ([category] if category else []) + [project, subdir, filename]
+    parts = ([project] if project else []) + ['defuddle', filename]
     return '/'.join(parts)
 
 
-def generate_filename(title, word_count='2-3'):
+def generate_filename(title, max_words=None):
     """Generate a kebab-case filename from a title using the configured AI provider.
     Falls back to filtering title words by length if the AI call fails."""
     import urllib.request as _urlreq
 
-    ai_prompt = f'Give me a {word_count} word kebab-case filename (no extension) for an article titled "{title}". Return ONLY the filename, nothing else.'
+    n = max_words or FILENAME_WORDS
+    ai_prompt = f'Give me a 1 to {n} word kebab-case filename (no extension) for an article titled "{title}". Return ONLY the filename, nothing else.'
 
     def _clean(raw):
         name = raw.strip().lower().splitlines()[0]
@@ -2456,7 +2528,7 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
     import base64 as b64mod
     VALID_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.avif'}
     def _norm_ext(e): return '.jpg' if e == '.jpeg' else e
-    pattern = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+    pattern = re.compile(r'!\[(.*?)\]\(([^)]+)\)', re.DOTALL)
     if not pattern.search(content):
         return content
 
@@ -2840,20 +2912,24 @@ def fetch_for_method(url, method):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--url',      required=True)
+    parser.add_argument('url_pos',    nargs='?', default=None, metavar='URL')
+    parser.add_argument('--url',      default=None)
     parser.add_argument('--project',  default=None)
-    parser.add_argument('--category', default=None)
     parser.add_argument('--created',  default=None)
     parser.add_argument('--filename', default=None)
     parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'googlebot', 'wayback', 'archive-is'])
     args = parser.parse_args()
 
+    raw_url = args.url or args.url_pos
+    if not raw_url:
+        parser.error('URL required as first argument or via --url')
+
     _is_special = (
-        (ENABLE_PAPER   and is_doi_url(args.url)) or
-        (ENABLE_PODCAST and is_apple_podcast(args.url)) or
-        (ENABLE_YOUTUBE and is_youtube(args.url))
+        (ENABLE_PAPER   and is_doi_url(raw_url)) or
+        (ENABLE_PODCAST and is_apple_podcast(raw_url)) or
+        (ENABLE_YOUTUBE and is_youtube(raw_url))
     )
-    url = args.url if _is_special else clean_url(args.url)
+    url = raw_url if _is_special else clean_url(raw_url)
 
     # Normalize DOI URLs to canonical https://doi.org/{doi} form (strip dx., www., etc.)
     if ENABLE_PAPER and is_doi_url(url) and 'arxiv.org' not in url:
@@ -2869,17 +2945,20 @@ def main():
             return
         note, images_dict, meta = build_paper(url, args.project, args.created)
         title    = meta.get('title', '')
-        filename = args.filename or generate_filename(title, word_count='3-4')
+        authors  = meta.get('authors', [])
+        last_name = re.sub(r'[^a-z0-9]+', '-', authors[0].split()[-1].lower()).strip('-') if authors else ''
+        ai_name  = generate_filename(title)
+        filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
         vault    = get_vault_path()
-        papers_dir = get_save_dir(vault, args.category, args.project, 'papers')
-        os.makedirs(papers_dir, exist_ok=True)
+        save_dir = get_save_dir(vault, args.project)
+        os.makedirs(save_dir, exist_ok=True)
         if ENABLE_IMAGES:
-            note = download_images(note, papers_dir, filename, images_dict=images_dict, source_url=url)
+            note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=url)
         note = _dedup_note_tags(note)
-        out_path = os.path.join(papers_dir, f'{filename}.md')
+        out_path = os.path.join(save_dir, f'{filename}.md')
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write(note)
-        print(f'Saved to {format_saved_path(args.category, args.project, "papers", filename)}')
+        print(f'Saved to {format_saved_path(args.project, filename)}')
         return
 
     # Apple Podcasts: local TTML transcript, no HTTP cascade needed
@@ -2911,18 +2990,19 @@ def main():
         title = meta.get('title', '')
         # Strip words containing digits (e.g. "S10E5", "256") from episode title
         cleaned_title = ' '.join(w for w in title.split() if not re.search(r'\d', w)).strip()
-        combined = f'{show}: {cleaned_title}' if show and cleaned_title else show or cleaned_title or title
-        filename = args.filename or generate_filename(combined, word_count='3-4')
+        show_slug  = generate_filename(show, max_words=2) if show else ''
+        ep_slug    = generate_filename(cleaned_title or title)
+        filename   = args.filename or (f'{show_slug}-{ep_slug}' if show_slug else ep_slug)
         vault    = get_vault_path()
-        transcripts_dir = get_save_dir(vault, args.category, args.project, 'transcripts')
-        os.makedirs(transcripts_dir, exist_ok=True)
+        save_dir = get_save_dir(vault, args.project)
+        os.makedirs(save_dir, exist_ok=True)
         if ENABLE_IMAGES:
-            note = download_images(note, transcripts_dir, filename, source_url=url)
+            note = download_images(note, save_dir, filename, source_url=url)
         note = _dedup_note_tags(note)
-        out_path = os.path.join(transcripts_dir, f'{filename}.md')
+        out_path = os.path.join(save_dir, f'{filename}.md')
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write(note)
-        print(f'Saved to {format_saved_path(args.category, args.project, "transcripts", filename)}')
+        print(f'Saved to {format_saved_path(args.project, filename)}')
         return
 
     if args.method:
@@ -2996,9 +3076,8 @@ def main():
     title = d.get('title', '') or title_from_content(d.get('content', ''))
     filename = args.filename or generate_filename(title)
 
-    vault   = get_vault_path()
-    subdir  = 'transcripts' if is_youtube(url) else 'docs'
-    save_dir = get_save_dir(vault, args.category, args.project, subdir)
+    vault    = get_vault_path()
+    save_dir = get_save_dir(vault, args.project)
     os.makedirs(save_dir, exist_ok=True)
     if ENABLE_IMAGES:
         note = download_images(note, save_dir, filename, source_url=url)
@@ -3006,7 +3085,7 @@ def main():
     out_path = os.path.join(save_dir, f'{filename}.md')
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(note)
-    print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
+    print(f'Saved to {format_saved_path(args.project, filename)}')
 
 
 if __name__ == '__main__':
