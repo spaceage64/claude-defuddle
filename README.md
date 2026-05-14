@@ -32,7 +32,7 @@ This skill offloads that work to dedicated tools:
 
 - **Defuddle** strips pages down to just the article before Claude sees anything
 - **yt-dlp** handles YouTube transcripts entirely in a subprocess — no raw VTT in context
-- **Datalab / marker_single** converts PDFs to markdown outside Claude's context
+- **Datalab / Marker** converts PDFs to markdown outside Claude's context
 - **The Python script** handles all formatting — frontmatter, tags, timestamps, indexes, image downloading — without Claude reasoning about any of it
 - **A separate AI provider** (Gemini, OpenAI, Ollama) handles summarisation as its own API call, so a full article never needs to fit in Claude's context window. Default is Gemini free tier, so no cost. If not configured, it falls back to a Claude Haiku subprocess.
 
@@ -189,7 +189,7 @@ Configure your preferred AI provider in `defuddle.py` under `AI_LLM`.
 - **Gemini**: `YOUR_GEMINI_API_KEY_HERE`
 ```
 
-Default model is `gemini-3.1-flash-lite-preview`, which is on the free tier. You can swap it for any model you like via `AI_MODEL`. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for free tier eligibility.
+Default model is `gemini-3.1-flash-lite`, which is on the free tier. You can swap it for any model you like via `AI_MODEL`. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for free tier eligibility.
 
 > **Note:** To go back to the free tier later, just remove your billing info — it downgrades automatically.
 
@@ -230,7 +230,7 @@ Given a DOI URL (e.g. `https://doi.org/10.48550/arXiv.1706.03762`), the skill:
 
 1. Tries to fetch the arXiv LaTeX source directly (best quality)
 2. Falls back to the Datalab API for cloud PDF→markdown
-3. Falls back to local `marker_single` if Datalab isn't available
+3. Falls back to local [Marker](https://github.com/VikParuchuri/marker) if Datalab isn't available
 4. Optionally tries a shadow library for restricted papers
 
 To enable Datalab, add your key to `~/.claude/CLAUDE.md`:

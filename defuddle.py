@@ -71,7 +71,7 @@ DATALAB_API_KEY = _apikey('Datalab')
 # ║    'ollama' — Local Ollama server (no key needed). https://ollama.com        ║
 # ║               Set AI_MODEL to any pulled model, e.g. llama3.2                ║
 AI_LLM      = 'gemini'
-AI_MODEL    = 'gemini-3.1-flash-lite-preview'
+AI_MODEL    = 'gemini-3.1-flash-lite'
 AI_BASE_URL = ''
 # ║                                                                              ║
 # ║  Claude fallback model (used when AI provider fails or has no key).          ║
