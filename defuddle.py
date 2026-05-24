@@ -34,9 +34,10 @@ VAULT_PATH = ''
 ENABLE_YOUTUBE  = True
 ENABLE_PODCAST  = True
 ENABLE_PAPER    = True
+ENABLE_PDF      = True   # Enables plain PDF URL support
 # ║                                                                              ║
-# ║  Shadow library — URL for fetching paywalled papers by DOI.                  ║
-# ║  Set to '' to disable. Example: 'https://shadow-library-domain-here.box'     ║
+# ║  Shadow library — Optional shadow library base URL for paywalled papers      ║
+# ║  (e.g. https://sci-hub.example). Set to '' to disable.                       ║
 SHADOW_BASE_URL = ''
 # ║                                                                              ║
 # ║  Images — download and localise images into a /img subfolder.                ║
@@ -47,11 +48,19 @@ ENABLE_IMAGES            = True
 # ║  jpegoptim: re-encodes only if quality > 85; strips metadata.                ║
 ENABLE_IMAGE_COMPRESSION = True
 # ║                                                                              ║
-# ║  Datalab — converts paper PDFs to markdown (fallback: local marker_single)   ║
+# ║  Datalab — converts paper PDFs to markdown via cloud API.                    ║
 # ║  Get key at https://datalab.to — free accounts get $10 in credits.           ║
-# ║  Costs are about 10-15 cents per paper. Local fallback is free               ║
+# ║  Costs are about 10-15 cents per paper.                                      ║
 # ║  Add to ~/.claude/CLAUDE.md:  **Datalab**: `your-api-key`                    ║
 DATALAB_API_KEY = _apikey('Datalab')
+# ║                                                                              ║
+# ║  PDF processor — which method(s) to use when converting PDFs to markdown.    ║
+# ║  Local uses marker-pdf (install with: pipx install marker-pdf).              ║
+# ║    'local_first'   — local marker, fall back to Datalab if unavailable       ║
+# ║    'datalab_first' — Datalab API, fall back to local marker if it fails      ║
+# ║    'local'         — local marker only (ignores Datalab key)                 ║
+# ║    'datalab'       — Datalab API only (no local fallback)                    ║
+PDF_PROCESSOR = 'local_first'
 # ║                                                                              ║
 # ║  AI enrichment — provider for summaries, tags, chapters, and filenames.      ║
 # ║  Always falls back to Claude CLI if the provider fails or has no key.        ║
@@ -507,13 +516,16 @@ def _heading_display(title):
 
 def build_index(content, min_level=2):
     """Build a nested index from markdown headings, indented relative to the shallowest level."""
-    headings = re.findall(r'^(#{' + str(min_level) + r',4})\s+(.+)$', content, re.MULTILINE)
+    headings = re.findall(r'^(#{' + str(min_level) + r',6})\s+(.+)$', content, re.MULTILINE)
     if not headings:
         return None
-    base_level = min(len(h) for h, _ in headings)
+    # Map distinct heading levels to 0, 2, 4... spaces, but cap at 2 to avoid
+    # the 4-space indented code block rendering bug in CommonMark/Obsidian.
+    distinct_levels = sorted(set(len(h) for h, _ in headings))
+    level_to_indent = {lvl: min(i * 2, 2) for i, lvl in enumerate(distinct_levels)}
     lines = []
     for hashes, title in headings:
-        indent = '  ' * (len(hashes) - base_level)
+        indent = ' ' * level_to_indent[len(hashes)]
         display = _heading_display(title)
         if display != title:
             lines.append(f'{indent}- [[#{title}|{display}]]')
@@ -1003,9 +1015,77 @@ def build_apple_podcast(url, project, created, ttml_path):
 # Academic paper support (DOI / arXiv)
 # ---------------------------------------------------------------------------
 
-def is_doi_url(url):
-    return bool(re.match(r'https?://(dx\.)?doi\.org/', url)) or \
-           bool(re.match(r'https?://(www\.)?arxiv\.org/abs/', url))
+def is_pdf_url(url):
+    """True for URLs or local paths ending in .pdf that aren't already handled as papers."""
+    path = url if os.path.isabs(url) else urlparse(url).path
+    return path.lower().endswith('.pdf') and not is_paper_url(url)
+
+def extract_doi_from_pdf_text(text):
+    """Scan text (e.g. first PDF page) for a DOI. Returns the bare DOI string or None."""
+    # Match URL-formatted DOIs first (doi.org/..., dx.doi.org/...), then plain 10.xxxx/...
+    patterns = [
+        r'https?://(?:dx\.)?doi\.org/(10[.][0-9]{4,}(?:[.][0-9]+)*/(?:(?!["&\'<>])\S)+)',
+        r'\b(10[.][0-9]{4,}(?:[.][0-9]+)*/(?:(?!["&\'<>])\S)+)\b',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).rstrip('.,;')
+    return None
+
+def is_paper_url(url):
+    return (
+        bool(re.match(r'https?://(dx\.)?doi\.org/', url)) or
+        bool(re.match(r'https?://(www\.)?arxiv\.org/abs/', url)) or
+        is_shadow_url(url) or
+        is_ssrn_url(url) or
+        is_academia_url(url)
+    )
+
+def is_academia_url(url):
+    return bool(re.match(r'https?://(www\.)?academia\.edu/\d+', url))
+
+def is_ssrn_url(url):
+    return bool(re.search(r'ssrn\.com.*(abstract_id|abstract)=(\d+)', url, re.IGNORECASE))
+
+def extract_ssrn_doi(url):
+    m = re.search(r'(?:abstract_id|abstract)=(\d+)', url, re.IGNORECASE)
+    return f'10.2139/ssrn.{m.group(1)}' if m else None
+
+def extract_academia_pdf_url(url):
+    """Fetch an Academia.edu page and return (pdf_url, doi). Either may be None."""
+    result = subprocess.run(
+        ['curl', '-sL', '--max-time', '15', '-A',
+         'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+         url],
+        capture_output=True, timeout=20
+    )
+    html = result.stdout.decode('utf-8', errors='replace')
+    pdf_url = None
+    for pattern in [
+        r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']citation_pdf_url["\']',
+        r'"pdf_url"\s*:\s*"([^"]+)"',
+        r'href=["\']([^"\']+\.pdf(?:[^"\']*)?)["\']',
+    ]:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            pdf_url = m.group(1)
+            break
+    doi = None
+    m = re.search(r'<meta[^>]+name=["\']citation_doi["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if not m:
+        m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']citation_doi["\']', html, re.IGNORECASE)
+    if m:
+        doi = m.group(1).strip()
+    return pdf_url, doi
+
+def is_shadow_url(url):
+    return bool(SHADOW_BASE_URL) and url.startswith(SHADOW_BASE_URL.rstrip('/'))
+
+def extract_doi_from_shadow(url):
+    path = url[len(SHADOW_BASE_URL.rstrip('/')):].lstrip('/')
+    return path if path.startswith('10.') else None
 
 def extract_doi(url):
     m = re.match(r'https?://(?:dx\.)?doi\.org/(.+)', url)
@@ -1576,13 +1656,13 @@ def fetch_shadow_pdf(doi, tmp_dir):
     return None
 
 def pdf_to_markdown(pdf_path):
-    """Convert a PDF to markdown + images dict.
+    """Convert a PDF to markdown + images dict via PDF_PROCESSOR setting.
 
-    Tries Datalab Marker API first, falls back to local marker_single.
-    Returns (markdown_str, images_dict).
+    Returns (markdown_str, images_dict, method_name).
     """
-    # ── Datalab API ───────────────────────────────────────────────────────────
-    if DATALAB_API_KEY:
+    def _try_datalab():
+        if not DATALAB_API_KEY:
+            return None
         print('Converting PDF via Datalab Marker API...', file=sys.stderr)
         result = subprocess.run(
             ['curl', '-sL', '-X', 'POST',
@@ -1606,67 +1686,79 @@ def pdf_to_markdown(pdf_path):
                     )
                     status = json.loads(poll.stdout.decode('utf-8', errors='replace'))
                     if status.get('status') == 'complete':
-                        return status.get('markdown', ''), status.get('images', {})
+                        return status.get('markdown', ''), status.get('images', {}), 'datalab'
                     if status.get('status') == 'failed':
-                        print(f'Datalab failed: {status.get("error", "")} — falling back to local marker...', file=sys.stderr)
-                        break
-                else:
-                    print('Datalab timed out — falling back to local marker...', file=sys.stderr)
+                        print(f'Datalab failed: {status.get("error", "")}', file=sys.stderr)
+                        return None
+                print('Datalab timed out.', file=sys.stderr)
             else:
-                print(f'Datalab error: {data.get("error", "no request URL")} — falling back to local marker...', file=sys.stderr)
+                print(f'Datalab error: {data.get("error", "no request URL")}', file=sys.stderr)
         except Exception as e:
-            print(f'Datalab error: {e} — falling back to local marker...', file=sys.stderr)
+            print(f'Datalab error: {e}', file=sys.stderr)
+        return None
 
-    # ── Local marker_single ───────────────────────────────────────────────────
-    if not shutil.which('marker_single'):
+    def _try_local():
+        if not shutil.which('marker_single'):
+            return None
+        _MARKER_LLM = {
+            'gemini': ('marker.services.gemini.GoogleGeminiService', '--gemini_api_key'),
+            'openai': ('marker.services.openai.OpenAIService',       '--openai_api_key'),
+            'claude': ('marker.services.claude.ClaudeService',       '--claude_api_key'),
+            'ollama': ('marker.services.ollama.OllamaService',       None),
+        }
+        marker_service, key_flag = _MARKER_LLM.get(AI_LLM, (None, None))
+        use_llm = bool(marker_service and (AI_API_KEY or AI_LLM == 'ollama'))
+        with tempfile.TemporaryDirectory() as out_dir:
+            cmd = ['marker_single', pdf_path, '--output_dir', out_dir, '--output_format', 'markdown']
+            if use_llm:
+                cmd += ['--use_llm', '--llm_service', marker_service]
+                if key_flag and AI_API_KEY:
+                    cmd += [key_flag, AI_API_KEY]
+                print(f'Running local marker (with {AI_LLM} LLM)...', file=sys.stderr)
+            else:
+                print('Running local marker...', file=sys.stderr)
+            subprocess.run(cmd, capture_output=True, timeout=3600)
+            md_files = glob.glob(os.path.join(out_dir, '**', '*.md'), recursive=True)
+            if not md_files:
+                return None
+            with open(md_files[0], encoding='utf-8') as f:
+                markdown = f.read()
+            import base64 as _b64
+            _IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+            images_dict = {}
+            for img_file in glob.glob(os.path.join(out_dir, '**', '*'), recursive=True):
+                if os.path.splitext(img_file)[1].lower() in _IMG_EXT:
+                    try:
+                        with open(img_file, 'rb') as f:
+                            images_dict[os.path.basename(img_file)] = _b64.b64encode(f.read()).decode()
+                    except Exception:
+                        pass
+            return markdown, images_dict, 'marker'
+
+    if PDF_PROCESSOR == 'local':
+        result = _try_local()
+    elif PDF_PROCESSOR == 'datalab':
+        result = _try_datalab()
+    elif PDF_PROCESSOR == 'local_first':
+        result = _try_local()
+        if result is None:
+            print('Local marker unavailable — falling back to Datalab...', file=sys.stderr)
+            result = _try_datalab()
+    else:  # datalab_first
+        result = _try_datalab()
+        if result is None:
+            print('Datalab unavailable — falling back to local marker...', file=sys.stderr)
+            result = _try_local()
+
+    if result is None:
         print(
-            'PDF conversion requires either a Datalab API key or local marker.\n'
-            'Install with: pip install marker-pdf',
+            'PDF conversion failed. Install local marker with: pipx install marker-pdf\n'
+            'Or set a Datalab API key in ~/.claude/CLAUDE.md.',
             file=sys.stderr
         )
-        return '', {}
+        return '', {}, ''
 
-    # Map AI_LLM to marker's --llm_service and key flag
-    _MARKER_LLM = {
-        'gemini': ('marker.services.gemini.GoogleGeminiService', '--gemini_api_key'),
-        'openai': ('marker.services.openai.OpenAIService',       '--openai_api_key'),
-        'claude': ('marker.services.claude.ClaudeService',       '--claude_api_key'),
-        'ollama': ('marker.services.ollama.OllamaService',       None),
-    }
-    marker_service, key_flag = _MARKER_LLM.get(AI_LLM, (None, None))
-    use_llm = bool(marker_service and (AI_API_KEY or AI_LLM == 'ollama'))
-
-    with tempfile.TemporaryDirectory() as out_dir:
-        cmd = ['marker_single', pdf_path, '--output_dir', out_dir, '--output_format', 'markdown']
-        if use_llm:
-            cmd += ['--use_llm', '--llm_service', marker_service]
-            if key_flag and AI_API_KEY:
-                cmd += [key_flag, AI_API_KEY]
-            print(f'Running local marker (with {AI_LLM} LLM)...', file=sys.stderr)
-        else:
-            print('Running local marker...', file=sys.stderr)
-
-        subprocess.run(cmd, capture_output=True, timeout=600)
-
-        md_files = glob.glob(os.path.join(out_dir, '**', '*.md'), recursive=True)
-        if not md_files:
-            return '', {}
-
-        with open(md_files[0], encoding='utf-8') as f:
-            markdown = f.read()
-
-        import base64 as _b64
-        _IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-        images_dict = {}
-        for img_file in glob.glob(os.path.join(out_dir, '**', '*'), recursive=True):
-            if os.path.splitext(img_file)[1].lower() in _IMG_EXT:
-                try:
-                    with open(img_file, 'rb') as f:
-                        images_dict[os.path.basename(img_file)] = _b64.b64encode(f.read()).decode()
-                except Exception:
-                    pass
-
-        return markdown, images_dict
+    return result
 
 def _latex_braced_arg(content, cmd):
     """Extract the content of \\cmd{...} with proper nested-brace handling."""
@@ -2202,10 +2294,9 @@ def build_paper(url, project, created):
                     file=sys.stderr
                 )
                 sys.exit(1)
-            content, images_dict = pdf_to_markdown(pdf_path)
+            content, images_dict, method = pdf_to_markdown(pdf_path)
             if content:
                 content = fix_paper_markdown(content)
-                method  = 'datalab'
 
     if not content:
         print('Failed to extract paper content.', file=sys.stderr)
@@ -2296,6 +2387,92 @@ def build_paper(url, project, created):
     heading = f'# {title}' if title else ''
     parts   = [fm] + ([heading] if heading else []) + [content]
     return '\n\n'.join(parts), images_dict, meta
+
+
+def build_pdf(url, project, created, skip_doi=False):
+    """Download (or copy) a plain PDF and build an Obsidian note."""
+    local_path = url if os.path.isabs(url) else None
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        pdf_name = os.path.basename(url) or 'document.pdf'
+        if not pdf_name.lower().endswith('.pdf'):
+            pdf_name += '.pdf'
+        pdf_path = os.path.join(tmp_dir, pdf_name)
+        if local_path:
+            import shutil as _shutil
+            _shutil.copy2(local_path, pdf_path)
+        else:
+            print('Downloading PDF...', file=sys.stderr)
+            subprocess.run(
+                ['curl', '-sL', '-o', pdf_path, url],
+                capture_output=True, timeout=120
+            )
+        if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 1024:
+            print('Failed to download PDF or file too small.', file=sys.stderr)
+            return '', {}, {}
+
+        # Scan first ~64KB of raw bytes for embedded ASCII text, then check for DOI
+        with open(pdf_path, 'rb') as _f:
+            raw = _f.read(65536)
+        first_page = b' '.join(re.findall(rb'[\x20-\x7e]{4,}', raw)).decode('ascii', errors='ignore')
+        doi = extract_doi_from_pdf_text(first_page)
+        if doi and not skip_doi:
+            print(f'DOI found on first page: {doi} — processing as paper...', file=sys.stderr)
+            return None, None, {'redirect_doi': doi}
+
+        content, images_dict, method = pdf_to_markdown(pdf_path)
+
+    if not content or len(content.split()) < MIN_WORDS:
+        print('PDF conversion produced no usable content.', file=sys.stderr)
+        return '', {}, {}
+
+    # Extract title from first heading, fall back to filename
+    title_match = re.search(r'^#{1,2}\s+(.+)$', content, re.MULTILINE)
+    if title_match:
+        title = title_match.group(1).strip()
+        content = content[title_match.end():].lstrip('\n')
+    else:
+        title = re.sub(r'[-_]+', ' ', os.path.splitext(pdf_name)[0]).strip()
+
+    words = len(content.split())
+    ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, '', content)
+    ai_tags_clean = [t.lower() for t in ai_tags]
+
+    if local_path:
+        site = ''
+    else:
+        p = urlparse(url)
+        root_url = f'{p.scheme}://{p.netloc}'
+        site = fetch_defuddle(root_url).get('site', '')
+        if not site:
+            parts = p.netloc.split('.')
+            if len(parts) > 2:
+                site = fetch_defuddle(f'{p.scheme}://www.{".".join(parts[-2:])}').get('site', '')
+
+    fm = build_frontmatter('pdf', project, created, ai_tags_clean, [
+        frontmatter_field('title', title),
+        f'description: {yaml_str(ai_desc or "[Description to be added]")}',
+        *([] if local_path else [frontmatter_field('url', url)]),
+        frontmatter_field('site', site),
+        frontmatter_field('method', method),
+        frontmatter_field('words', words, quote=False),
+    ])
+    summary = ai_summary or '[Summary to be added]'
+    index = build_index(content)
+    index_section = ('\n' + _toc_section(index, 'Index') + '\n') if index else '\n---\n'
+
+    note = f"""{fm}
+
+---
+
+# {title}
+
+## Summary
+
+{summary}
+{index_section}
+{content}
+"""
+    return note, images_dict, {'title': title}
 
 
 def title_from_content(content):
@@ -2924,26 +3101,91 @@ def main():
     if not raw_url:
         parser.error('URL required as first argument or via --url')
 
+    if not args.created:
+        import datetime
+        args.created = datetime.date.today().isoformat()
+
     _is_special = (
-        (ENABLE_PAPER   and is_doi_url(raw_url)) or
+        os.path.isabs(raw_url) or
+        (ENABLE_PAPER   and is_paper_url(raw_url)) or
         (ENABLE_PODCAST and is_apple_podcast(raw_url)) or
         (ENABLE_YOUTUBE and is_youtube(raw_url))
     )
     url = raw_url if _is_special else clean_url(raw_url)
+    academia_doi = None
+
+    # Academia.edu: extract PDF URL from page, then re-route through normal pipeline
+    if is_academia_url(url):
+        print('Detected Academia.edu page — extracting PDF URL...', file=sys.stderr)
+        pdf_url, academia_doi = extract_academia_pdf_url(url)
+        if pdf_url:
+            print(f'Found PDF: {pdf_url}', file=sys.stderr)
+            note, images_dict, meta = build_pdf(pdf_url, args.project, args.created, skip_doi=True)
+            if not note:
+                return
+            title    = meta.get('title', '')
+            filename = args.filename or generate_filename(title)
+            vault    = get_vault_path()
+            save_dir = get_save_dir(vault, args.project)
+            if args.project is not None:
+                os.makedirs(save_dir, exist_ok=True)
+                if ENABLE_IMAGES:
+                    note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=pdf_url)
+                note = _dedup_note_tags(note)
+                with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
+                    f.write(note)
+                print(f'Saved to {format_saved_path(args.project, filename)}')
+            else:
+                print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
+            return
+        elif ENABLE_PAPER and academia_doi and SHADOW_BASE_URL:
+            print(f'PDF not publicly available — trying shadow library for DOI {academia_doi}...', file=sys.stderr)
+            shadow_url = SHADOW_BASE_URL.rstrip('/') + '/' + academia_doi
+            url = shadow_url
+            # Fall through to the paper pipeline below
+        else:
+            msg = 'PDF requires login.'
+            if academia_doi:
+                msg += f' DOI: {academia_doi}'
+            msg += ' Download the PDF manually and pass the local file location to defuddle.'
+            print(msg, file=sys.stderr)
+            return
+
+    # SSRN: derive DOI from abstract_id and route to paper pipeline
+    if ENABLE_PAPER and is_ssrn_url(url):
+        ssrn_doi = extract_ssrn_doi(url)
+        if ssrn_doi:
+            print(f'Detected SSRN paper — using DOI {ssrn_doi}...', file=sys.stderr)
+            url = f'https://doi.org/{ssrn_doi}'
+        else:
+            print('Could not extract abstract_id from SSRN URL.', file=sys.stderr)
+            return
+
+    # Normalize shadow library URLs to canonical doi.org form
+    if ENABLE_PAPER and is_shadow_url(url):
+        doi_part = extract_doi_from_shadow(url)
+        if doi_part:
+            url = f'https://doi.org/{doi_part}'
+        else:
+            print('Shadow library URL detected but no DOI found in path.', file=sys.stderr)
 
     # Normalize DOI URLs to canonical https://doi.org/{doi} form (strip dx., www., etc.)
-    if ENABLE_PAPER and is_doi_url(url) and 'arxiv.org' not in url:
+    if ENABLE_PAPER and 'doi.org' in url and 'arxiv.org' not in url:
         doi_part = extract_doi(url)
         if doi_part:
             url = f'https://doi.org/{doi_part}'
 
-    # Academic papers: DOI / arXiv
-    if ENABLE_PAPER and is_doi_url(url):
+    # Academic papers: DOI / arXiv / shadow library
+    if ENABLE_PAPER and is_paper_url(url):
         if args.project is None:
             note, _, _meta = build_paper(url, None, args.created)
             print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
             return
         note, images_dict, meta = build_paper(url, args.project, args.created)
+        if not note:
+            if academia_doi:
+                print(f'Paper not found in shadow library either. Download the PDF manually and pass the local file location to defuddle. DOI: {academia_doi}', file=sys.stderr)
+            return
         title    = meta.get('title', '')
         authors  = meta.get('authors', [])
         last_name = re.sub(r'[^a-z0-9]+', '-', authors[0].split()[-1].lower()).strip('-') if authors else ''
@@ -2957,6 +3199,40 @@ def main():
         note = _dedup_note_tags(note)
         out_path = os.path.join(save_dir, f'{filename}.md')
         with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(note)
+        print(f'Saved to {format_saved_path(args.project, filename)}')
+        return
+
+    # Plain PDFs: download, scan first page for DOI, route accordingly
+    if ENABLE_PDF and is_pdf_url(url):
+        note, images_dict, meta = build_pdf(url, args.project, args.created)
+        redirect_doi = meta.get('redirect_doi') if meta else None
+        if redirect_doi:
+            # First page had a DOI — re-route to build_paper
+            doi_url = f'https://doi.org/{redirect_doi}'
+            if args.project is None:
+                note, _, _meta = build_paper(doi_url, None, args.created)
+                print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
+                return
+            note, images_dict, meta = build_paper(doi_url, args.project, args.created)
+            authors  = meta.get('authors', [])
+            last_name = re.sub(r'[^a-z0-9]+', '-', authors[0].split()[-1].lower()).strip('-') if authors else ''
+            ai_name  = generate_filename(meta.get('title', ''))
+            filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
+            vault    = get_vault_path()
+            save_dir = get_save_dir(vault, args.project)
+        elif not note:
+            return
+        else:
+            title    = meta.get('title', '')
+            filename = args.filename or generate_filename(title)
+            vault    = get_vault_path()
+            save_dir = get_save_dir(vault, args.project)
+        os.makedirs(save_dir, exist_ok=True)
+        if ENABLE_IMAGES:
+            note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=url)
+        note = _dedup_note_tags(note)
+        with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
             f.write(note)
         print(f'Saved to {format_saved_path(args.project, filename)}')
         return

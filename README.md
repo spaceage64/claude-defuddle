@@ -16,7 +16,9 @@ Just paste any URL into your conversation. That's it.
 
 **Apple podcasts** — same as YouTube, but for podcast episodes. Reads the TTML transcript cached by the macOS Podcasts app. (No other podcast platforms supported for now.)
 
-**Academic papers** — give it a DOI URL (`https://doi.org/...`) or arXiv abstract URL (`https://arxiv.org/abs/...`). It fetches the PDF, converts it to markdown, and saves a structured note with abstract, keywords as tags, and bibliography.
+**Academic papers** — give it a DOI URL (`https://doi.org/...`), arXiv abstract URL (`https://arxiv.org/abs/...`), SSRN paper URL, or Academia.edu page URL. It fetches the PDF, converts it to markdown, and saves a structured note with abstract, keywords as tags, and bibliography. Falls back to a configured shadow library for restricted papers.
+
+**Plain PDFs** — any `.pdf` URL, or a local file path. First page is scanned for a DOI; if found, it's routed through the full paper pipeline automatically.
 
 All content saves to `{vault}/{project}/defuddle/`.
 
@@ -100,8 +102,8 @@ A concise AI-generated summary of the article's key points...
 
 | Tool | Purpose | Install |
 |---|---|---|
-| Datalab API key | Cloud PDF→markdown conversion | [datalab.to](https://datalab.to) — free accounts get $10 in credits (roughly 10–15 cents per paper) |
-| [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→markdown fallback | `pip install marker-pdf` |
+| [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→markdown (default) | `pipx install marker-pdf` |
+| Datalab API key | Cloud PDF→markdown fallback | [datalab.to](https://datalab.to) — free accounts get $10 in credits (roughly 10–15 cents per paper) |
 
 **Optional — image compression:**
 
@@ -226,12 +228,22 @@ If no API key is found or the provider fails, the skill falls back to the Claude
 
 ## Academic papers
 
-Given a DOI URL (e.g. `https://doi.org/10.48550/arXiv.1706.03762`), the skill:
+Supported sources:
+- **DOI URL** — `https://doi.org/10.xxxx/...`
+- **arXiv** — `https://arxiv.org/abs/...`
+- **SSRN** — `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=...`
+- **Academia.edu** — `https://www.academia.edu/{id}/...` (uses public PDF if available, otherwise tries shadow library via DOI)
+- **Any `.pdf` URL** — first page is scanned for a DOI and auto-routed to the paper pipeline if found
+- **Local file path** — pass an absolute path to a PDF on disk
+
+For DOI and arXiv papers, the skill:
 
 1. Tries to fetch the arXiv LaTeX source directly (best quality)
-2. Falls back to the Datalab API for cloud PDF→markdown
-3. Falls back to local [Marker](https://github.com/VikParuchuri/marker) if Datalab isn't available
+2. Falls back to local [Marker](https://github.com/VikParuchuri/marker) for PDF→markdown
+3. Falls back to the Datalab API if Marker isn't installed
 4. Optionally tries a shadow library for restricted papers
+
+The PDF processor order is controlled by `PDF_PROCESSOR` in `defuddle.py` (default: `local_first`).
 
 To enable Datalab, add your key to `~/.claude/CLAUDE.md`:
 
@@ -260,6 +272,12 @@ Just share a URL in your Claude Code conversation:
 > "Summarise this page: https://github.com/spaceage64/claude-defuddle"
 
 > "https://doi.org/10.1145/3706598.3713709"
+
+> "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3125518"
+
+> "https://www.academia.edu/26155908/Some_Paper_Title"
+
+> "/Users/me/Downloads/paper.pdf"
 
 > "Check out this podcast: https://podcasts.apple.com/us/podcast/restitutio/id1053137114?i=1000741998143"
 
