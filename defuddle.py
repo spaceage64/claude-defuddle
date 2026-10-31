@@ -2783,7 +2783,8 @@ def _rasterize(path, kind, out):
         attempts.append([gs, '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-dEPSCrop', '-dUseCropBox',
                          '-dFirstPage=1', '-dLastPage=1', '-sDEVICE=png16m', '-r200', f'-sOutputFile={out}', path])
     if magick:
-        attempts.append([magick, '-density', '200', f'{path}[0]', out])
+        # flatten onto white like a printed page: transparent figures would hide black text in dark mode
+        attempts.append([magick, '-density', '200', f'{path}[0]', '-background', 'white', '-alpha', 'remove', '-alpha', 'off', out])
     if kind == 'pdf' and shutil.which('sips'):
         attempts.append(['sips', '-s', 'format', 'png', path, '--out', out])
     for cmd in attempts:
