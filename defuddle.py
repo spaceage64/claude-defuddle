@@ -1943,16 +1943,20 @@ def fix_paper_markdown(md):
     md = re.sub(r'\{[^}]*reference-type[^}]*\}', '', md)
 
     # 4. Convert <figure> blocks to markdown images with captions
+    # pandoc writes bitmap figures as <img> and PDF/EPS figures as <embed>; a figure made of
+    # sub-figures has several. All become images, the caption goes on the first one.
+    _fig_src = r'<(?:img|embed)[^>]+src=["\']([^"\']+)["\']'
     def _figure_to_md(m):
         block = m.group(0)
-        src_m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', block)
+        srcs = re.findall(_fig_src, block)
         cap_m = re.search(r'<figcaption>(.*?)</figcaption>', block, re.DOTALL)
-        if not src_m:
+        if not srcs:
             return ''
-        src = src_m.group(1)
         caption = re.sub(r'<[^>]+>', '', cap_m.group(1)).strip() if cap_m else ''
-        return f'\n![{caption}]({src})\n'
+        return '\n' + '\n'.join(f'![{caption if i == 0 else ""}]({s})' for i, s in enumerate(srcs)) + '\n'
     md = re.sub(r'<figure[^>]*>.*?</figure>', _figure_to_md, md, flags=re.DOTALL)
+    # Stray <embed> outside a <figure> (e.g. a PDF figure inside a table)
+    md = re.sub(r'<embed[^>]+src=["\']([^"\']+)["\'][^>]*/?>', r'\n![](\1)\n', md)
 
     # 5. Clean and isolate $$...$$ display math blocks
     # Multi-line environments need an aligned/gathered wrapper to render in Obsidian MathJax.
@@ -2271,17 +2275,22 @@ def build_paper(url, project, created):
                     if content:
                         content = fix_paper_markdown(content)
                         method  = 'arxiv'
-                        # Collect image files from the source dir before tmp_dir is cleaned up
+                        # Collect figure files from the source dir (and its subfolders, e.g. figures/)
+                        # before tmp_dir is cleaned up, keyed by their path relative to it. PDF/EPS
+                        # figures are rendered to PNG/JPG by download_images → finalize_image.
                         import base64 as _b64mod
-                        _IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+                        _IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.pdf', '.eps', '.ps'}
                         src_dir = os.path.dirname(tex_path)
-                        for _fname in os.listdir(src_dir):
-                            if os.path.splitext(_fname)[1].lower() in _IMG_EXT:
-                                try:
-                                    with open(os.path.join(src_dir, _fname), 'rb') as _f:
-                                        images_dict[_fname] = _b64mod.b64encode(_f.read()).decode()
-                                except Exception:
-                                    pass
+                        for _root, _dirs, _files in os.walk(src_dir):
+                            for _fname in _files:
+                                if os.path.splitext(_fname)[1].lower() in _IMG_EXT:
+                                    _full = os.path.join(_root, _fname)
+                                    _rel = os.path.relpath(_full, src_dir).replace(os.sep, '/')
+                                    try:
+                                        with open(_full, 'rb') as _f:
+                                            images_dict[_rel] = _b64mod.b64encode(_f.read()).decode()
+                                    except Exception:
+                                        pass
                         # Build citation key → number map from .bbl if present
                         bbl_key_map = {}
                         for _fname in os.listdir(src_dir):
@@ -2685,7 +2694,8 @@ def resolve_img_tags(html_str, base_url):
 
 def _image_type(path):
     """The real image type from the file's first bytes, whatever its name says:
-    'jpg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp', 'tiff', 'heic', 'jxl', 'jp2', 'ico' or 'psd'.
+    'jpg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp', 'tiff', 'heic', 'jxl', 'jp2', 'ico', 'psd',
+    or 'pdf'/'eps' (vector figures, e.g. from LaTeX papers).
     Returns None if the file isn't an image (e.g. an HTML error page)."""
     try:
         with open(path, 'rb') as f:
@@ -2719,6 +2729,10 @@ def _image_type(path):
         return 'ico'
     if head.startswith(b'8BPS'):
         return 'psd'
+    if head.startswith(b'%PDF'):
+        return 'pdf'
+    if head.startswith((b'%!PS', b'\xc5\xd0\xd3\xc6')):
+        return 'eps'
     text = head.lstrip(b'\xef\xbb\xbf \t\r\n').lower()
     if text.startswith(b'<') and b'<svg' in text and b'<html' not in text:
         return 'svg'
@@ -2733,7 +2747,8 @@ def _is_valid_image(path):
 # Shown as they are in Obsidian everywhere (Mac and iPhone): only the extension is normalised
 _KEEP_IMAGE_TYPES = {'jpg', 'png', 'gif', 'webp', 'avif', 'svg'}
 # Converted to PNG or JPG; extension used if no converter is available
-_CONVERT_IMAGE_TYPES = {'bmp': 'bmp', 'tiff': 'tif', 'heic': 'heic', 'jxl': 'jxl', 'jp2': 'jp2', 'ico': 'ico', 'psd': 'psd'}
+_CONVERT_IMAGE_TYPES = {'bmp': 'bmp', 'tiff': 'tif', 'heic': 'heic', 'jxl': 'jxl', 'jp2': 'jp2', 'ico': 'ico', 'psd': 'psd',
+                        'pdf': 'pdf', 'eps': 'eps'}
 
 
 def _compress_image(path):
@@ -2754,12 +2769,50 @@ def _compress_image(path):
             )
 
 
+def _rasterize(path, kind, out):
+    """Render the first page of a PDF or EPS figure to a PNG at 200 dpi (sharp on retina screens).
+    PDF: poppler's pdftocairo, Ghostscript, ImageMagick or macOS sips (72 dpi); EPS: Ghostscript or
+    ImageMagick (which also uses Ghostscript). Returns True on success."""
+    gs = shutil.which('gs') or shutil.which('gswin64c')
+    magick = shutil.which('magick') or (shutil.which('convert') if os.name != 'nt' else None)
+    attempts = []
+    if kind == 'pdf' and shutil.which('pdftocairo'):
+        attempts.append(['pdftocairo', '-png', '-r', '200', '-singlefile', '-f', '1', '-l', '1',
+                         path, os.path.splitext(out)[0]])
+    if gs:
+        attempts.append([gs, '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-dEPSCrop', '-dUseCropBox',
+                         '-dFirstPage=1', '-dLastPage=1', '-sDEVICE=png16m', '-r200', f'-sOutputFile={out}', path])
+    if magick:
+        attempts.append([magick, '-density', '200', f'{path}[0]', out])
+    if kind == 'pdf' and shutil.which('sips'):
+        attempts.append(['sips', '-s', 'format', 'png', path, '--out', out])
+    for cmd in attempts:
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode == 0 and _image_type(out) == 'png':
+            return True
+    return False
+
+
 def _convert_image(path, base):
     """Convert a BMP/TIFF/HEIC/JPEG XL/JPEG 2000/ICO/PSD file to base.png or base.jpg; returns the new path,
     or None without a converter (sips on macOS, else ImageMagick).
 
     Transparency → PNG (JPG can't store it). Otherwise both are made (and compressed, if enabled) and
-    the smaller one is kept: graphics, screenshots and text compress far better as PNG, photos as JPG."""
+    the smaller one is kept: graphics, screenshots and text compress far better as PNG, photos as JPG.
+    PDF/EPS figures are first rendered to a PNG (_rasterize), which then goes through the same choice."""
+    kind = _image_type(path)
+    if kind in ('pdf', 'eps'):
+        raster = base + '.render.png'
+        if not _rasterize(path, kind, raster):
+            return None
+        best = _convert_image(raster, base)
+        if not best:                     # no sips/ImageMagick to compare formats: the PNG is fine
+            best = base + '.png'
+            os.replace(raster, best)
+            if ENABLE_IMAGE_COMPRESSION:
+                _compress_image(best)
+        os.unlink(path)
+        return best
     # ImageMagick 7 is 'magick', 6 is 'convert' — but never on Windows, where convert.exe is the
     # system tool that converts FAT drives to NTFS
     magick = shutil.which('magick') or (shutil.which('convert') if os.name != 'nt' else None)
@@ -2804,7 +2857,7 @@ def finalize_image(path):
     """Give a saved image its final form and return its new path (None if it isn't an image).
 
     The type comes from the file's contents, not its name. JPG, PNG, GIF, WebP, AVIF and SVG keep
-    their format; BMP, TIFF, HEIC/HEIF, JPEG XL, JPEG 2000, ICO and PSD are converted to PNG or JPG (see
+    their format; BMP, TIFF, HEIC/HEIF, JPEG XL, JPEG 2000, ICO, PSD and PDF/EPS figures are converted to PNG or JPG (see
     _convert_image). The extension is normalised (lowercase, .jpeg/.jfif → .jpg, real type over a
     wrong or missing one), then the image is compressed if ENABLE_IMAGE_COMPRESSION is on.
     """
@@ -2816,8 +2869,10 @@ def finalize_image(path):
         converted = _convert_image(path, base)
         if converted:
             return converted
+        needs = {'eps': 'Ghostscript (brew install ghostscript)',
+                 'pdf': 'poppler (brew install poppler), Ghostscript, ImageMagick or macOS sips'}.get(kind, 'macOS sips or ImageMagick')
         print(f'WARNING: {os.path.basename(path)} is {kind.upper()} and could not be converted to PNG/JPG '
-              f'(needs macOS sips or ImageMagick) — kept as is.', file=sys.stderr)
+              f'(needs {needs}) — kept as is.', file=sys.stderr)
         new = f'{base}.{_CONVERT_IMAGE_TYPES[kind]}'
     else:
         new = f'{base}.{kind}'
@@ -2826,6 +2881,32 @@ def finalize_image(path):
     if ENABLE_IMAGE_COMPRESSION:
         _compress_image(new)
     return new
+
+
+def _find_image(images_dict, src):
+    """The images_dict entry for an image reference. Tries the exact path, the path without './',
+    the file name, then the name without its extension (LaTeX's \\includegraphics often omits it),
+    preferring formats that need no conversion."""
+    if not images_dict:
+        return None
+    ref = src.split('?')[0].split('#')[0]
+    while ref.startswith('./'):
+        ref = ref[2:]
+    for key in (src, ref):
+        if key in images_dict:
+            return images_dict[key]
+    name = os.path.basename(ref)
+    same_name = [k for k in images_dict if os.path.basename(k) == name]
+    if same_name:
+        return images_dict[min(same_name, key=len)]
+    order = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.pdf', '.eps', '.ps']
+    rank = lambda k: order.index(os.path.splitext(k)[1].lower()) if os.path.splitext(k)[1].lower() in order else len(order)
+    for match in (lambda k: os.path.splitext(k)[0] == ref,
+                  lambda k: os.path.splitext(os.path.basename(k))[0] == name):
+        hits = [k for k in images_dict if match(k)]
+        if hits:
+            return images_dict[min(hits, key=rank)]
+    return None
 
 
 def download_images(content, docs_dir, filename_base, images_dict=None, source_url=None):
@@ -2891,8 +2972,8 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
                 local_name = None
         elif images_dict:
             # Decode from base64 dict (Datalab or arXiv)
-            # Try exact key first, then basename (handles path-prefix mismatches)
-            raw = images_dict.get(src) or images_dict.get(os.path.basename(src))
+            # Exact path first, then file name, then name without extension (see _find_image)
+            raw = _find_image(images_dict, src)
             if raw is not None:
                 try:
                     data = raw.split(',', 1)[1] if ',' in raw else raw
