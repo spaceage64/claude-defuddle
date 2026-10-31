@@ -2683,23 +2683,57 @@ def resolve_img_tags(html_str, base_url):
     return re.sub(r'<img[^>]*/?>',  _replace, html_str, flags=re.IGNORECASE)
 
 
-def _is_valid_image(path):
-    """Check magic bytes to confirm the file is actually an image, not an HTML error page."""
-    MAGIC = [
-        b'\xff\xd8\xff',       # JPEG
-        b'\x89PNG\r\n\x1a\n',  # PNG
-        b'GIF8',               # GIF
-        b'RIFF',               # WebP
-    ]
+def _image_type(path):
+    """The real image type from the file's first bytes, whatever its name says:
+    'jpg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp', 'tiff', 'heic', 'jxl', 'jp2', 'ico' or 'psd'.
+    Returns None if the file isn't an image (e.g. an HTML error page)."""
     try:
         with open(path, 'rb') as f:
-            header = f.read(16)
-        ext = os.path.splitext(path)[1].lower()
-        if ext == '.svg':
-            return header.lstrip()[:1] in (b'<',)
-        return any(header.startswith(m) for m in MAGIC)
+            head = f.read(1024)
     except Exception:
-        return False
+        return None
+    if head.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if head.startswith((b'GIF87a', b'GIF89a')):
+        return 'gif'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return 'webp'
+    if head[4:8] == b'ftyp':                     # ISO media: AVIF and HEIC/HEIF share this container
+        brands = head[8:12] + head[16:min(len(head), 64)]
+        if b'avif' in brands or b'avis' in brands:
+            return 'avif'
+        if any(b in brands for b in (b'heic', b'heix', b'hevc', b'hevx', b'heim', b'heis', b'mif1', b'msf1')):
+            return 'heic'
+        return None
+    if head.startswith((b'\xff\x0a', b'\x00\x00\x00\x0cJXL \r\n\x87\n')):
+        return 'jxl'
+    if head.startswith(b'\x00\x00\x00\x0cjP  \r\n\x87\n'):
+        return 'jp2'
+    if head.startswith((b'II*\x00', b'MM\x00*')):
+        return 'tiff'
+    if head.startswith(b'BM'):
+        return 'bmp'
+    if head.startswith(b'\x00\x00\x01\x00'):
+        return 'ico'
+    if head.startswith(b'8BPS'):
+        return 'psd'
+    text = head.lstrip(b'\xef\xbb\xbf \t\r\n').lower()
+    if text.startswith(b'<') and b'<svg' in text and b'<html' not in text:
+        return 'svg'
+    return None
+
+
+def _is_valid_image(path):
+    """Check magic bytes to confirm the file is actually an image, not an HTML error page."""
+    return _image_type(path) is not None
+
+
+# Shown as they are in Obsidian everywhere (Mac and iPhone): only the extension is normalised
+_KEEP_IMAGE_TYPES = {'jpg', 'png', 'gif', 'webp', 'avif', 'svg'}
+# Converted to PNG or JPG; extension used if no converter is available
+_CONVERT_IMAGE_TYPES = {'bmp': 'bmp', 'tiff': 'tif', 'heic': 'heic', 'jxl': 'jxl', 'jp2': 'jp2', 'ico': 'ico', 'psd': 'psd'}
 
 
 def _compress_image(path):
@@ -2720,6 +2754,80 @@ def _compress_image(path):
             )
 
 
+def _convert_image(path, base):
+    """Convert a BMP/TIFF/HEIC/JPEG XL/JPEG 2000/ICO/PSD file to base.png or base.jpg; returns the new path,
+    or None without a converter (sips on macOS, else ImageMagick).
+
+    Transparency → PNG (JPG can't store it). Otherwise both are made (and compressed, if enabled) and
+    the smaller one is kept: graphics, screenshots and text compress far better as PNG, photos as JPG."""
+    # ImageMagick 7 is 'magick', 6 is 'convert' — but never on Windows, where convert.exe is the
+    # system tool that converts FAT drives to NTFS
+    magick = shutil.which('magick') or (shutil.which('convert') if os.name != 'nt' else None)
+    if shutil.which('sips'):
+        def to(fmt, out):
+            # top quality when compression follows; otherwise a sensible quality straight away
+            q = 'best' if ENABLE_IMAGE_COMPRESSION else 'high'
+            opts = ['-s', 'formatOptions', q] if fmt == 'jpeg' else []
+            r = subprocess.run(['sips', '-s', 'format', fmt, *opts, path, '--out', out], capture_output=True)
+            return r.returncode == 0 and _image_type(out) is not None
+        r = subprocess.run(['sips', '-g', 'hasAlpha', path], capture_output=True, text=True)
+        transparent = 'hasAlpha: yes' in r.stdout
+    elif magick:
+        def to(fmt, out):
+            q = '100' if ENABLE_IMAGE_COMPRESSION else '85'
+            r = subprocess.run([magick, f'{path}[0]', *(['-quality', q] if fmt == 'jpeg' else []), out],
+                               capture_output=True)
+            return r.returncode == 0 and _image_type(out) is not None
+        r = subprocess.run([magick, f'{path}[0]', '-format', '%[opaque]', 'info:'], capture_output=True, text=True)
+        transparent = r.stdout.strip().lower() == 'false'
+    else:
+        return None
+
+    candidates = []
+    for fmt, ext in ([('png', '.png')] if transparent else [('png', '.png'), ('jpeg', '.jpg')]):
+        out = base + ext
+        if out != path and to(fmt, out):
+            if ENABLE_IMAGE_COMPRESSION:
+                _compress_image(out)
+            candidates.append(out)
+    if not candidates:
+        return None
+    best = min(candidates, key=os.path.getsize)
+    for c in candidates:
+        if c != best:
+            os.unlink(c)
+    os.unlink(path)
+    return best
+
+
+def finalize_image(path):
+    """Give a saved image its final form and return its new path (None if it isn't an image).
+
+    The type comes from the file's contents, not its name. JPG, PNG, GIF, WebP, AVIF and SVG keep
+    their format; BMP, TIFF, HEIC/HEIF, JPEG XL, JPEG 2000, ICO and PSD are converted to PNG or JPG (see
+    _convert_image). The extension is normalised (lowercase, .jpeg/.jfif → .jpg, real type over a
+    wrong or missing one), then the image is compressed if ENABLE_IMAGE_COMPRESSION is on.
+    """
+    kind = _image_type(path)
+    if kind is None:
+        return None
+    base = os.path.splitext(path)[0]
+    if kind in _CONVERT_IMAGE_TYPES:
+        converted = _convert_image(path, base)
+        if converted:
+            return converted
+        print(f'WARNING: {os.path.basename(path)} is {kind.upper()} and could not be converted to PNG/JPG '
+              f'(needs macOS sips or ImageMagick) — kept as is.', file=sys.stderr)
+        new = f'{base}.{_CONVERT_IMAGE_TYPES[kind]}'
+    else:
+        new = f'{base}.{kind}'
+    if new != path:
+        os.replace(path, new)
+    if ENABLE_IMAGE_COMPRESSION:
+        _compress_image(new)
+    return new
+
+
 def download_images(content, docs_dir, filename_base, images_dict=None, source_url=None):
     """Save all images referenced in content to img/[filename_base]-NNN.ext.
 
@@ -2727,86 +2835,86 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
     - https:// URLs  → downloaded via curl
     - local filenames → decoded from base64 in images_dict (Datalab output)
 
+    Each file is saved under a temporary name, then finalize_image() picks its real type,
+    format and extension and compresses it.
+
     source_url: the original article URL, used as Referer on a retry when the
     first download fails image validation (e.g. CDN hotlink protection).
 
     Returns updated content with rewritten img/ paths.
     """
     import base64 as b64mod
-    VALID_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.avif'}
-    def _norm_ext(e): return '.jpg' if e == '.jpeg' else e
     pattern = re.compile(r'!\[(.*?)\]\(([^)]+)\)', re.DOTALL)
     if not pattern.search(content):
         return content
 
     img_dir = os.path.join(docs_dir, 'img')
-    os.makedirs(img_dir, exist_ok=True)
     seen = {}   # original src → local_name (or None if failed)
     counter = [0]
 
     def replace_img(m):
         alt, src = m.group(1), m.group(2)
-        if src.startswith('data:') or src.startswith('img/'):
+        # Skip inline data, already-local files, and video embeds (YouTube / vid/)
+        if src.startswith(('data:', 'img/', 'vid/')) or is_youtube(src):
             return m.group(0)
         if src in seen:
             return f'![{alt}](img/{seen[src]})' if seen[src] else m.group(0)
 
+        # Create img/ only once there is a real image to save
+        os.makedirs(img_dir, exist_ok=True)
         counter[0] += 1
         local_name = None
+        tmp_path = os.path.join(img_dir, f'{filename_base}-{counter[0]:03d}.download')
 
         if src.startswith('http'):
             # Download from URL
-            ext = _norm_ext(os.path.splitext(urlparse(src).path)[1].lower())
-            if ext not in VALID_EXT:
-                ext = '.png'
-            local_name = f'{filename_base}-{counter[0]:03d}{ext}'
-            local_path = os.path.join(img_dir, local_name)
             def _curl(extra_args=()):
-                cmd = ['curl', '-sL', src, '-o', local_path] + list(extra_args)
+                cmd = ['curl', '-sL', src, '-o', tmp_path] + list(extra_args)
                 r = subprocess.run(cmd, capture_output=True, timeout=30)
-                return (r.returncode == 0 and os.path.exists(local_path)
-                        and os.path.getsize(local_path) > 0
-                        and _is_valid_image(local_path))
+                return (r.returncode == 0 and os.path.exists(tmp_path)
+                        and os.path.getsize(tmp_path) > 0
+                        and _is_valid_image(tmp_path))
 
             try:
                 ok = _curl()
                 if not ok and source_url:
-                    if os.path.exists(local_path):
-                        os.unlink(local_path)
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
                     ok = _curl([
                         '-H', f'Referer: {source_url}',
                         '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                     ])
-                if not ok:
-                    if os.path.exists(local_path):
-                        os.unlink(local_path)
-                    local_name = None
+                if ok:
+                    final = finalize_image(tmp_path)
+                    local_name = os.path.basename(final) if final else None
             except Exception:
                 local_name = None
-            if ENABLE_IMAGE_COMPRESSION and local_name:
-                _compress_image(local_path)
         elif images_dict:
             # Decode from base64 dict (Datalab or arXiv)
             # Try exact key first, then basename (handles path-prefix mismatches)
             raw = images_dict.get(src) or images_dict.get(os.path.basename(src))
             if raw is not None:
-                ext = _norm_ext(os.path.splitext(src)[1].lower())
-                if ext not in VALID_EXT:
-                    ext = '.png'
-                local_name = f'{filename_base}-{counter[0]:03d}{ext}'
                 try:
                     data = raw.split(',', 1)[1] if ',' in raw else raw
-                    with open(os.path.join(img_dir, local_name), 'wb') as f:
+                    with open(tmp_path, 'wb') as f:
                         f.write(b64mod.b64decode(data))
+                    final = finalize_image(tmp_path)
+                    local_name = os.path.basename(final) if final else None
                 except Exception:
                     local_name = None
-                if ENABLE_IMAGE_COMPRESSION and local_name:
-                    _compress_image(os.path.join(img_dir, local_name))
 
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)   # failed download, or not an image
         seen[src] = local_name
+        if not local_name:
+            counter[0] -= 1  # keep numbering gapless when a download fails
         return f'![{alt}](img/{local_name})' if local_name else m.group(0)
 
-    return pattern.sub(replace_img, content)
+    content = pattern.sub(replace_img, content)
+    # Don't leave an empty img/ behind when every download failed
+    if os.path.isdir(img_dir) and not os.listdir(img_dir):
+        os.rmdir(img_dir)
+    return content
 
 
 def html_to_markdown(html_str):
