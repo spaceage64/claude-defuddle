@@ -310,6 +310,7 @@ You can reinforce this in your own `~/.claude/CLAUDE.md`:
 - **Platform** — designed and tested on macOS. Linux should work for articles, YouTube, and papers — all dependencies are available, but it's untested. Windows may work with Claude Code for Windows and the relevant tools installed, also untested. Apple Podcasts is macOS-only regardless (TTML transcripts are stored by the macOS Podcasts app).
 - **Transcripts** — the skill tries manual captions first (better quality), then falls back to auto-generated. Rolling-window caption artefacts (duplicated lines) are detected and removed automatically.
 - **YouTube chapters** — if the video has chapter markers, they're used directly. If not, the AI generates logical chapter breaks.
+- **Videos without subtitles** — the note (or the read-only output) still gets the title, channel and full description, with “No subtitles available for this video.” in place of the transcript. YouTube links never go through the archive fallbacks.
 - **Tags** — hashtags in YouTube descriptions and keywords in paper abstracts are extracted and added to frontmatter. The AI also adds content-based tags.
 - **Images** — when `ENABLE_IMAGES = True`, images are downloaded into an `img/` subfolder next to the note. Invalid responses (auth errors, HTML pages served as images) are detected and the original URL is kept instead.
 - **Obsidian compatibility** — formatting is tuned for Obsidian. May look slightly different in other Markdown readers.

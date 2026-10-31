@@ -337,21 +337,73 @@ def parse_vtt(content, vid_id, interval=30):
     return '\n\n'.join(out)
 
 
-def yt_extra(url):
-    """Fetch description, duration, and chapters from yt-dlp. Returns (desc, duration, chapters)."""
+def yt_info(url):
+    """Fetch video metadata (title, channel, description, duration, chapters, ...) from yt-dlp.
+    Returns the yt-dlp info dict, or {} on failure."""
     try:
         result = subprocess.run(
             ['yt-dlp', '--skip-download', '--dump-single-json', url],
             capture_output=True, text=True, timeout=30
         )
-        data = json.loads(result.stdout)
-        return (
-            data.get('description', ''),
-            data.get('duration_string', ''),
-            data.get('chapters') or []
-        )
+        return json.loads(result.stdout)
     except Exception:
-        return '', '', []
+        return {}
+
+
+def fetch_youtube(url):
+    """Defuddle's parse of a YouTube page, with title/channel/date filled in from yt-dlp when
+    defuddle returns nothing. Returns {} if neither could read the video."""
+    d = fetch_defuddle(url)
+    if not d.get('title'):
+        info = yt_info(url)
+        if info.get('title'):
+            date = info.get('upload_date') or ''
+            d = dict(d, title=info['title'], site='YouTube',
+                     author=info.get('channel') or info.get('uploader', ''),
+                     published=f'{date[:4]}-{date[4:6]}-{date[6:8]}' if len(date) == 8 else '')
+    return d if d.get('title') else {}
+
+
+NO_SUBTITLES = '*No subtitles available for this video.*'
+
+
+def youtube_transcript(content, url, vid_id, yt_chapters):
+    """Transcript for a video: yt-dlp captions (with yt-dlp's chapters), else defuddle's own
+    transcript. Returns (transcript_body, has_chapters); the body is '' if the video has no subtitles."""
+    vtt_transcript = fetch_vtt(url, vid_id) if vid_id else None
+    if vtt_transcript:
+        if not yt_chapters:
+            return vtt_transcript, False  # Let Gemini generate chapters
+        # Use accurate chapter timestamps from yt-dlp
+        chapter_list = [{'time': fmt_tc(int(ch['start_time'])),
+                         'title': 'Introduction' if re.match(r'^<Untitled Chapter', ch['title']) else ch['title']}
+                        for ch in yt_chapters]
+        return insert_chapters(vtt_transcript, chapter_list), True
+
+    # Fall back to defuddle's transcript; without one its content is only the embed and description
+    m = re.search(r'^## Transcript[ \t]*$', content, re.MULTILINE)
+    if not m:
+        return '', False
+    transcript_body = content[m.end():].strip()
+    if vid_id:
+        transcript_body = linkify_timecodes(transcript_body, vid_id)
+    return transcript_body, bool(re.search(r'^### ', transcript_body, re.MULTILINE))
+
+
+def present_youtube(d, url):
+    """Read-only output for a video: title, channel, duration, description and transcript."""
+    info      = yt_info(url)
+    title     = strip_title_suffix(d.get('title', ''))
+    meta_line = ' · '.join(x for x in (d.get('author', ''), info.get('duration_string', '')) if x)
+    desc      = strip_timecode_lines(info.get('description') or d.get('description', ''))
+    transcript_body, _ = youtube_transcript(d.get('content', ''), url, youtube_id(url),
+                                            info.get('chapters') or [])
+    if not transcript_body:
+        print('No subtitles available for this video — showing its title and description only.',
+              file=sys.stderr)
+    parts = [f'# {title}', meta_line, '## Description', desc.strip(),
+             '## Transcript', transcript_body or NO_SUBTITLES]
+    print('\n\n'.join(p for p in parts if p))
 
 
 def fetch_vtt(url, vid_id):
@@ -576,46 +628,17 @@ def build_youtube(d, url, project, created, method=None):
     vid_id    = youtube_id(url)
     short_url = f'https://youtu.be/{vid_id}' if vid_id else url
 
-    yt_desc, duration, yt_chapters = yt_extra(url)
-    desc = strip_timecode_lines(yt_desc or d.get('description', ''))
+    info     = yt_info(url)
+    duration = info.get('duration_string', '')
+    desc     = strip_timecode_lines(info.get('description') or d.get('description', ''))
 
-    # Try VTT for granular per-sentence timestamps
-    vtt_transcript = fetch_vtt(url, vid_id) if vid_id else None
-
-    if vtt_transcript:
-        transcript_body = vtt_transcript
-        if yt_chapters:
-            # Use accurate chapter timestamps from yt-dlp
-            chapter_list = [{'time': fmt_tc(int(ch['start_time'])),
-                             'title': 'Introduction' if re.match(r'^<Untitled Chapter', ch['title']) else ch['title']}
-                            for ch in yt_chapters]
-            transcript_body = insert_chapters(transcript_body, chapter_list)
-            has_chapters = True
-        else:
-            has_chapters = False  # Let Gemini generate chapters
-    else:
-        # Fall back to defuddle's transcript
-        lines = content.split('\n')
-        i = 0
-        while i < len(lines) and not lines[i].strip():
-            i += 1
-        if i < len(lines) and lines[i].startswith('!['):
-            i += 1
-        while i < len(lines) and not lines[i].strip():
-            i += 1
-        if i < len(lines) and lines[i].strip() == '## Transcript':
-            i += 1
-        transcript_body = '\n'.join(lines[i:]).strip()
-
-        if vid_id:
-            transcript_body = linkify_timecodes(transcript_body, vid_id)
-
-        has_chapters = bool(re.search(r'^### ', transcript_body, re.MULTILINE))
+    # VTT captions give granular per-sentence timestamps; defuddle's transcript is the fallback
+    transcript_body, has_chapters = youtube_transcript(content, url, vid_id, info.get('chapters') or [])
 
     # Gemini enrichment
     yt_content = f"Description:\n{desc}\n\nTranscript:\n{transcript_body}"
     ai_desc, ai_summary, ai_tags, ai_chapters = ai_enrich(
-        title, author, yt_content, needs_chapters=not has_chapters
+        title, author, yt_content, needs_chapters=bool(transcript_body) and not has_chapters
     )
 
     # Insert AI-generated chapters if needed
@@ -635,10 +658,10 @@ def build_youtube(d, url, project, created, method=None):
     # Strip all blank lines — Obsidian renders line spacing natively
     desc = '\n'.join(line for line in desc.splitlines() if line.strip())
 
-    # Build Contents from chapter headings
+    # Build Contents from chapter headings (none without a transcript)
     contents = build_index(transcript_body) or '[Chapters to be added]'
+    contents_section = _toc_section(contents) + '\n\n' if transcript_body else ''
 
-    contents_section = _toc_section(contents)
     fm_description = ai_desc if ai_desc else '[Description to be added]'
     fm = build_frontmatter('video', project, created, all_tags, [
         frontmatter_field('title', title),
@@ -669,11 +692,9 @@ def build_youtube(d, url, project, created, method=None):
 
 {desc}
 
-{contents_section}
+{contents_section}## Transcript
 
-## Transcript
-
-{transcript_body}
+{transcript_body or NO_SUBTITLES}
 """
 
 
@@ -3290,7 +3311,17 @@ def main():
         print(f'Saved to {format_saved_path(args.project, filename)}')
         return
 
-    if args.method:
+    # YouTube: defuddle's page parse plus yt-dlp, no archive cascade. A video without subtitles
+    # has only a few words but isn't JS-rendered, and archives don't have its transcript either
+    if ENABLE_YOUTUBE and is_youtube(url):
+        d, used_method = fetch_youtube(url), 'native-page'
+        if not d:
+            print('Could not read this video (defuddle and yt-dlp both failed).', file=sys.stderr)
+            return
+        if args.project is None:
+            present_youtube(d, url)
+            return
+    elif args.method:
         d, used_method = fetch_for_method(url, args.method)
     else:
         # Auto-cascade: native-md → native-page → googlebot → wayback → archive-is
@@ -3348,7 +3379,7 @@ def main():
         return
 
     # Don't save an empty note
-    if d.get('wordCount', 0) <= MIN_WORDS:
+    if d.get('wordCount', 0) <= MIN_WORDS and not (ENABLE_YOUTUBE and is_youtube(url)):
         print('No content retrieved — skipping save.', file=sys.stderr)
         return
 
