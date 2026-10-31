@@ -255,11 +255,12 @@ def insert_chapters(transcript_body, chapters):
     return '\n'.join(result)
 
 
-def parse_vtt(content, vid_id, interval=30):
+def parse_vtt(content, vid_id, interval=30, breaks=()):
     """Parse VTT content into a transcript_body string with paragraph-level timestamps.
 
     Auto-detects rolling-window captions (take last line per cue) vs standalone
-    captions (join all lines per cue). interval groups cues into ~N-second paragraphs.
+    captions (join all lines per cue). interval groups cues into ~N-second paragraphs;
+    breaks (seconds, e.g. chapter starts) always begin a new paragraph.
     """
     raw_blocks = []
     for block in re.split(r'\n\n+', content):
@@ -317,7 +318,8 @@ def parse_vtt(content, vid_id, interval=30):
         if group_start is None:
             group_start = secs
             group_texts = [text]
-        elif secs - group_start >= interval:
+        # Chapter starts are whole seconds and a line often starts a split second early: round
+        elif secs - group_start >= interval or any(group_start < b <= round(secs) for b in breaks):
             paragraphs.append((group_start, ' '.join(group_texts)))
             group_start = secs
             group_texts = [text]
@@ -330,8 +332,8 @@ def parse_vtt(content, vid_id, interval=30):
     for secs, text in paragraphs:
         text = html.unescape(text)
         text = re.sub(r'\s*>>\s*', '\n', text).strip()
-        tc = fmt_tc(int(secs))
-        link = f'[**{tc}**](https://youtu.be/{vid_id}?t={int(secs)})'
+        tc = fmt_tc(round(secs))
+        link = f'[**{tc}**](https://youtu.be/{vid_id}?t={round(secs)})'
         out.append(f'{link} {text}')
 
     return '\n\n'.join(out)
@@ -367,10 +369,17 @@ def fetch_youtube(url):
 NO_SUBTITLES = '*No subtitles available for this video.*'
 
 
+def yt_duration(info):
+    """Video length as M:SS or H:MM:SS, like the transcript timecodes."""
+    return fmt_tc(info['duration']) if info.get('duration') else info.get('duration_string', '')
+
+
 def youtube_transcript(content, url, vid_id, yt_chapters):
     """Transcript for a video: yt-dlp captions (with yt-dlp's chapters), else defuddle's own
     transcript. Returns (transcript_body, has_chapters); the body is '' if the video has no subtitles."""
-    vtt_transcript = fetch_vtt(url, vid_id) if vid_id else None
+    # Paragraphs break at chapter starts, so every chapter heading lands right before its own text
+    breaks = [ch['start_time'] for ch in yt_chapters]
+    vtt_transcript = fetch_vtt(url, vid_id, breaks) if vid_id else None
     if vtt_transcript:
         if not yt_chapters:
             return vtt_transcript, False  # Let Gemini generate chapters
@@ -394,7 +403,7 @@ def present_youtube(d, url):
     """Read-only output for a video: title, channel, duration, description and transcript."""
     info      = yt_info(url)
     title     = strip_title_suffix(d.get('title', ''))
-    meta_line = ' · '.join(x for x in (d.get('author', ''), info.get('duration_string', '')) if x)
+    meta_line = ' · '.join(x for x in (d.get('author', ''), yt_duration(info)) if x)
     desc      = strip_timecode_lines(info.get('description') or d.get('description', ''))
     transcript_body, _ = youtube_transcript(d.get('content', ''), url, youtube_id(url),
                                             info.get('chapters') or [])
@@ -406,7 +415,7 @@ def present_youtube(d, url):
     print('\n\n'.join(p for p in parts if p))
 
 
-def fetch_vtt(url, vid_id):
+def fetch_vtt(url, vid_id, breaks=()):
     """Fetch VTT transcript via yt-dlp, preferring manual captions over auto-generated.
     Returns parsed transcript_body string or None."""
     vtt_path = f'/tmp/yt_{vid_id}.en.vtt'
@@ -419,7 +428,7 @@ def fetch_vtt(url, vid_id):
         )
         if os.path.exists(vtt_path):
             content = open(vtt_path).read()
-            result = parse_vtt(content, vid_id)
+            result = parse_vtt(content, vid_id, breaks=breaks)
             if result.strip():
                 return result
 
@@ -431,7 +440,7 @@ def fetch_vtt(url, vid_id):
         )
         if os.path.exists(vtt_path):
             content = open(vtt_path).read()
-            result = parse_vtt(content, vid_id)
+            result = parse_vtt(content, vid_id, breaks=breaks)
             if result.strip():
                 return result
 
@@ -629,7 +638,7 @@ def build_youtube(d, url, project, created, method=None):
     short_url = f'https://youtu.be/{vid_id}' if vid_id else url
 
     info     = yt_info(url)
-    duration = info.get('duration_string', '')
+    duration = yt_duration(info)
     desc     = strip_timecode_lines(info.get('description') or d.get('description', ''))
 
     # VTT captions give granular per-sentence timestamps; defuddle's transcript is the fallback
