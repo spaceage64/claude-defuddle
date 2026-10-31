@@ -2790,7 +2790,16 @@ def html_to_markdown(html_str):
     # Always remove noise elements first (head strips <title> text, nav/header/footer strips chrome)
     html_str = re.sub(r'<(head|style|script|nav|header|footer)[^>]*>.*?</\1>', '', html_str, flags=re.DOTALL | re.IGNORECASE)
 
-    if '```' in html_str:
+    # Finished code blocks are set aside until the end: once unescaped, text like ">_<" in a
+    # plain-text guide would otherwise be taken for a tag and everything up to the next ">" stripped
+    fences = []
+
+    def stash_fence(m):
+        fences.append('\n\n```\n' + html.unescape(re.sub(r'<[^>]+>', '', m.group(1))).strip() + '\n```\n')
+        return f'\x00{len(fences) - 1}\x00'
+
+    # Only fences outside <pre> mean the page embeds raw markdown; a ``` inside a code sample doesn't
+    if '```' in re.sub(r'<pre[^>]*>.*?</pre>', '', html_str, flags=re.DOTALL | re.IGNORECASE):
         # Content is already markdown — strip HTML tags only, preserving the markdown structure
         html_str = re.sub(r'<pre[^>]*>.*?</pre>', '', html_str, flags=re.DOTALL | re.IGNORECASE)
         html_str = re.sub(r'<[^>]+>', '', html_str)
@@ -2804,8 +2813,7 @@ def html_to_markdown(html_str):
             )
         html_str = re.sub(
             r'<pre[^>]*>(?:<code[^>]*>)?(.*?)(?:</code>)?</pre>',
-            lambda m: '\n\n```\n' + html.unescape(re.sub(r'<[^>]+>', '', m.group(1))).strip() + '\n```\n',
-            html_str, flags=re.DOTALL | re.IGNORECASE
+            stash_fence, html_str, flags=re.DOTALL | re.IGNORECASE
         )
         html_str = re.sub(
             r'<code[^>]*>(.*?)</code>',
@@ -2817,6 +2825,7 @@ def html_to_markdown(html_str):
         html_str = re.sub(r'<[^>]+>', '', html_str)
 
     html_str = html.unescape(html_str)
+    html_str = re.sub(r'\x00(\d+)\x00', lambda m: fences[int(m.group(1))], html_str)
     # Collapse whitespace outside code fences only (preserve indentation inside)
     lines = html_str.split('\n')
     in_fence = False
