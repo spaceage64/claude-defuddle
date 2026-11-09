@@ -18,7 +18,7 @@ Just paste any URL into your conversation. That's it.
 
 **Academic papers** — give it a DOI URL (`https://doi.org/...`), arXiv abstract URL (`https://arxiv.org/abs/...`), SSRN paper URL, or Academia.edu page URL. It fetches the PDF, converts it to markdown, and saves a structured note with abstract, keywords as tags, and bibliography. Falls back to a configured shadow library for restricted papers.
 
-**Plain PDFs** — any `.pdf` URL, or a local file path. First page is scanned for a DOI; if found, it's routed through the full paper pipeline automatically. With `--keep-pdf`, papers and PDFs also keep the original PDF next to the note, with the same name.
+**Plain PDFs** — any `.pdf` URL, or a local file path. First page is scanned for a DOI; if found, it's routed through the full paper pipeline automatically. With `--keep-pdf`, papers and PDFs also keep the original PDF next to the note, with the same name. When `ENABLE_PDF_COMPRESSION` is on (the default, separate from `ENABLE_IMAGE_COMPRESSION`) and [uv](https://docs.astral.sh/uv/) is installed, that PDF is compressed too with PyMuPDF (`uv` fetches it in isolation): images above 160 dpi go to 150 dpi, fonts are trimmed, and forms and protected files are left alone.
 
 All content saves to `{vault}/{project}/defuddle/`.
 

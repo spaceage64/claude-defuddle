@@ -47,6 +47,9 @@ ENABLE_IMAGES            = True
 # ║  pngquant: lossy palette reduction (~60–80% smaller, similar to TinyPNG)     ║
 # ║  jpegoptim: re-encodes only if quality > 85; strips metadata.                ║
 ENABLE_IMAGE_COMPRESSION = True
+# ║  PDF compression (--keep-pdf) — requires: uv                                 ║
+# ║  Images above 160 dpi go to 150 dpi; fonts are trimmed.                      ║
+ENABLE_PDF_COMPRESSION   = True
 # ║                                                                              ║
 # ║  Datalab — converts paper PDFs to markdown via cloud API.                    ║
 # ║  Get key at https://datalab.to — free accounts get $10 in credits.           ║
@@ -3464,6 +3467,43 @@ def fetch_for_method(url, method):
         return {}, method
 
 
+# Scans above 160 dpi go to 150 dpi at JPEG quality 75, fonts are trimmed to the characters used.
+# Forms and protected files are left alone; the result is only used if pages and text are unchanged.
+_PDF_COMPRESS = '''
+import sys, pymupdf
+src, out = sys.argv[1:3]
+pymupdf.TOOLS.mupdf_display_errors(False)
+doc = pymupdf.open(src)
+if doc.needs_pass or doc.is_encrypted or doc.is_form_pdf:
+    sys.exit(3)
+doc.rewrite_images(dpi_threshold=160, dpi_target=150, quality=75)
+doc.subset_fonts()
+doc.save(out, garbage=4, deflate=True)
+a, b = pymupdf.open(src), pymupdf.open(out)
+if len(a) != len(b) or any(x.get_text() != y.get_text() for x, y in zip(a, b)):
+    sys.exit(4)
+'''
+
+
+def _compress_pdf(path):
+    """Compress a saved PDF in place with PyMuPDF, run through uv so nothing has to be installed.
+    Skips silently without uv, and keeps the original if the result isn't smaller."""
+    if not shutil.which('uv'):
+        return
+    path = os.path.abspath(path)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, 'compressed.pdf')
+        try:
+            r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pymupdf', 'python', '-c', _PDF_COMPRESS, path, out],
+                               capture_output=True, cwd=tmp, timeout=600)
+        except Exception:
+            return
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) < os.path.getsize(path):
+            before, after = os.path.getsize(path), os.path.getsize(out)
+            shutil.move(out, path)
+            print(f'Compressed the PDF: {before / 1e6:.1f} → {after / 1e6:.1f} MB')
+
+
 def save_original_pdf(save_dir, filename, source=None, meta=None):
     """--keep-pdf: save the original PDF next to the note as {filename}.pdf.
     source is the PDF's URL or local path; without one, the PDF build_paper found (meta) is used."""
@@ -3486,9 +3526,12 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
     if not data or b'%PDF' not in data[:1024]:
         print('WARNING: the original PDF could not be saved — the note was saved without it.', file=sys.stderr)
         return
-    with open(os.path.join(save_dir, f'{filename}.pdf'), 'wb') as f:
+    pdf_path = os.path.join(save_dir, f'{filename}.pdf')
+    with open(pdf_path, 'wb') as f:
         f.write(data)
     print(f'Saved the original PDF as {filename}.pdf next to the note')
+    if ENABLE_PDF_COMPRESSION:
+        _compress_pdf(pdf_path)
 
 
 def main():

@@ -36,7 +36,7 @@ python3 ~/.claude/skills/defuddle/defuddle.py \
 - `--project`: subfolder name inside your vault (e.g. `my-project`, `research`)
 - `--filename`: optional override; script auto-generates from the title via AI if omitted
 - `--method`: force a specific fetch method instead of the auto-cascade (articles only)
-- `--keep-pdf` (papers and PDFs): also save the original PDF next to the note, with the same name (`{filename}.pdf`). Use only when the user asks to keep the PDF.
+- `--keep-pdf` (papers and PDFs): also save the original PDF next to the note, with the same name (`{filename}.pdf`), compressed when `ENABLE_PDF_COMPRESSION` is on. Use only when the user asks to keep the PDF.
 
 Notes are saved to `{vault}/{folder}/defuddle/` regardless of source type.
 
