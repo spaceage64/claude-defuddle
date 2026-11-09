@@ -92,6 +92,7 @@ AI_FALLBACK_MODEL = 'claude-haiku-4-5'
 # ║  Minimum word count to consider a fetch attempt successful. Few words        ║
 # ║  indicate and error and may trigger alternative processing methods.          ║
 MIN_WORDS = 25
+DUPLICATE_IMAGE_DIFF = 9   # mean pixel difference (0–255) below which neighbouring PDF images count as one
 # ║                                                                              ║
 # ║  Filename word count — maximum number of words the AI uses when generating   ║
 # ║  a filename from a title. Papers prepend the first author's last name;       ║
@@ -1358,11 +1359,79 @@ def _expand_simple_macros(content):
     return content
 
 
+def _inline_inputs(content, source_dir, depth=0):
+    """Replace \\input/\\include of .tex files in the source folder with their text, so figures and
+    labels in separate files are numbered together."""
+    def _sub(m):
+        name = m.group(2).strip()
+        path = os.path.realpath(os.path.join(source_dir, name if name.endswith('.tex') else name + '.tex'))
+        if depth >= 5 or not path.startswith(os.path.realpath(source_dir) + os.sep) or not os.path.isfile(path):
+            return m.group(0)
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return m.group(1) + _inline_inputs(f.read(), source_dir, depth + 1)
+    return re.sub(r'^([^%\n]*)\\(?:input|include)\{([^}]+)\}', _sub, content, flags=re.MULTILINE)
+
+
+def _number_figures(content):
+    """Prefix each figure caption with "Figure N." the way LaTeX numbers it (pandoc drops the number).
+    Sub-figure captions are left alone. Returns (content, {label: number})."""
+    content = re.sub(r'^[ \t]*%.*\n', '', content, flags=re.MULTILINE)
+    content = re.sub(r'\\iffalse\b.*?\\fi\b', '', content, flags=re.DOTALL)
+    labels = {}
+    count = [0]
+
+    def _number(fig):
+        block = fig.group(0)
+        # Sub-figures, and algorithms or tables placed inside a figure, have their own captions
+        nested = [s.span() for s in re.finditer(r'\\begin\{(subfigure|algorithm\*?|table\*?)\}.*?\\end\{\1\}', block, re.DOTALL)]
+        out, last, current, waiting = [], 0, None, []
+        for m in re.finditer(r'\\caption(?:of\{figure\}|(\*?))(?:\[[^\]]*\])?\{|\\label\{([^}]+)\}', block):
+            if any(a <= m.start() < b for a, b in nested):
+                continue
+            if m.group(2):
+                if current:
+                    labels[m.group(2)] = current
+                else:
+                    waiting.append(m.group(2))
+            elif not m.group(1):
+                count[0] += 1
+                current = str(count[0])
+                labels.update((w, current) for w in waiting)
+                waiting = []
+                head = '\\caption{' if 'captionof' in m.group(0) else m.group(0)   # pandoc drops \captionof
+                out += [block[last:m.start()], head, f'Figure {current}. ']
+                last = m.end()
+        return ''.join(out) + block[last:]
+
+    return re.sub(r'\\begin\{figure(\*?)\}.*?\\end\{figure\1\}', _number, content, flags=re.DOTALL), labels
+
+
+def _resolve_figure_refs(content, fig_labels):
+    """Replace \\cref/\\Cref/\\autoref to figures with "Figure N" / "Figures N and M"."""
+    def _sub(m):
+        nums = [fig_labels.get(k.strip()) for k in m.group(1).split(',')]
+        if not all(nums):
+            return m.group(0)
+        if len(nums) == 1:
+            return f'Figure {nums[0]}'
+        return f'Figures {", ".join(nums[:-1])} and {nums[-1]}'
+    return re.sub(r'\\(?:[cC]ref|[aA]utoref)\{([^}]+)\}', _sub, content)
+
+
+def _resolve_toggles(content):
+    """Replace \\iftoggle{name}{a}{b} with the branch set by the paper's \\toggletrue/\\togglefalse."""
+    state = {m.group(2): m.group(1) == 'true'
+             for m in re.finditer(r'^[^%\n]*\\toggle(true|false)\{(\w+)\}', content, re.MULTILINE)}
+    return re.sub(r'\\iftoggle\{(\w+)\}\{([^{}]*)\}\{([^{}]*)\}',
+                  lambda m: m.group(2) if state.get(m.group(1)) else m.group(3), content)
+
+
 def _preprocess_latex(content):
     """Preprocess LaTeX so pandoc can parse it without choking."""
     # Expand simple \newcommand macros so structural commands like \begin/\end
     # are visible to _collect_labels even when wrapped in paper-specific shorthands.
     content = _expand_simple_macros(content)
+    content = _resolve_toggles(content)
     # Strip optional spacing args from \\ line breaks in math: \\[6pt] → \\
     content = re.sub(r'\\\\(\[\s*[\d.]+\s*(?:pt|em|ex|cm|mm|in|bp|pc|sp)\s*\])', r'\\\\', content)
     # Strip \iffalse...\fi blocks (commented-out code)
@@ -1391,10 +1460,14 @@ def _preprocess_latex(content):
 
 def _run_pandoc(pre_path, out_path, cwd, fmt='latex'):
     """Run pandoc -f {fmt} -t markdown. Returns True on success."""
-    result = subprocess.run(
-        ['pandoc', '-f', fmt, '-t', 'markdown', '--wrap=none', '-o', out_path, pre_path],
-        capture_output=True, cwd=cwd, timeout=60
-    )
+    try:
+        result = subprocess.run(
+            ['pandoc', '-f', fmt, '-t', 'markdown', '--wrap=none', '-o', out_path, pre_path],
+            capture_output=True, cwd=cwd, timeout=60
+        )
+    except subprocess.TimeoutExpired:
+        print(f'pandoc ({fmt}) timed out.', file=sys.stderr)
+        return False
     return result.returncode == 0 and os.path.exists(out_path)
 
 _NUMBERED_THEOREM_ENVS = {
@@ -1590,15 +1663,18 @@ def latex_to_markdown(tex_path, tmp_dir):
         raw = f.read()
     # Parse \newtheorem BEFORE preprocessing strips them, to preserve counter-
     # sharing info (e.g. \newtheorem{cor}[thm]{Corollary}).
+    source_dir = os.path.dirname(tex_path)
+    raw = _inline_inputs(raw, source_dir)
     nt_data = _parse_newtheorem(raw)
+    raw, fig_labels = _number_figures(raw)
     preprocessed = _preprocess_latex(raw)
     # Resolve cross-references: replace \ref{}/\eqref{} with numbers and
     # inject \textbf{N} markers into theorem environments.
-    labels = _collect_labels(preprocessed, nt_data=nt_data)
+    labels = {**_collect_labels(preprocessed, nt_data=nt_data), **fig_labels}
+    preprocessed = _resolve_figure_refs(preprocessed, fig_labels)
     preprocessed = _inject_ref_numbers(preprocessed, labels, nt_data=nt_data)
     # Inline .bbl bibliography: try \bibliography{name}.bbl → main.bbl →
     # master.bbl → any .bbl in the source directory.
-    source_dir = os.path.dirname(tex_path)
     def _find_bbl(names):
         for name in names:
             p = os.path.join(source_dir, name + '.bbl')
@@ -1747,9 +1823,13 @@ def pdf_to_markdown(pdf_path):
                 print(f'Running local marker (with {AI_LLM} LLM)...', file=sys.stderr)
             else:
                 print('Running local marker...', file=sys.stderr)
-            subprocess.run(cmd, capture_output=True, timeout=3600)
+            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=3600)
             md_files = glob.glob(os.path.join(out_dir, '**', '*.md'), recursive=True)
             if not md_files:
+                error = '\n'.join([l for l in r.stderr.splitlines() if l.strip()][-5:])
+                if AI_API_KEY:
+                    error = error.replace(AI_API_KEY, '<API key>')
+                print(f'marker failed (exit {r.returncode}):\n{error}', file=sys.stderr)
                 return None
             with open(md_files[0], encoding='utf-8') as f:
                 markdown = f.read()
@@ -1788,7 +1868,59 @@ def pdf_to_markdown(pdf_path):
         )
         return '', {}, ''
 
-    return result
+    markdown, images, method = result
+    return _clean_pdf_markdown(markdown, images), images, method
+
+
+def _thumbnail_pixels(data):
+    """Pixels of an image (bytes) shrunk to 64×64, for comparing; None without sips or ImageMagick."""
+    magick = shutil.which('magick') or (shutil.which('convert') if os.name != 'nt' else None)
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = os.path.join(tmp, 'image'), os.path.join(tmp, 'thumb.bmp')
+        with open(src, 'wb') as f:
+            f.write(data)
+        if shutil.which('sips'):
+            cmd = ['sips', '-z', '64', '64', '-s', 'format', 'bmp', src, '--out', out]
+        elif magick:
+            cmd = [magick, f'{src}[0]', '-resize', '64x64!', f'BMP3:{out}']
+        else:
+            return None
+        subprocess.run(cmd, capture_output=True)
+        if not os.path.exists(out):
+            return None
+        with open(out, 'rb') as f:
+            bmp = f.read()
+    return bmp[int.from_bytes(bmp[10:14], 'little'):]
+
+
+def _drop_duplicate_images(md, images):
+    """Remove an image that directly follows a nearly identical one: PDF converters sometimes detect
+    one figure twice, with slightly different crops. A figure repeated later on is left alone."""
+    import base64 as b64mod
+    out, pos, prev_end, prev_pixels = [], 0, None, None
+    for m in re.finditer(r'!\[[^\]]*\]\(([^)\s]+)\)', md):
+        raw = _find_image(images, m.group(1))
+        try:
+            pixels = _thumbnail_pixels(b64mod.b64decode(raw.split(',', 1)[1] if ',' in raw else raw)) if raw else None
+        except Exception:
+            pixels = None
+        if (pixels and prev_pixels and len(pixels) == len(prev_pixels) and not md[prev_end:m.start()].strip()
+                and sum(abs(a - b) for a, b in zip(pixels, prev_pixels)) / len(pixels) < DUPLICATE_IMAGE_DIFF):
+            out.append(md[pos:prev_end])
+            pos, prev_end = m.end(), m.end()
+            continue
+        prev_end, prev_pixels = m.end(), pixels
+    return ''.join(out) + md[pos:]
+
+
+def _clean_pdf_markdown(md, images):
+    """Tidy marker/Datalab output for Obsidian: remove page anchors and links, descriptions without
+    an image, and figures detected twice."""
+    md = re.sub(r'!\[[^\]]*\]\(\s*\)[ \t]*\n*', '', md)
+    md = re.sub(r'<span id="[^"]*">\s*</span>', '', md)
+    md = re.sub(r'\[((?:\\.|[^\]\\])*)\]\(#page-[\d-]+\)',
+                lambda m: re.sub(r'\\([\[\]])', r'\1', m.group(1)), md)
+    return _drop_duplicate_images(md, images)
 
 def _latex_braced_arg(content, cmd):
     """Extract the content of \\cmd{...} with proper nested-brace handling."""
@@ -1891,8 +2023,9 @@ def _convert_simple_tables(md):
         i += 1
     return '\n'.join(out)
 
-def fix_paper_markdown(md):
-    """Sanitise pandoc markdown output for Obsidian compatibility."""
+def fix_paper_markdown(md, latex=False):
+    """Sanitise pandoc markdown output for Obsidian compatibility.
+    latex: the markdown comes from LaTeX source, so an image's alt text is the figure caption."""
     # 0. Convert standalone $\eqref{label}$ / $\ref{label}$ to plain (label) —
     #    Obsidian MathJax does not support \eqref and renders (???)
     md = re.sub(r'\$\\(?:eqref|ref)\{([^}]+)\}\$', r'(\1)', md)
@@ -1944,17 +2077,29 @@ def fix_paper_markdown(md):
 
     # 4. Convert <figure> blocks to markdown images with captions
     # pandoc writes bitmap figures as <img> and PDF/EPS figures as <embed>; a figure made of
-    # sub-figures has several. All become images, the caption goes on the first one.
+    # sub-figures has several. All become images, the caption goes below them as text, because
+    # Obsidian doesn't show alt text. The numbered captions are kept, as a block can hold two
+    # figures side by side; without numbers the last <figcaption> is the main one.
     _fig_src = r'<(?:img|embed)[^>]+src=["\']([^"\']+)["\']'
+    def _caption_md(text):
+        return re.sub(r'^Figure (\d+)\.', r'**Figure \1.**', text.strip())
+    def _caption_text(raw):
+        # MathML holds the rendered formula and its LaTeX: keep only the LaTeX
+        raw = re.sub(r'<math\b.*?<annotation[^>]*>(.*?)</annotation>.*?</math>', r'$\1$', raw, flags=re.DOTALL)
+        return html.unescape(re.sub(r'<[^>]+>', '', raw)).strip()
     def _figure_to_md(m):
         block = m.group(0)
         srcs = re.findall(_fig_src, block)
-        cap_m = re.search(r'<figcaption>(.*?)</figcaption>', block, re.DOTALL)
-        if not srcs:
-            return ''
-        caption = re.sub(r'<[^>]+>', '', cap_m.group(1)).strip() if cap_m else ''
-        return '\n' + '\n'.join(f'![{caption if i == 0 else ""}]({s})' for i, s in enumerate(srcs)) + '\n'
+        caps = [_caption_text(c) for c in re.findall(r'<figcaption>(.*?)</figcaption>', block, re.DOTALL)]
+        captions = [_caption_md(c) for c in ([c for c in caps if re.match(r'Figure \d+\.', c)] or caps[-1:])]
+        images = '\n'.join(f'![]({s})' for s in srcs)
+        return '\n' + '\n\n'.join(x for x in [images, *captions] if x) + '\n'
     md = re.sub(r'<figure[^>]*>.*?</figure>', _figure_to_md, md, flags=re.DOTALL)
+    if latex:
+        md = re.sub(r'^!\[(.+)\]\(([^)\n]+)\)(?:\{[^}\n]*\})?[ \t]*$',
+                    lambda m: f'![]({m.group(2)})\n\n{_caption_md(m.group(1))}', md, flags=re.MULTILINE)
+    # Pandoc attributes after an image: ![](a.png){#fig:a width="\\linewidth"}
+    md = re.sub(r'(!\[[^\n]*?\]\([^)\n]*\))\{[^}\n]*\}', r'\1', md)
     # Stray <embed> outside a <figure> (e.g. a PDF figure inside a table)
     md = re.sub(r'<embed[^>]+src=["\']([^"\']+)["\'][^>]*/?>', r'\n![](\1)\n', md)
 
@@ -2095,7 +2240,7 @@ def _extract_paper_keywords(content):
     return content, keywords
 
 
-def _fix_paper_structure(content, title='', authors=None):
+def _fix_paper_structure(content, title='', authors=None, latex=False):
     """Fix common structural issues in publisher-formatted (PDF-converted) papers:
     - Strip content before the paper title (publisher headers, logos, etc.)
     - Remove duplicate title headings
@@ -2137,7 +2282,7 @@ def _fix_paper_structure(content, title='', authors=None):
     lines_to_remove = set()
     img_re = re.compile(r'^(!\[)(.*?)(\]\([^)]+\))\s*$')
     for i, line in enumerate(lines):
-        img_m = img_re.match(line)
+        img_m = img_re.match(line) if not latex else None   # LaTeX figures have no AI paragraphs
         if not img_m:
             continue
         # Find the first bolded real caption within 15 lines
@@ -2202,6 +2347,9 @@ def _fix_paper_structure(content, title='', authors=None):
     return re.sub(r'\n{3,}', '\n\n', content).strip()
 
 
+_HTML_TAG = re.compile(r'</?[a-zA-Z!][^<>]*>')
+
+
 def _strip_html_preserve_math(text):
     """Strip HTML tags while leaving $...$ and $$...$$ content untouched."""
     result = []
@@ -2223,13 +2371,9 @@ def _strip_html_preserve_math(text):
                 break
             result.append(text[i:end + 1])
             i = end + 1
-        # Strip HTML tags
-        elif text[i] == '<':
-            end = text.find('>', i)
-            if end == -1:
-                result.append(text[i:])
-                break
-            i = end + 1
+        # Strip HTML tags (a real tag only: "<90% error ... >1000" is text)
+        elif text[i] == '<' and _HTML_TAG.match(text, i):
+            i = _HTML_TAG.match(text, i).end()
         else:
             result.append(text[i])
             i += 1
@@ -2273,7 +2417,7 @@ def build_paper(url, project, created):
                     print('Converting LaTeX → Markdown via pandoc...', file=sys.stderr)
                     content = latex_to_markdown(tex_path, tmp_dir)
                     if content:
-                        content = fix_paper_markdown(content)
+                        content = fix_paper_markdown(content, latex=True)
                         method  = 'arxiv'
                         # Collect figure files from the source dir (and its subfolders, e.g. figures/)
                         # before tmp_dir is cleaned up, keyed by their path relative to it. PDF/EPS
@@ -2365,7 +2509,7 @@ def build_paper(url, project, created):
     content = re.sub(r'^- (\[\d+\] )', r'\1', content, flags=re.MULTILINE)
 
     # Fix paper structure: strip pre-title content, remove duplicate titles, move abstract to top
-    content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []))
+    content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []), latex=method == 'arxiv')
     # Extract keywords from content (removed from body, added as tags below)
     content, paper_keywords = _extract_paper_keywords(content)
 
@@ -2745,10 +2889,10 @@ def _is_valid_image(path):
 
 
 # Shown as they are in Obsidian everywhere (Mac and iPhone): only the extension is normalised
-_KEEP_IMAGE_TYPES = {'jpg', 'png', 'gif', 'webp', 'avif', 'svg'}
+_KEEP_IMAGE_TYPES = {'jpg', 'png', 'gif', 'svg'}
 # Converted to PNG or JPG; extension used if no converter is available
 _CONVERT_IMAGE_TYPES = {'bmp': 'bmp', 'tiff': 'tif', 'heic': 'heic', 'jxl': 'jxl', 'jp2': 'jp2', 'ico': 'ico', 'psd': 'psd',
-                        'pdf': 'pdf', 'eps': 'eps'}
+                        'webp': 'webp', 'avif': 'avif', 'pdf': 'pdf', 'eps': 'eps'}
 
 
 def _compress_image(path):
@@ -2857,8 +3001,8 @@ def _convert_image(path, base):
 def finalize_image(path):
     """Give a saved image its final form and return its new path (None if it isn't an image).
 
-    The type comes from the file's contents, not its name. JPG, PNG, GIF, WebP, AVIF and SVG keep
-    their format; BMP, TIFF, HEIC/HEIF, JPEG XL, JPEG 2000, ICO, PSD and PDF/EPS figures are converted to PNG or JPG (see
+    The type comes from the file's contents, not its name. JPG, PNG, SVG and GIF keep their
+    format; everything else, including WebP, AVIF and PDF/EPS figures, is converted to PNG or JPG (see
     _convert_image). The extension is normalised (lowercase, .jpeg/.jfif → .jpg, real type over a
     wrong or missing one), then the image is compressed if ENABLE_IMAGE_COMPRESSION is on.
     """

@@ -102,7 +102,7 @@ A concise AI-generated summary of the article's key points...
 
 | Tool | Purpose | Install |
 |---|---|---|
-| [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→markdown (default) | `pipx install marker-pdf` |
+| [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→markdown (default); version 2 also needs `llama-server` | `pipx install marker-pdf` and `brew install llama.cpp` |
 | Datalab API key | Cloud PDF→markdown fallback | [datalab.to](https://datalab.to) — free accounts get $10 in credits (roughly 10–15 cents per paper) |
 
 **Optional — image compression:**
@@ -316,6 +316,6 @@ You can reinforce this in your own `~/.claude/CLAUDE.md`:
 - **Videos without subtitles** — the note (or the read-only output) still gets the title, channel and full description, with “No subtitles available for this video.” in place of the transcript. YouTube links never go through the archive fallbacks.
 - **Tags** — hashtags in YouTube descriptions and keywords in paper abstracts are extracted and added to frontmatter. The AI also adds content-based tags.
 - **Images** — when `ENABLE_IMAGES = True`, images are downloaded into an `img/` subfolder next to the note. Invalid responses (auth errors, HTML pages served as images) are detected and the original URL is kept instead.
-- **Image formats** — each saved image gets its type from its contents, not its URL, so a JPEG served as `.jpeg`, `.jfif`, `.PNG` or without any extension is saved as `.jpg`. JPG, PNG, GIF, WebP, AVIF and SVG keep their format. BMP, TIFF, HEIC/HEIF, JPEG XL, JPEG 2000, ICO and PSD are converted so they display everywhere: images with transparency become PNG; otherwise both a PNG and a JPG are made and the smaller one is kept (PNG wins for screenshots, diagrams and text, JPG for photos). Without a converter (`sips` on macOS, ImageMagick elsewhere) such images are kept as they are, with a warning. `finalize_image(path)` does all of this for a single file and can be used on its own.
+- **Image formats** — each saved image gets its type from its contents, not its URL, so a JPEG served as `.jpeg`, `.jfif`, `.PNG` or without any extension is saved as `.jpg`. JPG, PNG, SVG and GIF keep their format. WebP, AVIF, BMP, TIFF, HEIC/HEIF, JPEG XL, JPEG 2000, ICO and PSD are converted: images with transparency become PNG; otherwise both a PNG and a JPG are made and the smaller one is kept (PNG wins for screenshots, diagrams and text, JPG for photos). Without a converter (`sips` on macOS, ImageMagick elsewhere) such images are kept as they are, with a warning. `finalize_image(path)` does all of this for a single file and can be used on its own.
 - **Paper figures** — for arXiv papers converted from their LaTeX source, figures are collected from every subfolder (e.g. `figures/`) and matched by path, file name or name without extension (as `\includegraphics` often omits it). PDF and EPS figures are rendered at 200 dpi and then saved as PNG or JPG like any other image; figures made of several sub-figures keep all of them.
 - **Obsidian compatibility** — formatting is tuned for Obsidian. May look slightly different in other Markdown readers.
