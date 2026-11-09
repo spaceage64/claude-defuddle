@@ -84,7 +84,7 @@ A concise AI-generated summary of the article's key points...
 | Tool | Purpose | Install |
 |---|---|---|
 | [Claude Code](https://claude.ai/code) | Runs the skill | See Claude docs |
-| [defuddle](https://github.com/kepano/defuddle) | Extracts clean content from web pages | `npm install -g defuddle` |
+| [defuddle](https://github.com/kepano/defuddle) | Extracts clean content from web pages | `npm install -g defuddle` or `brew install defuddle` |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Downloads YouTube transcripts | `brew install yt-dlp` |
 | Python 3.9+ | Runs the formatting script | Pre-installed on macOS Ventura+ |
 | [Obsidian](https://obsidian.md) | Your note vault (optional) | See Obsidian site |

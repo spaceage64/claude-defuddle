@@ -198,7 +198,7 @@ def linkify_timecodes(text, vid_id):
         tc = m.group(1)
         secs = timecode_to_seconds(tc)
         return f'[**{tc}**](https://youtu.be/{vid_id}?t={secs})'
-    return re.sub(r'^\*\*(\d+:\d{2}(?::\d{2})?)\*\*', replace, text, flags=re.MULTILINE)
+    return re.sub(r'^\*\*(\d+:\d{2}(?::\d{2})?)\*\*(?: ·)?', replace, text, flags=re.MULTILINE)
 
 
 def extract_desc_tags(text):
@@ -2926,7 +2926,8 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
     Returns updated content with rewritten img/ paths.
     """
     import base64 as b64mod
-    pattern = re.compile(r'!\[(.*?)\]\(([^)]+)\)', re.DOTALL)
+    # The source may contain escaped parentheses (\( \)) and be followed by a "title"
+    pattern = re.compile(r'!\[(.*?)\]\(((?:\\.|[^)\\])+?)(?:\s+"[^"]*")?\)', re.DOTALL)
     if not pattern.search(content):
         return content
 
@@ -2935,7 +2936,7 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
     counter = [0]
 
     def replace_img(m):
-        alt, src = m.group(1), m.group(2)
+        alt, src = m.group(1), re.sub(r'\\([()])', r'\1', m.group(2))
         # Skip inline data, already-local files, and video embeds (YouTube / vid/)
         if src.startswith(('data:', 'img/', 'vid/')) or is_youtube(src):
             return m.group(0)
