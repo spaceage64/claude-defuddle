@@ -30,12 +30,13 @@ Use the output to answer the user's question or complete the task. The script au
 ```bash
 python3 ~/.claude/skills/defuddle/defuddle.py \
   --url "<url>" --project "{folder}" --created "{YYYY-MM-DD}" \
-  [--filename "kebab-case-name"] [--method native|native-md|native-page|googlebot|wayback|archive-is]
+  [--filename "kebab-case-name"] [--method native|native-md|native-page|googlebot|wayback|archive-is] [--keep-pdf]
 ```
 
 - `--project`: subfolder name inside your vault (e.g. `my-project`, `research`)
 - `--filename`: optional override; script auto-generates from the title via AI if omitted
 - `--method`: force a specific fetch method instead of the auto-cascade (articles only)
+- `--keep-pdf` (papers and PDFs): also save the original PDF next to the note, with the same name (`{filename}.pdf`). Use only when the user asks to keep the PDF.
 
 Notes are saved to `{vault}/{folder}/defuddle/` regardless of source type.
 

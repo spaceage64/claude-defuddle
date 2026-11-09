@@ -2419,6 +2419,7 @@ def build_paper(url, project, created):
                     if content:
                         content = fix_paper_markdown(content, latex=True)
                         method  = 'arxiv'
+                        meta['pdf_url'] = f'https://arxiv.org/pdf/{arxiv_id}'
                         # Collect figure files from the source dir (and its subfolders, e.g. figures/)
                         # before tmp_dir is cleaned up, keyed by their path relative to it. PDF/EPS
                         # figures are rendered to PNG/JPG by download_images → finalize_image.
@@ -2478,6 +2479,8 @@ def build_paper(url, project, created):
                 )
                 sys.exit(1)
             content, images_dict, method = pdf_to_markdown(pdf_path)
+            with open(pdf_path, 'rb') as f:
+                meta['pdf'] = f.read()   # for --keep-pdf; tmp_dir is gone once this returns
             if content:
                 content = fix_paper_markdown(content)
 
@@ -3461,6 +3464,33 @@ def fetch_for_method(url, method):
         return {}, method
 
 
+def save_original_pdf(save_dir, filename, source=None, meta=None):
+    """--keep-pdf: save the original PDF next to the note as {filename}.pdf.
+    source is the PDF's URL or local path; without one, the PDF build_paper found (meta) is used."""
+    meta = meta or {}
+    data = None if source else meta.get('pdf')
+    source = source or meta.get('pdf_url')
+    if data is None and source and os.path.isfile(source):
+        with open(source, 'rb') as f:
+            data = f.read()
+    elif data is None and source:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'original.pdf')
+            try:
+                subprocess.run(['curl', '-sL', '--max-time', '120', '-o', path, source],
+                               capture_output=True, timeout=125)
+                with open(path, 'rb') as f:
+                    data = f.read()
+            except Exception:
+                data = None
+    if not data or b'%PDF' not in data[:1024]:
+        print('WARNING: the original PDF could not be saved — the note was saved without it.', file=sys.stderr)
+        return
+    with open(os.path.join(save_dir, f'{filename}.pdf'), 'wb') as f:
+        f.write(data)
+    print(f'Saved the original PDF as {filename}.pdf next to the note')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('url_pos',    nargs='?', default=None, metavar='URL')
@@ -3469,6 +3499,8 @@ def main():
     parser.add_argument('--created',  default=None)
     parser.add_argument('--filename', default=None)
     parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'googlebot', 'wayback', 'archive-is'])
+    parser.add_argument('--keep-pdf', action='store_true',
+                        help='papers and PDFs: also save the original PDF next to the note, with the same name')
     args = parser.parse_args()
 
     raw_url = args.url or args.url_pos
@@ -3509,6 +3541,8 @@ def main():
                 with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
                     f.write(note)
                 print(f'Saved to {format_saved_path(args.project, filename)}')
+                if args.keep_pdf:
+                    save_original_pdf(save_dir, filename, source=pdf_url)
             else:
                 print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
             return
@@ -3575,6 +3609,8 @@ def main():
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write(note)
         print(f'Saved to {format_saved_path(args.project, filename)}')
+        if args.keep_pdf:
+            save_original_pdf(save_dir, filename, meta=meta)
         return
 
     # Plain PDFs: download, scan first page for DOI, route accordingly
@@ -3609,6 +3645,8 @@ def main():
         with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
             f.write(note)
         print(f'Saved to {format_saved_path(args.project, filename)}')
+        if args.keep_pdf:
+            save_original_pdf(save_dir, filename, source=url)
         return
 
     # Apple Podcasts: local TTML transcript, no HTTP cascade needed
