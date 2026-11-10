@@ -8,7 +8,7 @@ Usage:
         --url "<url>" --project "<project>" --created "YYYY-MM-DD"
 """
 
-import sys, json, re, argparse, subprocess, os, html, glob, shutil, tempfile, time, unicodedata
+import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata
 from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin
 from datetime import datetime, timezone
 
@@ -29,6 +29,10 @@ except Exception:
 # ║  Vault path — where notes are saved. Leave '' to read from projects.yaml.    ║
 # ║  Example: '/Users/you/Documents/Obsidian'                                    ║
 VAULT_PATH = ''
+# ║                                                                              ║
+# ║  Save folder — notes are saved in {vault}/{project}/{SAVE_SUBFOLDER}/.       ║
+# ║  '' sorts them by type instead: docs/, papers/ and transcripts/.             ║
+SAVE_SUBFOLDER = 'defuddle'
 # ║                                                                              ║
 # ║  Source feature flags — set False to treat that type as a generic article    ║
 ENABLE_YOUTUBE  = True
@@ -140,6 +144,12 @@ def frontmatter_field(key, value, quote=True):
     return f'{key}: {val}'
 
 
+def frontmatter_url(*urls):
+    """url is always a YAML list (one or more sources), so the property has one type vault-wide."""
+    urls = [u for u in urls if u]
+    return ('url:\n' + '\n'.join(f'  - {yaml_str(u)}' for u in urls)) if urls else None
+
+
 # Frontmatter 'method' says where the content came from, not which internal fetch route was used
 _METHOD_LABELS = {'native': 'web', 'native-md': 'web', 'native-page': 'web', 'googlebot': 'web',
                   'wayback': 'archive', 'archive-is': 'archive'}
@@ -153,12 +163,6 @@ def method_field(method):
 def _with_archive(d, archive_url):
     """Remember which archived copy the content came from (second 'url' value)."""
     return dict(d, archive_url=archive_url) if d else {}
-
-
-def frontmatter_url(*urls):
-    """url is always a YAML list (one or more sources), so the property has one type vault-wide."""
-    urls = [u for u in urls if u]
-    return ('url:\n' + '\n'.join(f'  - {yaml_str(u)}' for u in urls)) if urls else None
 
 
 def build_frontmatter(created, tags, extra_fields):
@@ -497,6 +501,96 @@ def fetch_vtt(url, vid_id, breaks=()):
                 pass
 
 
+def download_youtube(url, save_dir, filename_base, video_quality=None, audio_quality=None):
+    """Download a YouTube video (or just its audio/video track) next to the note.
+
+    video_quality: max height in pixels (e.g. 720); None = highest; 0 = audio only.
+    audio_quality: max audio bitrate in kbps (e.g. 64); None = highest; 0 = video only (no sound).
+    Video (with or without sound) → vid/{filename_base}-NNN.mp4; audio only → aud/{filename_base}-NNN.m4a.
+    H.264 + AAC are preferred at the chosen resolution for playback in Obsidian on iOS;
+    if YouTube has no H.264 at that resolution, another codec (VP9/AV1) is used and a
+    warning with a ready-made ffmpeg conversion command is printed.
+    English subtitles (manual, else auto-generated), chapters, metadata and the
+    thumbnail are embedded in the file. Returns the path relative to save_dir, or None.
+    """
+    audio_only = video_quality == 0
+    no_audio   = audio_quality == 0
+    sub, ext   = ('aud', 'm4a') if audio_only else ('vid', 'mp4')
+    out_dir = os.path.join(save_dir, sub)
+    os.makedirs(out_dir, exist_ok=True)
+    # Continue numbering after the highest existing file for this note
+    nums = [int(m.group(1)) for f in os.listdir(out_dir)
+            if (m := re.match(rf'^{re.escape(filename_base)}-(\d{{3}})\.', f))]
+    name = f'{filename_base}-{max(nums, default=0) + 1:03d}'
+    out_path = os.path.join(out_dir, f'{name}.{ext}')
+
+    sort = []
+    if not audio_only:
+        sort += [f'res:{video_quality}' if video_quality else 'res', 'vcodec:h264']
+    if not no_audio:
+        sort += ['acodec:aac'] + ([f'abr:{audio_quality}'] if audio_quality else [])
+    if audio_only:
+        # m4a can't take yt-dlp's --embed-subs, so subs are written as .srt and muxed in below
+        fmt = ['-f', 'ba/b', '-x', '--audio-format', 'm4a', '--convert-subs', 'srt']
+    else:
+        fmt = ['-f', 'bv*' if no_audio else 'bv*+ba/b',
+               '--merge-output-format', 'mp4', '--remux-video', 'mp4', '--embed-subs']
+    cmd = ['yt-dlp', *fmt, '-S', ','.join(sort),
+           '--write-subs', '--write-auto-subs', '--sub-langs', 'en',
+           '--embed-chapters', '--embed-metadata', '--embed-thumbnail',
+           '--quiet', '--no-warnings', '-o', os.path.join(out_dir, f'{name}.%(ext)s'), url]
+    # YouTube occasionally returns HTTP 403 on a fragment — one retry usually fixes it
+    for attempt in range(2):
+        r = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+        if r.returncode == 0 and os.path.exists(out_path):
+            break
+        print(f'Download failed (attempt {attempt + 1}/2).', file=sys.stderr)
+
+    srt = os.path.join(out_dir, f'{name}.en.srt')
+    if audio_only and os.path.exists(out_path) and os.path.exists(srt):
+        tmp = os.path.join(out_dir, f'{name}.tmp.m4a')
+        r = subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', out_path, '-i', srt,
+                            '-map', '0', '-map', '1', '-dn', '-c', 'copy', '-c:s', 'mov_text',
+                            '-metadata:s:s:0', 'language=eng', tmp],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            os.replace(tmp, out_path)
+        else:
+            print('WARNING: could not embed subtitles in the audio file.', file=sys.stderr)
+
+    # Remove leftover sidecar files (subs/thumbnail/temp) from the run
+    for f in glob.glob(os.path.join(out_dir, f'{name}.*')):
+        if f != out_path:
+            os.unlink(f)
+    if not os.path.exists(out_path):
+        if not os.listdir(out_dir):
+            os.rmdir(out_dir)
+        return None
+
+    if not audio_only:
+        try:
+            codec, height = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name,height',
+                 '-of', 'csv=p=0', out_path], capture_output=True, text=True, timeout=30).stdout.strip().split(',')
+            if codec != 'h264':
+                # H.264 is the safest choice up to 1080p; above that H.265 keeps files much smaller.
+                # hvc1/avc1 tags are needed for Apple playback. -dn drops yt-dlp's chapter data track
+                # (chapters themselves are kept), -map 0 keeps subs and cover art.
+                enc = (['libx264', '-crf', '23', '-preset', 'slow', '-tag:v:0', 'avc1'] if int(height) < 1080
+                       else ['libx265', '-crf', '26', '-preset', 'medium', '-tag:v:0', 'hvc1'])
+                tmp = out_path[:-4] + '.conv.mp4'
+                conv = ' '.join(shlex.quote(a) for a in
+                                ['ffmpeg', '-i', out_path, '-map', '0', '-dn', '-c', 'copy', '-c:v:0', *enc,
+                                 '-movflags', '+faststart', tmp])
+                print(f'WARNING: no H.264 at {height}p — saved as {codec}, which may not play in Obsidian on iPhone.\n'
+                      f'Convert to {"H.264" if int(height) < 1080 else "H.265"} '
+                      f'(keeps subtitles, chapters, metadata and cover art):\n'
+                      f'  {conv} && mv {shlex.quote(tmp)} {shlex.quote(out_path)}', file=sys.stderr)
+        except Exception:
+            pass
+    return f'{sub}/{name}.{ext}'
+
+
 def ai_enrich(title, author, content, needs_chapters=False):
     """Call an AI model for description, summary, tags, and optionally chapters.
 
@@ -638,8 +732,9 @@ def build_index(content, min_level=2):
 
 
 def _toc_section(toc, heading='Contents'):
-    """Wrap a TOC block with a ## heading and trailing divider, for consistent note structure."""
-    return f'## {heading}\n\n{toc}\n\n---'
+    """Wrap a TOC block in a collapsed callout with a trailing divider, for consistent note structure."""
+    body = '\n'.join(f'> {line}' if line.strip() else '>' for line in toc.splitlines())
+    return f'> [!note]- {heading}\n{body}\n\n---'
 
 
 def strip_title_suffix(title):
@@ -3030,7 +3125,6 @@ def _fix_paper_structure(content, title='', authors=None, ai_paragraphs=False):
     """Fix common structural issues in publisher-formatted (PDF-converted) papers:
     - Strip content before the paper title (publisher headers, logos, etc.)
     - Remove duplicate title headings
-    - Move AI image descriptions into alt-text; keep real captions in the body
     - Normalise abstract heading to ## Abstract and move it to the top
     Returns cleaned content."""
     # 0. Strip publisher preamble (headers, logos, author affiliations, download links, etc.)
@@ -3062,11 +3156,11 @@ def _fix_paper_structure(content, title='', authors=None, ai_paragraphs=False):
     # Shared vocabulary for figure/table label terms.
     # Require bold markers (**) before the label — Datalab always bolds real captions;
     # plain-text "Figure 2: ..." lines are AI duplicates and must not be treated as captions.
-    _cap_vocab   = r'fig(?:ure)?|tab(?:le)?|sch(?:eme)?|pl(?:ate)?|chart|diag(?:ram)?|panel|appendix|app'
-    caption_re   = re.compile(rf'(?mi)^\W*\*+(?:{_cap_vocab})\.?\s*\d')
+    _cap_vocab  = r'fig(?:ure)?|tab(?:le)?|sch(?:eme)?|pl(?:ate)?|chart|diag(?:ram)?|panel|appendix|app'
+    caption_re  = re.compile(rf'(?mi)^\W*\*+(?:{_cap_vocab})\.?\s*\d')
     # Strip a leading bold caption label (e.g. "**Fig. 2.**") from the start of a line.
     cap_label_re = re.compile(rf'^\W*\*+(?:{_cap_vocab})[\w.\s]*?\*+\s*', re.IGNORECASE)
-    line_updates   = {}   # line index -> replacement string
+    line_updates  = {}   # line index -> replacement string
     lines_to_remove = set()
     img_re = re.compile(r'^(!\[)(.*?)(\]\([^)]+\))\s*$')
     for i, line in enumerate(lines):
@@ -3278,11 +3372,8 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 else:
                     print('Paper is not publicly accessible and no shadow library is configured (set SHADOW_BASE_URL).', file=sys.stderr)
             if not pdf_path:
-                print(
-                    'Could not retrieve PDF. Please provide a direct link to the PDF.',
-                    file=sys.stderr
-                )
-                sys.exit(1)
+                print('Could not retrieve PDF.', file=sys.stderr)
+                return '', {}, {}
             content, images_dict, method = converted or pdf_to_markdown(pdf_path)
             with open(pdf_path, 'rb') as f:
                 meta['pdf'] = f.read()   # for --keep-pdf; tmp_dir is gone once this returns
@@ -3378,6 +3469,68 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     heading = f'# {title}' if title else ''
     parts   = [fm] + ([heading] if heading else []) + [content]
     return '\n\n'.join(parts), images_dict, meta
+
+
+def title_from_content(content):
+    """Extract title from first # or ## heading, or return empty string."""
+    for prefix in (r'^# ', r'^## '):
+        m = re.search(prefix + r'(.+)$', content, re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return ''
+
+
+def build_article(d, url, project, created, method=None):
+    title     = strip_title_suffix(d.get('title', '') or title_from_content(d.get('content', '')))
+    author    = d.get('author', '')
+    published = (d.get('published') or '')[:10]
+    site      = d.get('site', '')
+    words     = d.get('wordCount')
+    content   = d.get('content', '')
+    # Strip leading heading from content if it duplicates the title (or its first component)
+    if title:
+        first_component = re.split(r'\s+[-—|]\s+', title)[0].strip()
+        candidates = [title] + ([first_component] if first_component != title else [])
+        for candidate in candidates:
+            new_content = re.sub(r'^\s*#{1,2}\s+' + re.escape(candidate) + r'\s*\n?', '', content).lstrip()
+            if new_content != content:
+                content = new_content
+                break
+
+    # Gemini enrichment
+    ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, author, content)
+    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
+
+    # Build index from article headings
+    index = build_index(content)
+
+    fm_description = ai_desc if ai_desc else '[Description to be added]'
+    fm = build_frontmatter(created, ai_tags_clean, [
+        frontmatter_field('title', title),
+        f'description: {yaml_str(fm_description)}',
+        frontmatter_url(url, d.get('archive_url')),   # archived copy as a second source
+        *([f'author:\n  - {yaml_str(author)}'] if author else []),
+        frontmatter_field('published', published),
+        frontmatter_field('site', site),
+        frontmatter_field('words', words, quote=False) if words else None,
+        method_field(method),
+    ])
+    summary = ai_summary if ai_summary else '[Summary to be added]'
+
+    index_section = ('\n' + _toc_section(index, 'Index') + '\n') if index else '\n---\n'
+
+    return f"""{fm}
+
+---
+
+# {title}
+
+## Summary
+
+{summary}
+{index_section}
+{content}
+"""
 
 
 def build_pdf(url, project, created, skip_doi=False):
@@ -3490,84 +3643,28 @@ def build_pdf(url, project, created, skip_doi=False):
     return note, images_dict, {'title': title}
 
 
-def title_from_content(content):
-    """Extract title from first # or ## heading, or return empty string."""
-    for prefix in (r'^# ', r'^## '):
-        m = re.search(prefix + r'(.+)$', content, re.MULTILINE)
-        if m:
-            return m.group(1).strip()
-    return ''
-
-
-def build_article(d, url, project, created, method=None):
-    title     = strip_title_suffix(d.get('title', '') or title_from_content(d.get('content', '')))
-    author    = d.get('author', '')
-    published = (d.get('published') or '')[:10]
-    site      = d.get('site', '')
-    words     = d.get('wordCount')
-    content   = d.get('content', '')
-    # Strip leading heading from content if it duplicates the title (or its first component)
-    if title:
-        first_component = re.split(r'\s+[-—|]\s+', title)[0].strip()
-        candidates = [title] + ([first_component] if first_component != title else [])
-        for candidate in candidates:
-            new_content = re.sub(r'^\s*#{1,2}\s+' + re.escape(candidate) + r'\s*\n?', '', content).lstrip()
-            if new_content != content:
-                content = new_content
-                break
-
-    # Gemini enrichment
-    ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, author, content)
-    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
-
-    # Build index from article headings
-    index = build_index(content)
-
-    fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter(created, ai_tags_clean, [
-        frontmatter_field('title', title),
-        f'description: {yaml_str(fm_description)}',
-        frontmatter_url(url, d.get('archive_url')),   # archived copy as a second source
-        *([f'author:\n  - {yaml_str(author)}'] if author else []),
-        frontmatter_field('published', published),
-        frontmatter_field('site', site),
-        frontmatter_field('words', words, quote=False) if words else None,
-        method_field(method),
-    ])
-    summary = ai_summary if ai_summary else '[Summary to be added]'
-
-    index_section = ('\n' + _toc_section(index, 'Index') + '\n') if index else '\n---\n'
-
-    return f"""{fm}
-
----
-
-# {title}
-
-## Summary
-
-{summary}
-{index_section}
-{content}
-"""
-
-
 def get_vault_path():
-    """Return vault path: VAULT_PATH setting > ~/Documents/Obsidian."""
+    """Return vault path: VAULT_PATH setting > ~/.claude/projects.yaml > ~/Documents/Obsidian."""
     if VAULT_PATH:
         return os.path.expanduser(VAULT_PATH)
-    return os.path.expanduser('~/Documents/Obsidian')
+    try:
+        content = open(os.path.expanduser('~/.claude/projects.yaml')).read()
+        m = re.search(r'path:\s*(.+)', content)
+        return m.group(1).strip() if m else os.path.expanduser('~/Documents/Obsidian')
+    except Exception:
+        return os.path.expanduser('~/Documents/Obsidian')
 
 
-def get_save_dir(vault, project):
-    """Build save directory path. project is optional."""
-    parts = [vault] + ([project] if project else []) + ['defuddle']
+def get_save_dir(vault, category, project, subdir):
+    """Build save directory path. category and project are optional; SAVE_SUBFOLDER, when set,
+    replaces the per-type subdir (docs, papers, transcripts)."""
+    parts = [vault] + ([category] if category else []) + ([project] if project else []) + [SAVE_SUBFOLDER or subdir]
     return os.path.join(*parts)
 
 
-def format_saved_path(project, filename):
+def format_saved_path(category, project, subdir, filename):
     """Format the 'Saved to ...' confirmation string."""
-    parts = ([project] if project else []) + ['defuddle', filename]
+    parts = ([category] if category else []) + ([project] if project else []) + [SAVE_SUBFOLDER or subdir, filename]
     return '/'.join(parts)
 
 
@@ -3607,7 +3704,6 @@ def generate_filename(title, max_words=None):
     """Generate a kebab-case filename from a title using the configured AI provider.
     Falls back to filtering title words by length if the AI call fails."""
     import urllib.request as _urlreq
-
     n = max_words or FILENAME_WORDS
     ai_prompt = f'Give me a 1 to {n} word kebab-case filename (no extension) for an article titled "{title}". Drop apostrophes instead of hyphenating them (O\'Hara -> ohara). Return ONLY the filename, nothing else.'
 
@@ -3660,7 +3756,10 @@ def generate_filename(title, max_words=None):
         except Exception:
             pass
 
-    # Fallback: filter words by decreasing minimum length until we get 3
+    # Fallback: filter words by decreasing minimum length until we get 3.
+    # Transliterate accents first (e.g. "Rosé" -> "Rose") — plain
+    # [a-zA-Z0-9] matching would otherwise silently truncate a word at its
+    # first accented character.
     words = [w for w in _slug(title or '').split('-') if w]
     for min_len in (4, 3, 2, 0):
         filtered = [w.lower() for w in words if len(w) > min_len]
@@ -4569,9 +4668,19 @@ def main(argv=None):
     parser.add_argument('url_pos',    nargs='*', default=[], metavar='URL')
     parser.add_argument('--url',      default=None)
     parser.add_argument('--project',  default=None)
+    parser.add_argument('--category', default=None, help=argparse.SUPPRESS)   # optional parent folder above --project
     parser.add_argument('--created',  default=None)
     parser.add_argument('--filename', default=None)
     parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'googlebot', 'wayback', 'archive-is'])
+    _num = lambda unit: (lambda s: int(re.sub(rf'(?i){unit}$', '', s.strip())))
+    parser.add_argument('--download', action='store_true',
+                        help='YouTube: also save the video to vid/ and embed the local file')
+    parser.add_argument('--video-quality', type=_num('p'), default=None, metavar='HEIGHT',
+                        help='max video height, e.g. 720 or 720p; 0 = audio only, saved to aud/ '
+                             '(implies --download; default: highest)')
+    parser.add_argument('--audio-quality', type=_num('k'), default=None, metavar='KBPS',
+                        help='max audio bitrate in kbps, e.g. 64 or 64k; 0 = video without sound '
+                             '(implies --download; default: highest)')
     parser.add_argument('--doi', default=None,
                         help='PDFs: the paper\'s DOI when it is known (e.g. a PDF saved from a shadow library); '
                              'saves it as a paper without searching')
@@ -4580,6 +4689,11 @@ def main(argv=None):
                              '(default: KEEP_PDF)')
     argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(argv)
+    if args.video_quality == args.audio_quality == 0:
+        parser.error('--video-quality and --audio-quality cannot both be 0')
+    # 0 is a valid value (skip that track), so test for None rather than truthiness
+    if args.video_quality is not None or args.audio_quality is not None:
+        args.download = True
 
     if args.keep_pdf is None:
         args.keep_pdf = KEEP_PDF
@@ -4617,15 +4731,15 @@ def main(argv=None):
             title    = meta.get('title', '')
             filename = args.filename or generate_filename(title)
             vault    = get_vault_path()
-            save_dir = get_save_dir(vault, args.project)
-            if args.project is not None:
+            save_dir = get_save_dir(vault, args.category, args.project, 'docs')
+            if args.project is not None or args.category is not None:
                 os.makedirs(save_dir, exist_ok=True)
                 if ENABLE_IMAGES:
                     note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=pdf_url)
                 note = _dedup_note_tags(note)
                 with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
                     f.write(note)
-                print(f'Saved to {format_saved_path(args.project, filename)}')
+                print(f'Saved to {format_saved_path(args.category, args.project, "docs", filename)}')
                 if args.keep_pdf:
                     save_original_pdf(save_dir, filename, source=pdf_url)
             else:
@@ -4677,7 +4791,7 @@ def main(argv=None):
         else:
             print('Shadow library URL detected but no DOI found in path.', file=sys.stderr)
 
-    # Normalize DOI URLs to canonical https://doi.org/{doi} form (strip dx., www., etc.)
+    # Normalize doi.org URLs to canonical form (strip dx., www., etc.)
     if ENABLE_PAPER and 'doi.org' in url and 'arxiv.org' not in url:
         doi_part = extract_doi(url)
         if doi_part:
@@ -4685,7 +4799,7 @@ def main(argv=None):
 
     # Academic papers: DOI / arXiv / shadow library
     if ENABLE_PAPER and is_paper_url(url):
-        if args.project is None:
+        if args.project is None and args.category is None:
             note, _, _meta = build_paper(url, None, args.created)
             print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
             return
@@ -4700,21 +4814,21 @@ def main(argv=None):
         ai_name  = generate_filename(title)
         filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
         vault    = get_vault_path()
-        save_dir = get_save_dir(vault, args.project)
-        os.makedirs(save_dir, exist_ok=True)
+        papers_dir = get_save_dir(vault, args.category, args.project, 'papers')
+        os.makedirs(papers_dir, exist_ok=True)
         if ENABLE_IMAGES:
-            note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=url)
+            note = download_images(note, papers_dir, filename, images_dict=images_dict, source_url=url)
         note = _dedup_note_tags(note)
-        out_path = os.path.join(save_dir, f'{filename}.md')
+        out_path = os.path.join(papers_dir, f'{filename}.md')
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write(note)
-        print(f'Saved to {format_saved_path(args.project, filename)}')
+        print(f'Saved to {format_saved_path(args.category, args.project, "papers", filename)}')
         if args.keep_pdf:
-            save_original_pdf(save_dir, filename, meta=meta)
+            save_original_pdf(papers_dir, filename, meta=meta)
         return
 
     # Plain PDFs: download, scan first page for DOI, route accordingly
-    if ENABLE_PDF and is_pdf_url(url):
+    if is_pdf_url(url):
         if args.doi:   # DOI given: no need to search for it
             doi = re.sub(r'^(https?://(dx\.)?doi\.org/|doi:)', '', args.doi.strip(), flags=re.I)
             if os.path.isabs(url):
@@ -4733,7 +4847,7 @@ def main(argv=None):
                 fd, pdf_file = tempfile.mkstemp(suffix='.pdf')
                 with os.fdopen(fd, 'wb') as f:
                     f.write(meta['pdf_bytes'])
-            if args.project is None:
+            if args.project is None and args.category is None:
                 try:
                     note, _, _meta = build_paper(doi_url, None, args.created, pdf_file=pdf_file, converted=meta.get('converted'))
                 finally:
@@ -4755,24 +4869,26 @@ def main(argv=None):
             ai_name  = generate_filename(meta.get('title', ''))
             filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
             vault    = get_vault_path()
-            save_dir = get_save_dir(vault, args.project)
+            save_dir = get_save_dir(vault, args.category, args.project, 'papers')
+            subdir   = 'papers'
         elif not note:
             return
-        elif args.project is None:   # read-only: print instead of saving
+        elif args.project is None and args.category is None:   # read-only: print instead of saving
             print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
             return
         else:
             title    = meta.get('title', '')
             filename = args.filename or generate_filename(title)
             vault    = get_vault_path()
-            save_dir = get_save_dir(vault, args.project)
+            save_dir = get_save_dir(vault, args.category, args.project, 'docs')
+            subdir   = 'docs'
         os.makedirs(save_dir, exist_ok=True)
         if ENABLE_IMAGES:
             note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=url)
         note = _dedup_note_tags(note)
         with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
             f.write(note)
-        print(f'Saved to {format_saved_path(args.project, filename)}')
+        print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
         if args.keep_pdf:
             if meta and meta.get('pdf'):
                 save_original_pdf(save_dir, filename, meta=meta)
@@ -4794,7 +4910,7 @@ def main(argv=None):
                 file=sys.stderr
             )
             return
-        if args.project is None:
+        if args.project is None and args.category is None:
             # Present mode: print transcript text
             for chunk in parse_ttml(ttml_path):
                 speaker_label = re.sub(r'SPEAKER_(\d+)', r'Speaker \1', chunk['speaker'])
@@ -4813,15 +4929,15 @@ def main(argv=None):
         ep_slug    = generate_filename(cleaned_title or title)
         filename   = args.filename or (f'{show_slug}-{ep_slug}' if show_slug else ep_slug)
         vault    = get_vault_path()
-        save_dir = get_save_dir(vault, args.project)
-        os.makedirs(save_dir, exist_ok=True)
+        transcripts_dir = get_save_dir(vault, args.category, args.project, 'transcripts')
+        os.makedirs(transcripts_dir, exist_ok=True)
         if ENABLE_IMAGES:
-            note = download_images(note, save_dir, filename, source_url=url)
+            note = download_images(note, transcripts_dir, filename, source_url=url)
         note = _dedup_note_tags(note)
-        out_path = os.path.join(save_dir, f'{filename}.md')
+        out_path = os.path.join(transcripts_dir, f'{filename}.md')
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write(note)
-        print(f'Saved to {format_saved_path(args.project, filename)}')
+        print(f'Saved to {format_saved_path(args.category, args.project, "transcripts", filename)}')
         return
 
     # YouTube: defuddle's page parse plus yt-dlp, no archive cascade. A video without subtitles
@@ -4831,7 +4947,9 @@ def main(argv=None):
         if not d:
             print('Could not read this video (defuddle and yt-dlp both failed).', file=sys.stderr)
             return
-        if args.project is None:
+        if args.project is None and args.category is None:
+            if args.download:
+                print('--download only works when saving (--project/--category) — skipped.', file=sys.stderr)
             present_youtube(d, url)
             return
     elif args.method:
@@ -4892,8 +5010,10 @@ def main(argv=None):
                     file=sys.stderr
                 )
 
-    # Present mode (no --project): output raw content
-    if args.project is None:
+    # Present mode (no --project and no --category): output raw content
+    if args.project is None and args.category is None:
+        if args.download:
+            print('--download only works when saving (--project/--category) — skipped.', file=sys.stderr)
         print(d.get('content', ''), end='')
         return
 
@@ -4911,16 +5031,25 @@ def main(argv=None):
     title = d.get('title', '') or title_from_content(d.get('content', ''))
     filename = args.filename or generate_filename(title)
 
-    vault    = get_vault_path()
-    save_dir = get_save_dir(vault, args.project)
+    vault   = get_vault_path()
+    subdir  = 'transcripts' if is_youtube(url) else 'docs'
+    save_dir = get_save_dir(vault, args.category, args.project, subdir)
     os.makedirs(save_dir, exist_ok=True)
     if ENABLE_IMAGES:
         note = download_images(note, save_dir, filename, source_url=url)
+    if args.download and ENABLE_YOUTUBE and is_youtube(url):
+        local = download_youtube(url, save_dir, filename, args.video_quality, args.audio_quality)
+        if local:
+            # Swap the YouTube embed for the local file; the URL stays in the frontmatter
+            note = re.sub(r'^!\[\]\(https://youtu\.be/[^)]+\)$', f'![]({local})', note, count=1, flags=re.M)
+        else:
+            print('WARNING: download failed after 2 attempts — nothing saved locally; '
+                  'the note keeps the YouTube embed.', file=sys.stderr)
     note = _dedup_note_tags(note)
     out_path = os.path.join(save_dir, f'{filename}.md')
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(note)
-    print(f'Saved to {format_saved_path(args.project, filename)}')
+    print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
 
 
 if __name__ == '__main__':

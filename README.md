@@ -72,7 +72,7 @@ Just paste a link into Claude Code:
 
 > "https://doi.org/10.1145/3706598.3713709"
 
-Claude reads the clean version and asks whether to save it. Tell it a folder name, and the note lands in `{vault}/{folder}/defuddle/`.
+Claude reads the clean version and asks whether to save it. Tell it a folder name, and the note lands in `{vault}/{folder}/defuddle/`. Prefer folders by type? Set `SAVE_SUBFOLDER = ''` in `defuddle.py`, and notes go to `docs/`, `papers/` and `transcripts/` instead.
 
 ---
 
@@ -126,11 +126,10 @@ method: "defuddle-web"
 
 A concise AI-generated summary of the article's key points...
 
-## Index
-
-- [[#Setting up your project]]
-- [[#Writing pyproject.toml]]
-- [[#Publishing to PyPI]]
+> [!note]- Index
+> - [[#Setting up your project]]
+> - [[#Writing pyproject.toml]]
+> - [[#Publishing to PyPI]]
 
 ---
 
@@ -150,7 +149,8 @@ A concise AI-generated summary of the article's key points...
 |---|---|---|
 | [Claude Code](https://claude.ai/code) | Runs the skill | See Claude docs |
 | [defuddle](https://github.com/kepano/defuddle) | Extracts clean content from web pages | `brew install defuddle` or `npm install -g defuddle` |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Downloads YouTube transcripts | `brew install yt-dlp` |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Downloads YouTube transcripts (and videos with `--download`) | `brew install yt-dlp` |
+| [ffmpeg](https://ffmpeg.org) | Merges video and audio for `--download` (optional) | `brew install ffmpeg` |
 | Python 3.9+ | Runs the formatting script | Pre-installed on macOS Ventura+ |
 | [Obsidian](https://obsidian.md) | Your note vault (optional) | See Obsidian site |
 
@@ -225,6 +225,7 @@ AI_MODEL = 'llama3.2'
 - **YouTube transcripts** — manual captions first (better quality), then auto-generated ones. Duplicated lines from rolling captions are removed automatically.
 - **YouTube chapters** — the video's own chapter markers are used; without them, the AI adds logical chapter breaks.
 - **Videos without subtitles** — the note still gets the title, channel and full description, with "No subtitles available for this video." in place of the transcript. YouTube links never go through the archive fallbacks.
+- **Saving the video** — ask Claude to keep a local copy, and `--download` saves it to `vid/{note}-001.mp4` next to the note (subtitles, chapters and thumbnail embedded), and the note embeds the local file instead of YouTube. `--video-quality 720p` and `--audio-quality 64k` cap the quality; `--video-quality 0` saves audio only, to `aud/`. H.264 is preferred so the file plays in Obsidian on iPhone; otherwise a warning gives a ready-made ffmpeg command to convert it.
 - **Apple Podcasts** — same as YouTube, using the TTML transcript the macOS Podcasts app stores. macOS only; no other podcast platforms for now.
 - **Tags** — hashtags in YouTube descriptions and keywords in paper abstracts become tags, and the AI adds content-based tags.
 
