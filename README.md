@@ -7,7 +7,7 @@ Works with:
 - **Web pages and docs**, with Wayback Machine / archive.is fallbacks for paywalled or JS-heavy pages
 - **YouTube videos**: full transcript with timestamps and chapters
 - **Apple Podcasts** episodes (macOS)
-- **Academic papers**: DOI, arXiv, SSRN and Academia.edu links
+- **Academic papers**: DOI, arXiv, SSRN and Academia.edu links, article links from publishers like ScienceDirect, Wiley and Springer, PubMed, NBER and university repositories
 - **PDFs**: any `.pdf` link or a file on your computer
 
 Every note gets an AI summary, tags and an index, and images can be saved locally.
@@ -233,8 +233,11 @@ AI_MODEL = 'llama3.2'
 Supported sources:
 
 - **DOI** — `https://doi.org/10.xxxx/...`
-- **arXiv** — `https://arxiv.org/abs/...`
+- **arXiv** — `https://arxiv.org/abs/...`, or its `/pdf/` and `/html/` links
 - **SSRN** — `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=...`
+- **Publisher pages** — article links from ScienceDirect, Cell, Wiley, Springer, Nature, Taylor & Francis, SAGE, MDPI, Frontiers, PLOS, ACS, ACM, Science, PNAS, JSTOR and other large publishers (see `PAPER_SITES`). The DOI is taken from the link (or, for Elsevier, looked up in Crossref) and the paper goes through the normal pipeline. Sites that block scripts and have no DOI in the link (IEEE, OUP, Cambridge) need the DOI link instead
+- **Paper indexes and preprints** — NBER, PubMed, PMC, Europe PMC, bioRxiv, medRxiv, OpenAlex and Semantic Scholar links are turned into their DOI
+- **University repositories and other scholarly pages** — any page with Google Scholar meta tags (DSpace, EPrints, Zenodo and most university repositories) goes through the paper pipeline when it names a DOI, or through the PDF pipeline with its PDF link when it doesn't (e.g. theses)
 - **Academia.edu** — `https://www.academia.edu/{id}/...` (public PDF if available, otherwise the shadow library via DOI)
 - **Any `.pdf` link** — the first page is scanned for a DOI and sent through the paper pipeline if one is found
 - **A local file** — pass the path to a PDF on your computer

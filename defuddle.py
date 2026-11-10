@@ -9,7 +9,7 @@ Usage:
 """
 
 import sys, json, re, argparse, subprocess, os, html, glob, shutil, tempfile, time, unicodedata
-from urllib.parse import urlparse, urlunparse, quote, urljoin
+from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin
 from datetime import datetime, timezone
 
 import io
@@ -1060,7 +1060,7 @@ def build_apple_podcast(url, project, created, ttml_path):
 def is_pdf_url(url):
     """True for URLs or local paths ending in .pdf that aren't already handled as papers."""
     path = url if os.path.isabs(url) else urlparse(url).path
-    return path.lower().endswith('.pdf') and not is_paper_url(url)
+    return url in _PDF_URLS or (path.lower().endswith('.pdf') and not is_paper_url(url))
 
 def extract_doi_from_pdf_text(text):
     """Scan text (e.g. first PDF page) for a DOI. Returns the bare DOI string or None."""
@@ -1093,6 +1093,194 @@ def is_ssrn_url(url):
 def extract_ssrn_doi(url):
     m = re.search(r'(?:abstract_id|abstract)=(\d+)', url, re.IGNORECASE)
     return f'10.2139/ssrn.{m.group(1)}' if m else None
+
+# Publisher and paper-index pages. Most carry the DOI in the URL; Elsevier uses a PII
+# (looked up in Crossref, as ScienceDirect blocks scripts), Nature an article ID under
+# 10.1038, and NCBI, OpenAlex and Semantic Scholar their own IDs (looked up in their
+# APIs). For the rest, the page's citation_doi meta tag is read.
+PAPER_SITES = (
+    'sciencedirect.com', 'cell.com', 'thelancet.com',                            # Elsevier
+    'link.springer.com', 'nature.com', 'biomedcentral.com', 'springeropen.com',  # Springer Nature
+    'onlinelibrary.wiley.com', 'hindawi.com',                                    # Wiley
+    'tandfonline.com', 'journals.sagepub.com', 'mdpi.com', 'frontiersin.org',
+    'ieeexplore.ieee.org', 'pubs.acs.org', 'academic.oup.com', 'cambridge.org',
+    'journals.plos.org', 'journals.lww.com', 'dl.acm.org', 'degruyter.com',
+    'emerald.com', 'iopscience.iop.org', 'journals.aps.org', 'pubs.aip.org',
+    'pubs.rsc.org', 'science.org', 'pnas.org', 'jstor.org', 'bmj.com',
+    'jamanetwork.com', 'nejm.org', 'annualreviews.org', 'pubsonline.informs.org',
+    'aeaweb.org', 'journals.uchicago.edu', 'direct.mit.edu', 'worldscientific.com',
+    'epubs.siam.org', 'royalsocietypublishing.org', 'muse.jhu.edu', 'karger.com',
+    'thieme-connect.com', 'brill.com',
+    'nber.org', 'ncbi.nlm.nih.gov', 'europepmc.org', 'biorxiv.org', 'medrxiv.org',  # indexes and preprints
+    'openalex.org', 'semanticscholar.org',
+)
+
+# Page-type suffixes publishers append after the DOI (/full, /abstract, .pdf, ...)
+_DOI_TAIL = re.compile(r'(?:/(?:full|abstract|abs|pdf|epdf|pdfdirect|html|fulltext|summary|meta'
+                       r'|references|figures|suppl)|\.(?:full|abstract|pdf|full-text))+$', re.IGNORECASE)
+
+# Meta tags that carry a page's own DOI or PDF link (Google Scholar's citation_* tags,
+# also used by university repositories such as DSpace, EPrints and Zenodo)
+_DOI_META = ('citation_doi', 'bepress_citation_doi', 'prism.doi', 'dc.identifier', 'dcterms.identifier')
+_PDF_META = ('citation_pdf_url', 'bepress_citation_pdf_url')
+_PDF_URLS = set()   # PDF links without a .pdf extension, found in meta tags (see academic_target)
+
+def _html_meta_tags(page):
+    """<meta> tags of an HTML page in the form of defuddle's metaTags."""
+    tags = []
+    for tag in re.findall(r'<meta\b[^>]*>', page, re.IGNORECASE):
+        attrs = {k.lower(): html.unescape(v) for k, _, v in re.findall(r'([\w:.-]+)\s*=\s*(["\'])(.*?)\2', tag)}
+        tags.append({'name': attrs.get('name'), 'property': attrs.get('property'), 'content': attrs.get('content')})
+    return tags
+
+def _meta_values(tags, names):
+    """Contents of the meta tags with these names, in the order of the names."""
+    for name in names:
+        for t in tags or []:
+            if (t.get('name') or t.get('property') or '').lower() == name and t.get('content'):
+                yield t['content'].strip()
+
+def doi_from_meta(tags):
+    """The page's own DOI from its meta tags, or None."""
+    for value in _meta_values(tags, _DOI_META):
+        m = re.search(r'10\.\d{4,9}/[^\s"<>]+', unquote(value))
+        if m:
+            return m.group(0).rstrip('.')
+    return None
+
+def academic_target(tags, page_url):
+    """For a scholarly page (citation_* meta tags): its doi.org URL, else its PDF URL, else None."""
+    doi = doi_from_meta(tags)
+    if doi:
+        return f'https://doi.org/{doi}'
+    pdf = next(_meta_values(tags, _PDF_META), None)
+    if pdf and ENABLE_PDF:
+        pdf = urljoin(page_url, pdf)
+        _PDF_URLS.add(pdf)
+        return pdf
+    return None
+
+def is_paper_site(url):
+    host = urlparse(url).netloc.lower().split(':')[0]
+    return any(host == d or host.endswith('.' + d) for d in PAPER_SITES)
+
+def _crossref(path):
+    """GET a Crossref API path and return its 'message', or None."""
+    try:
+        r = subprocess.run(['curl', '-sL', '--max-time', '15', f'https://api.crossref.org/{path}'],
+                           capture_output=True, timeout=20)
+        return json.loads(r.stdout.decode('utf-8', errors='replace'))['message']
+    except Exception:
+        return None
+
+def _get_json(url):
+    """GET a JSON API, or None."""
+    try:
+        r = subprocess.run(['curl', '-sL', '--max-time', '15', url], capture_output=True, timeout=20)
+        return json.loads(r.stdout.decode('utf-8', errors='replace'))
+    except Exception:
+        return None
+
+def _ncbi_doi(path):
+    """DOI for a PubMed, PMC or Europe PMC article page, via NCBI's APIs, or None."""
+    m = re.search(r'\b(PMC\d+)', path, re.IGNORECASE)
+    if m:
+        data = _get_json('https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/'
+                         f'?ids={m.group(1).upper()}&format=json&tool=defuddle')
+        recs = (data or {}).get('records') or [{}]
+        return recs[0].get('doi')
+    m = re.match(r'/(?:article/MED/|abstract/MED/)?(\d{5,9})\b', path, re.IGNORECASE)
+    if m:
+        data = _get_json('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi'
+                         f'?db=pubmed&id={m.group(1)}&retmode=json&tool=defuddle')
+        ids = ((data or {}).get('result') or {}).get(m.group(1), {}).get('articleids', [])
+        return next((i['value'] for i in ids if i.get('idtype') == 'doi'), None)
+    return None
+
+def _index_doi(host, path):
+    """DOI for an OpenAlex or Semantic Scholar work page, or None (arXiv papers get their arXiv DOI)."""
+    if host.endswith('openalex.org'):
+        m = re.search(r'\b(W\d+)', path)
+        data = _get_json(f'https://api.openalex.org/works/{m.group(1)}?select=doi,ids') if m else None
+        doi = (data or {}).get('doi') or ''
+        return re.sub(r'^https?://doi\.org/', '', doi) or None
+    m = re.search(r'\b([0-9a-f]{40})\b', path)
+    if m:
+        data = _get_json(f'https://api.semanticscholar.org/graph/v1/paper/{m.group(1)}?fields=externalIds')
+        ids = (data or {}).get('externalIds') or {}
+        if ids.get('DOI'):
+            return ids['DOI']
+        if ids.get('ArXiv'):
+            return f'10.48550/arXiv.{ids["ArXiv"]}'
+    return None
+
+def _crossref_pii_doi(pii):
+    """DOI for an Elsevier PII via Crossref's alternative-id field, or None."""
+    msg = _crossref(f'works?filter=alternative-id:{pii}&rows=1&select=DOI')
+    return msg['items'][0]['DOI'] if msg and msg.get('items') else None
+
+def _mdpi_doi(path):
+    """MDPI: /{issn}/{volume}/{issue}/{article} -> 10.3390/{journal code}{vv}{ii}{aaaa}.
+    The journal code (e.g. 'su') comes from any DOI of that journal in Crossref."""
+    m = re.match(r'/(\d{4}-\d{3}[\dX])/(\d+)/(\d+)/(\d+)', path)
+    if not m:
+        return None
+    issn, vol, issue, art = m.groups()
+    msg  = _crossref(f'journals/{issn}/works?rows=1&select=DOI')
+    code = re.match(r'10\.3390/([a-z]+)', msg['items'][0]['DOI']) if msg and msg.get('items') else None
+    if not code:
+        return None
+    doi = f'10.3390/{code.group(1)}{int(vol):02d}{int(issue):02d}{int(art):04d}'
+    return doi if _crossref(f'works/{doi}') else None
+
+def paper_site_doi(url):
+    """DOI for a publisher article page (see PAPER_SITES), or None."""
+    p      = urlparse(url)
+    path   = unquote(p.path)
+    target = path + ('?' + unquote(p.query) if p.query else '')
+    m = re.search(r'\b(10\.\d{4,9}/[^?#&\s]+)', target)
+    if m:
+        doi = _DOI_TAIL.sub('', m.group(1)).rstrip('/.')
+        return re.sub(r'v\d+$', '', doi) if doi.startswith('10.1101/') else doi   # bioRxiv versions
+    host = p.netloc.lower()
+    if host.endswith('nber.org'):
+        m = re.search(r'/(w\d{3,6})\b', path)
+        if m:
+            return f'10.3386/{m.group(1)}'
+    if host.endswith(('ncbi.nlm.nih.gov', 'europepmc.org')):
+        return _ncbi_doi(path)
+    if host.endswith(('openalex.org', 'semanticscholar.org')):
+        return _index_doi(host, path)
+    # Elsevier: /pii/S1703494920300384, or Cell/Lancet style S0092-8674(11)00127-9
+    m = (re.search(r'/pii/([A-Z0-9]+)', path, re.IGNORECASE) or
+         re.search(r'/(S\d{4}-?\d{3}[\dX]\(\d\d\)\d{5}-?[\dX])', path, re.IGNORECASE))
+    if m:
+        doi = _crossref_pii_doi(re.sub(r'[^0-9A-Za-z]', '', m.group(1)).upper())
+        if doi:
+            return doi
+    if p.netloc.lower().endswith('nature.com'):
+        m = re.match(r'/articles/([A-Za-z0-9.\-]+)$', path)
+        if m:
+            return f'10.1038/{m.group(1)}'
+    if p.netloc.lower().endswith('mdpi.com'):
+        doi = _mdpi_doi(path)
+        if doi:
+            return doi
+    if p.netloc.lower().endswith('jstor.org'):
+        # Many (not all) JSTOR items are registered as 10.2307/{stable id}
+        m = re.match(r'/stable/(?:pdf/)?(\d+)', path)
+        if m and _crossref(f'works/10.2307/{m.group(1)}'):
+            return f'10.2307/{m.group(1)}'
+    try:
+        r = subprocess.run(['curl', '-sL', '--max-time', '15', url], capture_output=True, timeout=20)
+        page = r.stdout.decode('utf-8', errors='replace')
+    except (OSError, subprocess.SubprocessError):
+        return None
+    doi = doi_from_meta(_html_meta_tags(page))
+    if doi:
+        return doi
+    m = re.search(r'"doi"\s*:\s*"(10\.\d{4,9}/[^"]+)"', page)   # IEEE Xplore page metadata
+    return m.group(1) if m else None
 
 def extract_academia_pdf_url(url):
     """Fetch an Academia.edu page and return (pdf_url, doi). Either may be None."""
@@ -3644,7 +3832,7 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
         _compress_pdf(pdf_path)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('url_pos',    nargs='?', default=None, metavar='URL')
     parser.add_argument('--url',      default=None)
@@ -3654,7 +3842,8 @@ def main():
     parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'googlebot', 'wayback', 'archive-is'])
     parser.add_argument('--keep-pdf', action='store_true',
                         help='papers and PDFs: also save the original PDF next to the note, with the same name')
-    args = parser.parse_args()
+    argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(argv)
 
     raw_url = args.url or args.url_pos
     if not raw_url:
@@ -3721,6 +3910,21 @@ def main():
         else:
             print('Could not extract abstract_id from SSRN URL.', file=sys.stderr)
             return
+
+    # arXiv PDF and HTML links: use the abstract page, so the LaTeX source route is tried
+    m = re.match(r'https?://(?:www\.)?arxiv\.org/(?:pdf|html)/(\d{4}\.\d{4,5}(?:v\d+)?)(?:\.pdf)?/?$', raw_url)
+    if ENABLE_PAPER and m:
+        url = f'https://arxiv.org/abs/{m.group(1)}'
+
+    # Publisher and paper-index pages (ScienceDirect, Wiley, PubMed, ...): find the DOI
+    if ENABLE_PAPER and is_paper_site(raw_url) and not m:
+        pub_doi = paper_site_doi(raw_url)
+        if pub_doi:
+            print(f'Detected paper page — using DOI {pub_doi}...', file=sys.stderr)
+            url = f'https://doi.org/{pub_doi}'
+        else:
+            print('Paper page detected but no DOI found (the site may block scripts); '
+                  'pass the DOI link instead. Reading it as an article...', file=sys.stderr)
 
     # Normalize shadow library URLs to canonical doi.org form
     if ENABLE_PAPER and is_shadow_url(url):
@@ -3870,6 +4074,12 @@ def main():
         # 2. native-page: defuddle parse
         if not used_method:
             candidate = fetch_defuddle(url)
+            # Scholarly pages (repositories, preprint servers, ...): continue as the paper or its PDF
+            target = academic_target(candidate.get('metaTags'), url) if ENABLE_PAPER else None
+            if target and target != url:
+                kind = 'DOI ' + target.split('doi.org/', 1)[1] if 'doi.org/' in target else 'its PDF'
+                print(f'Scholarly page detected — using {kind}...', file=sys.stderr)
+                return main([target if a == raw_url else a for a in argv])
             if candidate.get('wordCount', 0) > MIN_WORDS:
                 d, used_method = candidate, 'native-page'
 

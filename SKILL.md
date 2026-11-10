@@ -1,11 +1,11 @@
 ---
 name: defuddle
-description: "Extract clean markdown content from web pages using Defuddle CLI. ALWAYS use this instead of WebFetch when the user provides a URL to read or analyze. TRIGGER when: user provides any URL to a webpage, documentation, article, blog post, PDF link, DOI, arXiv, SSRN, Academia.edu page, or local PDF file path. DO NOT use WebFetch for these — use defuddle."
+description: "Extract clean markdown content from web pages using Defuddle CLI. ALWAYS use this instead of WebFetch when the user provides a URL to read or analyze. TRIGGER when: user provides any URL to a webpage, documentation, article, blog post, PDF link, DOI, arXiv, SSRN, Academia.edu page, publisher article page (ScienceDirect, Wiley, Springer, etc.), PubMed/NBER/bioRxiv page, university repository page, or local PDF file path. DO NOT use WebFetch for these — use defuddle."
 ---
 
 # Defuddle
 
-Use Defuddle CLI to extract clean readable content from any web page — including YouTube videos (transcript + chapters), Apple Podcasts episodes (transcript + chapters), academic papers (PDF → markdown via DOI, arXiv, SSRN, or Academia.edu), plain PDF URLs, and local PDF file paths.
+Use Defuddle CLI to extract clean readable content from any web page — including YouTube videos (transcript + chapters), Apple Podcasts episodes (transcript + chapters), academic papers (PDF → markdown via DOI, arXiv, SSRN, Academia.edu, publisher article links like ScienceDirect, Wiley and Springer, paper indexes like PubMed and NBER, or university repository pages), plain PDF URLs, and local PDF file paths.
 
 ## Fetch and present
 
