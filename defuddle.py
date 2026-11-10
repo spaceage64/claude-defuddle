@@ -52,6 +52,10 @@ ENABLE_IMAGES            = True
 # ║  pngquant: lossy palette reduction (~60–80% smaller, similar to TinyPNG)     ║
 # ║  jpegoptim: re-encodes only if quality > 85; strips metadata.                ║
 ENABLE_IMAGE_COMPRESSION = True
+# ║  Grayscale figures (with compression) — requires: uv. Grey images (scanned   ║
+# ║  graphs, line art) become PNG with 8 grey levels, or 32 when 8 would show    ║
+# ║  bands in smooth shading; photos and colour images are left alone.           ║
+GRAYSCALE_FIGURES        = True
 # ║  PDF compression (--keep-pdf) — requires: uv                                 ║
 # ║  Images above 160 dpi go to 150 dpi; fonts are trimmed.                      ║
 ENABLE_PDF_COMPRESSION   = True
@@ -2451,6 +2455,7 @@ def _clean_pdf_markdown(md, images):
     md = re.sub(r'!\[Description \d+: (!\[[^\]]*\]\([^)\s]+\)).*?\]\(([^)\s]+\.(?:jpe?g|png|gif|webp))\)',
                 r'\1\n\n![](\2)', md, flags=re.S)
     md = _separate_inline_math(md)
+    md = _tags_out_of_environments(md)
     md = _bold_titles_to_headings(md)
     md = _normalize_heading_levels(md)
     _warn_broken_equations(md)
@@ -2569,6 +2574,23 @@ def _bold_titles_to_headings(md):
              r'[^*\n]{2,120}?')
     return re.sub(rf'(?:^|(?<=\n\n))\*\*({title})\*\*[ \t]*(?=\n\n|\n?$)',
                   lambda m: '## ' + m.group(1).strip(), md)
+
+def _tags_out_of_environments(md):
+    """Obsidian's math renderer rejects \\tag inside aligned/split/gathered/...: move a single tag
+    after \\end{...}; with several tags, write the numbers as text, e.g. '\\qquad (5.11)'."""
+    env = r'(aligned|align\*?|gathered|split|array|cases|[pbv]?matrix)'
+
+    def fix(m):
+        inner = m.group(2)
+        tags = re.findall(r'\\tag\*?\{([^}]*)\}', inner)
+        if not tags:
+            return m.group(0)
+        if len(tags) == 1:
+            inner = re.sub(r'\s*\\tag\*?\{[^}]*\}', '', inner)
+            return f'\\begin{{{m.group(1)}}}{inner}\\end{{{m.group(1)}}} \\tag{{{tags[0]}}}'
+        inner = re.sub(r'\\tag\*?\{([^}]*)\}', r'\\qquad (\1)', inner)
+        return f'\\begin{{{m.group(1)}}}{inner}\\end{{{m.group(1)}}}'
+    return re.sub(rf'\\begin\{{{env}\}}(.*?)\\end\{{\1\}}', fix, md, flags=re.S)
 
 def _separate_inline_math(md):
     """'$s^1$$d$' (two inline formulas side by side) reads as a display-equation marker in
@@ -3836,6 +3858,10 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
         return f'![{alt}](img/{local_name})' if local_name else m.group(0)
 
     content = pattern.sub(replace_img, content)
+    saved = [os.path.join(img_dir, n) for n in dict.fromkeys(seen.values()) if n]
+    if saved and ENABLE_IMAGE_COMPRESSION and GRAYSCALE_FIGURES:
+        for old, new in optimize_grayscale_figures(saved).items():
+            content = content.replace(f'(img/{os.path.basename(old)})', f'(img/{os.path.basename(new)})')
     # Don't leave an empty img/ behind when every download failed
     if os.path.isdir(img_dir) and not os.listdir(img_dir):
         os.rmdir(img_dir)
@@ -4161,6 +4187,68 @@ def fetch_for_method(url, method):
 
 # Scans above 160 dpi go to 150 dpi at JPEG quality 75, fonts are trimmed to the characters used.
 # Forms and protected files are left alone; the result is only used if pages and text are unchanged.
+_GRAY_FIGURES = r'''
+import json, os, subprocess, sys
+import numpy as np
+from PIL import Image
+
+def box(a, r=3):
+    p = np.pad(a, r + 1, mode='edge').cumsum(0).cumsum(1); k = 2 * r + 1
+    s = p[k:, k:] - p[:-k, k:] - p[k:, :-k] + p[:-k, :-k]
+    return s[:a.shape[0], :a.shape[1]] / (k * k)
+
+out = {}
+for path in sys.argv[1:]:
+    try:
+        im = Image.open(path)
+        if im.mode in ('RGBA', 'LA', 'P') and 'transparency' in im.info or im.mode in ('RGBA', 'LA'):
+            continue                                        # keep transparency as it is
+        rgb = np.asarray(im.convert('RGB'), dtype=np.float64)
+        if np.percentile(np.ptp(rgb, axis=2), 99) > 24:
+            continue                                        # a colour image
+        g = rgb.mean(axis=2)
+        clean = np.where(g > 225, 255, np.where(g < 30, 0, g))   # scan noise to pure white / black
+        mean = box(g); std = np.sqrt(np.maximum(box(g * g) - mean ** 2, 0))
+        smooth = (g > 40) & (g < 215) & (std < 6)            # grey areas without edges: where bands would show
+        if ((g > 40) & (g < 215)).mean() > 0.6 and smooth.mean() < 0.1:
+            continue                                        # mostly textured grey: a photo, not a figure
+        base = Image.fromarray(clean.astype(np.uint8), 'L')
+        tmp = os.path.splitext(path)[0] + '.gray.png'
+        for levels in (8, 32):
+            q = base.quantize(colors=levels, dither=Image.Dither.NONE)
+            band = float(np.abs(np.asarray(q.convert('L'), dtype=np.float64) - mean)[smooth].mean()) if smooth.sum() > 500 else 0.0
+            if smooth.mean() <= 0.03 or band <= 3.0:
+                q.save(tmp, optimize=True)
+                subprocess.run(['pngquant', '--force', '--skip-if-larger', '--speed', '1', '--quality', '90-100',
+                                '--ext', '.png', tmp], capture_output=True)
+                break
+        else:
+            continue                                        # a photo: bands even with 32 greys
+        if os.path.getsize(tmp) > 2 * os.path.getsize(path):
+            os.remove(tmp); continue
+        final = os.path.splitext(path)[0] + '.png'
+        os.replace(tmp, final)
+        if final != path:
+            os.remove(path)
+        out[path] = final
+    except Exception:
+        continue
+print(json.dumps(out))
+'''
+
+def optimize_grayscale_figures(paths):
+    """Grey images (scanned graphs, line art) as PNG with 8 grey levels, or 32 when 8 would show bands
+    in smooth shading; colour images, photos and transparent images are left alone. One uv run for
+    all paths (Pillow + numpy in isolation). Returns {old path: new path} for the images that changed."""
+    if not paths or not shutil.which('uv'):
+        return {}
+    try:
+        r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pillow', '--with', 'numpy',
+                            'python', '-c', _GRAY_FIGURES, *paths], capture_output=True, text=True, timeout=600)
+        return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
 _PDF_COMPRESS = '''
 import sys, pymupdf
 src, out = sys.argv[1:3]
