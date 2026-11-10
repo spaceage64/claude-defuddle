@@ -161,12 +161,11 @@ def frontmatter_url(*urls):
     return ('url:\n' + '\n'.join(f'  - {yaml_str(u)}' for u in urls)) if urls else None
 
 
-def build_frontmatter(project, created, tags, extra_fields):
+def build_frontmatter(created, tags, extra_fields):
     """Build a YAML frontmatter block from common fields plus source-specific extras.
 
     extra_fields is a list of pre-formatted YAML lines (or None to skip).
     """
-    tags = ([f'project/{project}'] if project else []) + list(tags)
     fields = ['---'] + (['tags:'] + [f'  - {t}' for t in tags] if tags else [])
     if created:
         fields.append(f'created: {created}')
@@ -715,7 +714,7 @@ def build_youtube(d, url, project, created):
     contents_section = _toc_section(contents) + '\n\n' if transcript_body else ''
 
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter(project, created, all_tags, [
+    fm = build_frontmatter(created, all_tags, [
         frontmatter_field('title', title),
         f'description: {yaml_str(fm_description)}',
         frontmatter_url(short_url),
@@ -1049,7 +1048,7 @@ def build_apple_podcast(url, project, created, ttml_path):
 
     # Frontmatter
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter(project, created, [t.lower() for t in ai_tags], [
+    fm = build_frontmatter(created, [t.lower() for t in ai_tags], [
         frontmatter_field('title',     title),
         f'description: {yaml_str(fm_description)}',
         frontmatter_url(url),
@@ -3364,7 +3363,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
             kw_tags.append(kw_slug)
 
     author_lines = ([f'author:'] + [f'  - {yaml_str(a)}' for a in authors]) if authors else []
-    fm = build_frontmatter(project, created, list(ai_tags) + kw_tags, [
+    fm = build_frontmatter(created, list(ai_tags) + kw_tags, [
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
         frontmatter_url(url),
@@ -3462,7 +3461,7 @@ def build_pdf(url, project, created, skip_doi=False):
             if len(parts) > 2:
                 site = fetch_defuddle(f'{p.scheme}://www.{".".join(parts[-2:])}').get('site', '')
 
-    fm = build_frontmatter(project, created, ai_tags_clean, [
+    fm = build_frontmatter(created, ai_tags_clean, [
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
         *([] if local_path else [frontmatter_url(url)]),
@@ -3525,7 +3524,7 @@ def build_article(d, url, project, created, method=None):
     index = build_index(content)
 
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter(project, created, ai_tags_clean, [
+    fm = build_frontmatter(created, ai_tags_clean, [
         frontmatter_field('title', title),
         f'description: {yaml_str(fm_description)}',
         frontmatter_url(url, d.get('archive_url')),   # archived copy as a second source
