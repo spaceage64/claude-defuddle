@@ -2191,7 +2191,7 @@ def pdf_to_markdown(pdf_path):
                 print(f'Running local marker (with {AI_LLM} LLM)...', file=sys.stderr)
             else:
                 print('Running local marker...', file=sys.stderr)
-            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=4 * 3600)
+            r = _run_marker(cmd)
             md_files = glob.glob(os.path.join(out_dir, '**', '*.md'), recursive=True)
             if not md_files:
                 error = '\n'.join([l for l in r.stderr.splitlines() if l.strip()][-5:])
@@ -2239,6 +2239,71 @@ def pdf_to_markdown(pdf_path):
 
     markdown, images, method = result
     return _clean_pdf_markdown(markdown, images), images, method
+
+
+def _run_marker(cmd, timeout=4 * 3600):
+    """Run marker and show that it is working: its progress bars as short lines ('marker:
+    Recognizing Text 120/360 (30%)', once per 10% per step) when it draws any, and a line
+    every 5 minutes. Returns a CompletedProcess whose stderr holds marker's last lines."""
+    # marker only draws progress bars on a terminal, so give it a pseudo-terminal where possible
+    master = None
+    if os.name != 'nt':
+        import pty
+        master, slave = pty.openpty()
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=slave)
+        os.close(slave)
+        read = lambda: os.read(master, 4096)
+    else:
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        read = lambda: p.stderr.read1(4096)
+    tail, shown, buf, start = [], {}, b'', time.time()
+
+    # This marker version prints no progress bars, so say every 5 minutes that it is still working
+    import threading
+    done = threading.Event()
+    pages = (re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', cmd[1]], capture_output=True, text=True).stdout, re.M)
+             if shutil.which('pdfinfo') else None)
+    pages = f', {pages.group(1)} pages' if pages else ''
+
+    def heartbeat():
+        while not done.wait(300):
+            print(f'marker: still converting ({int((time.time() - start) // 60)} min so far{pages})',
+                  file=sys.stderr, flush=True)
+    threading.Thread(target=heartbeat, daemon=True).start()
+
+    def handle(line):
+        line = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', line).strip()   # terminal control codes
+        if not line:
+            return
+        tail.append(line)
+        del tail[:-20]
+        m = re.match(r'(.+?):\s+(\d+)%\|.*?\|\s*(\d+)/(\d+)', line)
+        if m:
+            step, pct = m.group(1).strip(), int(m.group(2))
+            if shown.get(step) != pct // 10:
+                shown[step] = pct // 10
+                print(f'marker: {step} {m.group(3)}/{m.group(4)} ({pct}%)', file=sys.stderr, flush=True)
+
+    while True:
+        try:
+            chunk = read()
+        except OSError:   # the pseudo-terminal closes when marker exits
+            break
+        if not chunk:
+            break
+        buf += chunk
+        *lines, buf = re.split(rb'[\r\n]', buf)   # tqdm redraws its bar with \r
+        for line in lines:
+            handle(line.decode('utf-8', 'replace'))
+        if time.time() - start > timeout:
+            p.kill()
+            break
+    handle(buf.decode('utf-8', 'replace'))
+    p.wait()
+    done.set()
+    if master is not None:
+        os.close(master)
+    return subprocess.CompletedProcess(cmd, p.returncode, '', '\n'.join(tail))
 
 
 def _pdf_text_words(path):
@@ -2315,12 +2380,30 @@ def _drop_duplicate_images(md, images):
 
 def _clean_pdf_markdown(md, images):
     """Tidy marker/Datalab output for Obsidian: remove page anchors and links, descriptions without
-    an image, and figures detected twice."""
+    an image, and figures detected twice; split image descriptions that wrap other images; warn
+    about display equations that won't render."""
+    # The AI step sometimes wraps one panel's image inside another's description:
+    # ![Description 1: ![](a.jpeg) | Description 2: caption](b.jpeg) -> both images
+    md = re.sub(r'!\[Description \d+: (!\[[^\]]*\]\([^)\s]+\)).*?\]\(([^)\s]+\.(?:jpe?g|png|gif|webp))\)',
+                r'\1\n\n![](\2)', md, flags=re.S)
+    _warn_broken_equations(md)
     md = re.sub(r'!\[[^\]]*\]\(\s*\)[ \t]*\n*', '', md)
     md = re.sub(r'<span id="[^"]*">\s*</span>', '', md)
     md = re.sub(r'\[((?:\\.|[^\]\\])*)\]\(#page-[\d-]+\)',
                 lambda m: re.sub(r'\\([\[\]])', r'\1', m.group(1)), md)
     return _drop_duplicate_images(md, images)
+
+def _warn_broken_equations(md):
+    """WARNING for display equations with unbalanced braces or \\left/\\right, which Obsidian can't render."""
+    bad = []
+    for eq in re.findall(r'\$\$(.+?)\$\$', md, re.S):
+        if (len(re.findall(r'(?<!\\)\{', eq)) != len(re.findall(r'(?<!\\)\}', eq)) or
+                len(re.findall(r'\\left\b', eq)) != len(re.findall(r'\\right\b', eq))):
+            num = re.search(r'\((\d+[a-z]?)\)\s*$', eq.strip())
+            bad.append(f'({num.group(1)})' if num else repr(eq.strip()[:40] + '…'))
+    if bad:
+        print(f'WARNING: {len(bad)} display equation(s) have unbalanced brackets and won\'t render in '
+              f'Obsidian: {", ".join(bad[:10])}; check them against the PDF.', file=sys.stderr)
 
 def _latex_braced_arg(content, cmd):
     """Extract the content of \\cmd{...} with proper nested-brace handling."""
