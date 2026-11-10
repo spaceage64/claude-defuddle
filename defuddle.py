@@ -1218,19 +1218,27 @@ def crossref_doi_for_pdf(text, hint='', name=''):
     clean_hint = '' if re.match(r'(PII|DOI)\b', hint or '', re.I) else hint
     for query in dict.fromkeys(q for q in (clean_hint, re.sub(r'\s+', ' ', text or '')[:300]) if q and q.strip()):
         msg = _crossref(f'works?query.bibliographic={quote(query)}&rows=5&select=DOI,title')
-        for item in (msg or {}).get('items', []):
-            if _title_on_pages(' '.join(item.get('title') or []), text):
-                return item['DOI']
+        hits = [item['DOI'] for item in (msg or {}).get('items', [])
+                if _title_on_pages(' '.join(item.get('title') or []), text)]
+        if hits:
+            # Several versions (working paper, journal article): prefer the one whose DOI
+            # ends in the file name, e.g. hhx084.pdf -> 10.1093/rfs/hhx084
+            stem = os.path.splitext(name or '')[0].lower()
+            named = [h for h in hits if len(stem) >= 5 and h.lower().rsplit('/', 1)[-1].endswith(stem)]
+            return (named or hits)[0]
     return None
 
 def _crossref(path):
-    """GET a Crossref API path and return its 'message', or None."""
-    try:
-        r = subprocess.run(['curl', '-sL', '--max-time', '15', f'https://api.crossref.org/{path}'],
-                           capture_output=True, timeout=20)
-        return json.loads(r.stdout.decode('utf-8', errors='replace'))['message']
-    except Exception:
-        return None
+    """GET a Crossref API path and return its 'message', or None (one retry: it occasionally doesn't answer)."""
+    for attempt in range(2):
+        try:
+            r = subprocess.run(['curl', '-sL', '--max-time', '15', f'https://api.crossref.org/{path}'],
+                               capture_output=True, timeout=20)
+            return json.loads(r.stdout.decode('utf-8', errors='replace'))['message']
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
+    return None
 
 def _get_json(url):
     """GET a JSON API, or None."""
@@ -2220,12 +2228,12 @@ def pdf_to_markdown(pdf_path):
     if result is not None:
         expected = _pdf_text_words(pdf_path)
         got = len(result[0].split())
-        if expected and expected > 500 and got < expected / 3:
+        if expected and expected > 500 and got < expected * INCOMPLETE_RATIO:
             print(f'Conversion looks incomplete ({got} of about {expected} words) — retrying once...', file=sys.stderr)
             retry = _convert()
             if retry is not None and len(retry[0].split()) > got:
                 result, got = retry, len(retry[0].split())
-            if got < expected / 3:
+            if got < expected * INCOMPLETE_RATIO:
                 print(f'WARNING: conversion looks incomplete ({got} of about {expected} words in the PDF\'s '
                       'text layer); check the note against the PDF.', file=sys.stderr)
 
@@ -2238,7 +2246,16 @@ def pdf_to_markdown(pdf_path):
         return '', {}, ''
 
     markdown, images, method = result
-    return _clean_pdf_markdown(markdown, images), images, method
+    markdown = _clean_pdf_markdown(markdown, images)
+    missing = _missing_equations(pdf_path, markdown)
+    if missing:
+        print(f'WARNING: equation{"s" if len(missing) > 1 else ""} {_number_ranges(missing)} from the PDF '
+              'missing in the note (part of the text may be lost there); check it against the PDF.', file=sys.stderr)
+    missing = _missing_appendices(pdf_path, markdown)
+    if missing:
+        print(f'WARNING: {", ".join(missing)} from the PDF missing in the note (no heading for '
+              f'{"it" if len(missing) == 1 else "them"}); check it against the PDF.', file=sys.stderr)
+    return markdown, images, method
 
 
 def _run_marker(cmd, timeout=4 * 3600):
@@ -2305,6 +2322,53 @@ def _run_marker(cmd, timeout=4 * 3600):
         os.close(master)
     return subprocess.CompletedProcess(cmd, p.returncode, '', '\n'.join(tail))
 
+
+# A converted PDF normally has 85–125% of the words in the PDF's own text layer; much less
+# means part of it was lost (e.g. a conversion that stopped partway through)
+INCOMPLETE_RATIO = 0.7
+
+def _missing_equations(path, md):
+    """Equation numbers printed in the PDF (a '(12)' on its own line of the text layer) that no
+    display equation in the markdown carries. Catches parts lost in the middle of a document."""
+    if not shutil.which('pdftotext'):
+        return []
+    try:
+        text = subprocess.run(['pdftotext', '-q', path, '-'], capture_output=True, text=True,
+                              errors='replace', timeout=300).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    in_pdf = {int(n) for n in re.findall(r'^\s*\((\d{1,3})\)\s*$', text, re.M)}
+    if len(in_pdf) < 3:
+        return []
+    eqs = ' '.join(_display_equations(md))
+    in_md = {int(a or b) for a, b in re.findall(r'\((\d{1,3})\)|\\tag\{(\d{1,3})\}', eqs)}
+    return sorted(in_pdf - in_md)
+
+def _missing_appendices(path, md):
+    """Appendix titles in the PDF ('Appendix A. ...' starting a line of the text layer) that no
+    heading in the markdown names, e.g. ['Appendix A']. Catches short appendices that the word
+    count and equation checks don't notice."""
+    if not shutil.which('pdftotext'):
+        return []
+    try:
+        text = subprocess.run(['pdftotext', '-q', path, '-'], capture_output=True, text=True,
+                              errors='replace', timeout=300).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    in_pdf = dict.fromkeys(re.findall(r'^\s*Appendix ([A-Z]|\d{1,2})[.:]\s+[A-Z]', text, re.M))
+    in_md = set(re.findall(r'^#{1,6}\s+[*_]*Appendix ([A-Z]|\d{1,2})\b', md, re.M))
+    return [f'Appendix {a}' for a in in_pdf if a not in in_md]
+
+def _number_ranges(nums):
+    """[3, 4, 5, 9] -> '(3)–(5), (9)'."""
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(f'({nums[i]})' if i == j else f'({nums[i]})–({nums[j]})')
+        i = j + 1
+    return ', '.join(out)
 
 def _pdf_text_words(path):
     """Word count of a PDF's text layer (pdftotext), or None when it has none or pdftotext is missing."""
@@ -2386,6 +2450,9 @@ def _clean_pdf_markdown(md, images):
     # ![Description 1: ![](a.jpeg) | Description 2: caption](b.jpeg) -> both images
     md = re.sub(r'!\[Description \d+: (!\[[^\]]*\]\([^)\s]+\)).*?\]\(([^)\s]+\.(?:jpe?g|png|gif|webp))\)',
                 r'\1\n\n![](\2)', md, flags=re.S)
+    md = _separate_inline_math(md)
+    md = _bold_titles_to_headings(md)
+    md = _normalize_heading_levels(md)
     _warn_broken_equations(md)
     md = re.sub(r'!\[[^\]]*\]\(\s*\)[ \t]*\n*', '', md)
     md = re.sub(r'<span id="[^"]*">\s*</span>', '', md)
@@ -2393,10 +2460,131 @@ def _clean_pdf_markdown(md, images):
                 lambda m: re.sub(r'\\([\[\]])', r'\1', m.group(1)), md)
     return _drop_duplicate_images(md, images)
 
+# Numbered headings: (kind, pattern). A marker's punctuation ('.', ')', ':', a dash or none) is part of its
+# style, so '1.' sections and '1)' items can be different levels. First match wins.
+_P = r'(?:[.):]|\s*[-–—])'   # punctuation after a marker
+_HEADING_STYLES = [
+    ('arabic3', re.compile(r'^\d{1,2}\.\d{1,2}\.\d{1,2}[.):]?\s')),
+    ('arabic2', re.compile(r'^\d{1,2}\.\d{1,2}[.):]?\s')),
+    ('arabic',  re.compile(rf'^\d{{1,2}}({_P}?)\s+\S')),
+    ('roman',   re.compile(rf'^[IVX]{{1,5}}({_P})\s')),
+    ('upper',   re.compile(rf'^[A-Z]({_P})\s')),
+    ('lroman',  re.compile(rf'^[ivx]{{1,5}}({_P})\s')),
+    ('lower',   re.compile(rf'^[a-z]({_P})\s')),
+    ('pnum',    re.compile(r'^\(\d{1,2}\)()\s')),
+    ('proman',  re.compile(r'^\([ivx]{1,4}\)()\s')),
+    ('plower',  re.compile(r'^\([a-z]\)()\s')),
+]
+# A one-letter roman numeral right after the previous letter is that letter: "I." after "H.", "(i)" after "(h)"
+_LETTER_OF = {'roman': 'upper', 'lroman': 'lower', 'proman': 'plower'}
+
+# Letters and roman numerals without punctuation ("A Introduction", "IV Results"): only numbering when
+# the document has two of them in sequence, since "A Model of Trading" also starts with a letter
+_BARE_STYLES = [('roman',  re.compile(r'^([IVX]{1,5})\s+[A-Z]')),
+                ('upper',  re.compile(r'^([A-Z])\s+[A-Z]')),
+                ('lroman', re.compile(r'^([ivx]{1,4})\s+[A-Za-z]')),
+                ('lower',  re.compile(r'^([a-z])\s+[A-Za-z]'))]
+
+def _marker_value(kind, marker):
+    if kind in ('roman', 'lroman'):
+        vals = {'i': 1, 'v': 5, 'x': 10}
+        n = [vals[c] for c in marker.lower()]
+        return sum(-v if i + 1 < len(n) and v < n[i + 1] else v for i, v in enumerate(n))
+    return ord(marker.lower()) - ord('a') + 1
+
+def _heading_style(title):
+    """(kind, style) of a numbered heading, e.g. ('upper', 'upper:') for 'A: Data'; None if not numbered."""
+    for kind, rx in _HEADING_STYLES:
+        m = rx.match(title)
+        if m:
+            punct = (m.group(1) or '').strip() if m.groups() else ''
+            return kind, kind + ('-' if punct in ('-', '–', '—') else punct)
+    return None
+
+def _bare_numbering(titles):
+    """{index: kind} for headings numbered without punctuation, where that kind has two markers in sequence."""
+    seen = {}
+    for i, t in enumerate(titles):
+        if _heading_style(t):
+            continue
+        for kind, rx in _BARE_STYLES:
+            m = rx.match(t)
+            if m:
+                seen.setdefault(kind, []).append((i, _marker_value(kind, m.group(1))))
+                break
+    out = {}
+    for kind, hits in seen.items():
+        vals = {v for _, v in hits}
+        if any(v + 1 in vals for v in vals):
+            out.update({i: kind for i, _ in hits})
+    return out
+
+def _normalize_heading_levels(md):
+    """Give numbered section headings consistent levels (marker guesses levels from font size).
+    Numbering can be 1 / I / i / A / a followed by '.', ')', ':', a dash or nothing, or (1) / (i) / (a).
+    The style that comes first is the main level and each style that appears later one level deeper;
+    '2.1' always sits right below '2.' and '2.1.1' below that. Main sections become ##, right below
+    the note's title. Only for documents with at least two headings in the main style."""
+    matches = list(re.finditer(r'^(#{2,6}) +(.+)$', md, re.M))
+    titles = [re.sub(r'[*_]', '', m.group(2)).strip() for m in matches]
+    bare = _bare_numbering(titles)
+    found, prev_letter = [], {}
+    for i, (m, t) in enumerate(zip(matches, titles)):
+        ks = _heading_style(t) or ((bare[i], bare[i]) if i in bare else None)
+        if not ks:
+            continue
+        kind, style = ks
+        letter = re.match(r'^\(?([A-Za-z])(?:[.):]|\s)', t)
+        if kind in _LETTER_OF and letter:
+            punct = style[len(kind):]
+            prev = prev_letter.get(_LETTER_OF[kind] + punct)
+            if prev and ord(letter.group(1)) == ord(prev) + 1:
+                kind, style = _LETTER_OF[kind], _LETTER_OF[kind] + punct
+        if kind in _LETTER_OF.values() and letter:
+            prev_letter[style] = letter.group(1)
+        found.append((m.start(1), m.end(1), kind, style))
+    if not found:
+        return md
+    order = []
+    for *_, kind, style in found:
+        if kind not in ('arabic2', 'arabic3') and style not in order:
+            order.append(style)
+    deeper = [s for s in ('arabic2', 'arabic3') if any(f[3] == s for f in found)]
+    first_arabic = next((i for i, s in enumerate(order) if s.startswith('arabic')), None)
+    if first_arabic is not None:        # 2.1 and 2.1.1 sit directly below 2.
+        order[first_arabic + 1:first_arabic + 1] = deeper
+    else:
+        order += deeper
+    if sum(1 for f in found if f[3] == order[0]) < 2:
+        return md
+    for a, b, _, style in reversed(found):
+        md = md[:a] + '#' * min(2 + order.index(style), 6) + md[b:]
+    return md
+
+def _bold_titles_to_headings(md):
+    """A bold line on its own that is a section title ('**Appendix C. Relaxing ...**', '**3. Results**',
+    '**2.1 Data**') becomes a heading; marker sometimes outputs titles as bold text. Its level is
+    set by _normalize_heading_levels (appendices: ##)."""
+    title = (r'(?:Appendix\s+(?:[A-Z]|\d{1,2})\b|\d{1,2}\.\d{1,2}\.?\s|(?:\d{1,2}|[IVX]{1,5}|[A-Z])[.):]\s)'
+             r'[^*\n]{2,120}?')
+    return re.sub(rf'(?:^|(?<=\n\n))\*\*({title})\*\*[ \t]*(?=\n\n|\n?$)',
+                  lambda m: '## ' + m.group(1).strip(), md)
+
+def _separate_inline_math(md):
+    """'$s^1$$d$' (two inline formulas side by side) reads as a display-equation marker in
+    Obsidian; put a space between them. Lines that are display equations are left alone."""
+    return '\n'.join(l if l.lstrip().startswith('$$') else re.sub(r'(\$[^$\n]+?)\$\$(?=[^$\s][^$\n]*\$)', r'\1$ $', l)
+                     for l in md.split('\n'))
+
+def _display_equations(md):
+    """Contents of display equations: $$ on its own lines around them, or around a whole line."""
+    return (re.findall(r'^[ \t]*\$\$[ \t]*\n(.*?)\n[ \t]*\$\$[ \t]*$', md, re.S | re.M) +
+            re.findall(r'^[ \t]*\$\$(?!\s*$)(.+?)\$\$[ \t]*$', md, re.M))
+
 def _warn_broken_equations(md):
     """WARNING for display equations with unbalanced braces or \\left/\\right, which Obsidian can't render."""
     bad = []
-    for eq in re.findall(r'\$\$(.+?)\$\$', md, re.S):
+    for eq in _display_equations(md):
         if (len(re.findall(r'(?<!\\)\{', eq)) != len(re.findall(r'(?<!\\)\}', eq)) or
                 len(re.findall(r'\\left\b', eq)) != len(re.findall(r'\\right\b', eq))):
             num = re.search(r'\((\d+[a-z]?)\)\s*$', eq.strip())
