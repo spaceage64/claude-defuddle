@@ -2959,7 +2959,7 @@ def _extract_paper_keywords(content):
     return content, keywords
 
 
-def _fix_paper_structure(content, title='', authors=None, latex=False):
+def _fix_paper_structure(content, title='', authors=None, ai_paragraphs=False):
     """Fix common structural issues in publisher-formatted (PDF-converted) papers:
     - Strip content before the paper title (publisher headers, logos, etc.)
     - Remove duplicate title headings
@@ -2989,6 +2989,8 @@ def _fix_paper_structure(content, title='', authors=None, latex=False):
     #    following body paragraph (which may differ). We merge both into the alt-text so the
     #    AI still has full context while keeping the note body clean for human readers.
     #    Format: "Description 1: {original alt} | Description 2: {body text}"
+    #    Datalab only: marker and LaTeX output have no AI paragraphs, so text between an image
+    #    and its caption is real body text (e.g. a paragraph continued after a page break).
     lines = content.split('\n')
     # Shared vocabulary for figure/table label terms.
     # Require bold markers (**) before the label — Datalab always bolds real captions;
@@ -3001,12 +3003,14 @@ def _fix_paper_structure(content, title='', authors=None, latex=False):
     lines_to_remove = set()
     img_re = re.compile(r'^(!\[)(.*?)(\]\([^)]+\))\s*$')
     for i, line in enumerate(lines):
-        img_m = img_re.match(line) if not latex else None   # LaTeX figures have no AI paragraphs
+        img_m = img_re.match(line) if ai_paragraphs else None
         if not img_m:
             continue
-        # Find the first bolded real caption within 15 lines
+        # Find the first bolded real caption within 15 lines, before the next image
         cap_idx = None
         for j in range(i + 1, min(i + 16, len(lines))):
+            if img_re.match(lines[j]):
+                break
             if caption_re.search(lines[j]):
                 cap_idx = j
                 break
@@ -3246,7 +3250,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     content = re.sub(r'^- (\[\d+\] )', r'\1', content, flags=re.MULTILINE)
 
     # Fix paper structure: strip pre-title content, remove duplicate titles, move abstract to top
-    content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []), latex=method == 'arxiv')
+    content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []), ai_paragraphs=method == 'datalab')
     # Extract keywords from content (removed from body, added as tags below)
     content, paper_keywords = _extract_paper_keywords(content)
 
@@ -3499,13 +3503,34 @@ def format_saved_path(project, filename):
 
 _TRANSLIT = str.maketrans({'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'ø': 'o', 'ł': 'l', 'đ': 'd',
                             'ð': 'd', 'þ': 'th', 'ı': 'i'})
+_APOSTROPHES = re.compile("['\u2018\u2019\u02bc\u0060\u00b4]")
+
+
+_ABBREVIATION = re.compile(r'(?<![\w.])(?:[^\W\d_]{1,2}\.){2,}')   # U.S., Ph.D., e.g.
 
 
 def _slug(text):
-    """Kebab-case ASCII slug; diacritics are dropped (Guéant -> gueant), not split on."""
-    text = unicodedata.normalize('NFKD', text.lower().translate(_TRANSLIT))
-    text = ''.join(c for c in text if not unicodedata.combining(c))
-    return re.sub(r'[^a-z0-9]+', '-', text).strip('-')
+    """Kebab-case slug. Latin letters become plain ASCII (Guéant -> gueant, ß -> ss); other scripts
+    (Greek, Cyrillic, kanji…) are kept as they are. Apostrophes and abbreviation dots join words
+    instead of splitting them (O'Hara -> ohara, U.S. -> us); & becomes 'and'."""
+    text = _APOSTROPHES.sub('', text)
+    text = _ABBREVIATION.sub(lambda m: m.group(0).replace('.', ''), text)
+    text = unicodedata.normalize('NFC', text.replace('&', ' and ').lower().translate(_TRANSLIT))
+    out = []
+    for c in text:
+        if c.isascii():
+            out.append(c if c.isalnum() else '-')
+        elif unicodedata.category(c)[0] == 'M':          # mark left over after NFC
+            out.append(c if out and not out[-1].isascii() else '')
+        else:
+            base = ''.join(b for b in unicodedata.normalize('NFKD', c) if not unicodedata.combining(b))
+            if base and base.isascii():                  # é -> e, ﬁ -> fi, ² -> 2, full-width letters
+                out.append(''.join(b if b.isalnum() else '-' for b in base.lower()))
+            elif unicodedata.category(c)[0] == 'L' and not unicodedata.name(c, '').startswith('LATIN'):
+                out.append(c)                            # other scripts
+            else:
+                out.append('-')                          # symbols, Latin letters without an ASCII form
+    return re.sub(r'-+', '-', ''.join(out)).strip('-')
 
 
 def generate_filename(title, max_words=None):
@@ -3514,7 +3539,7 @@ def generate_filename(title, max_words=None):
     import urllib.request as _urlreq
 
     n = max_words or FILENAME_WORDS
-    ai_prompt = f'Give me a 1 to {n} word kebab-case filename (no extension) for an article titled "{title}". Return ONLY the filename, nothing else.'
+    ai_prompt = f'Give me a 1 to {n} word kebab-case filename (no extension) for an article titled "{title}". Drop apostrophes instead of hyphenating them (O\'Hara -> ohara). Return ONLY the filename, nothing else.'
 
     def _clean(raw):
         name = raw.strip().lower().splitlines()[0]
