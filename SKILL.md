@@ -30,7 +30,7 @@ Use the output to answer the user's question or complete the task. The script au
 ```bash
 python3 ~/.claude/skills/defuddle/defuddle.py \
   --url "<url>" --project "{folder}" --created "{YYYY-MM-DD}" \
-  [--filename "kebab-case-name"] [--method native|native-md|native-page|googlebot|wayback|archive-is] [--keep-pdf | --no-keep-pdf]
+  [--filename "kebab-case-name"] [--method native|native-md|native-page|googlebot|wayback|archive-is] [--keep-pdf | --no-keep-pdf] [--doi "<doi>"]
 ```
 
 - `--project`: subfolder name inside your vault (e.g. `my-project`, `research`)
@@ -38,7 +38,8 @@ python3 ~/.claude/skills/defuddle/defuddle.py \
 - `--method`: force a specific fetch method instead of the auto-cascade (articles only)
 - `--keep-pdf` / `--no-keep-pdf` (papers and PDFs): save the original PDF next to the note, with the same name (`{filename}.pdf`), compressed when `ENABLE_PDF_COMPRESSION` is on. The default comes from `KEEP_PDF` in `defuddle.py` (off unless changed); pass `--keep-pdf` when the user asks to keep the PDF.
 - Several links: pass them all in one command (`defuddle.py <url1> <url2> ...` with the same options; not with `--filename`). They run `PARALLEL_JOBS` at a time (default 4), each link's progress lines are prefixed with its number, and each link's output follows under `=== [n] url ===`. Prefer this over separate commands; run it in the background when papers are involved.
-- PDFs without a printed DOI are looked up in Crossref (file name IDs, Elsevier PIIs, then title) and saved as papers when the found title appears on the PDF's first pages; a local PDF is reused, not downloaded again. A `WARNING: conversion looks incomplete` line means the note has under 70% of the words in the PDF's text layer — tell the user. Likewise relay `WARNING:` lines about missing equations, missing appendices or equations with unbalanced brackets, and offer to re-convert the affected pages.
+- `--doi` (local PDFs and PDF links): when you know the paper's DOI — e.g. the user saved the PDF from a shadow library page for a DOI you gave them, or named the paper — pass it, and the PDF is saved as a paper with full metadata without any search.
+- PDFs without a printed DOI are looked up in Crossref (file name IDs, Elsevier PIIs, then title; for scans without a text layer, again with the converted text) and saved as papers when the found title appears on the PDF's first pages; a local PDF is reused, not downloaded again. A `WARNING: conversion looks incomplete` line means the note has under 70% of the words in the PDF's text layer — tell the user. Likewise relay `WARNING:` lines about missing equations, missing appendices or equations with unbalanced brackets, and offer to re-convert the affected pages.
 - Papers behind a shadow library: the script opens the shadow library page in the user's browser and waits (up to `SHADOW_WAIT`, default 10 min) for a new PDF in their downloads folder, then continues. Run paper commands in the background and check their output after about 30 seconds; when it shows `Opening shadow library in your browser`, tell the user to save the PDF from that page (give the URL so they can click it if no browser opened). The PDF is left in their downloads folder.
 
 Notes are saved to `{vault}/{folder}/defuddle/` regardless of source type.

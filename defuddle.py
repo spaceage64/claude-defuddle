@@ -3072,10 +3072,11 @@ def _strip_html_preserve_math(text):
             i += 1
     return ''.join(result)
 
-def build_paper(url, project, created, pdf_file=None):
+def build_paper(url, project, created, pdf_file=None, converted=None):
     """Fetch an academic paper and build an Obsidian note.
     pdf_file: a PDF of this paper already at hand (e.g. a local file whose first page
-    named the DOI); used instead of downloading one."""
+    named the DOI); used instead of downloading one.
+    converted: (markdown, images, method) of pdf_file, when it was already converted."""
     doi      = extract_doi(url)
     arxiv_id = extract_arxiv_id_from_url(url)
     if doi and not arxiv_id:
@@ -3083,9 +3084,11 @@ def build_paper(url, project, created, pdf_file=None):
 
     meta = get_paper_metadata(doi) if doi else {}
 
-    if not arxiv_id and doi:
+    if not arxiv_id and doi and not converted:   # a converted PDF needs no preprint
         print('Checking for arXiv preprint...', file=sys.stderr)
         arxiv_id = find_arxiv_id(doi)
+    if converted:
+        arxiv_id = None
         if arxiv_id:
             print(f'Found arXiv preprint: {arxiv_id}', file=sys.stderr)
 
@@ -3172,7 +3175,7 @@ def build_paper(url, project, created, pdf_file=None):
                     file=sys.stderr
                 )
                 sys.exit(1)
-            content, images_dict, method = pdf_to_markdown(pdf_path)
+            content, images_dict, method = converted or pdf_to_markdown(pdf_path)
             with open(pdf_path, 'rb') as f:
                 meta['pdf'] = f.read()   # for --keep-pdf; tmp_dir is gone once this returns
             if content:
@@ -3312,6 +3315,15 @@ def build_pdf(url, project, created, skip_doi=False):
                 return None, None, {'redirect_doi': doi, 'pdf_bytes': f.read()}
 
         content, images_dict, method = pdf_to_markdown(pdf_path)
+        if content and not doi and not skip_doi:
+            # Scans without a text layer only become readable now: search Crossref with the converted text
+            head = re.search(r'^#{1,2}\s+(.+)$', content, re.M)
+            doi = crossref_doi_for_pdf(content[:4000], head.group(1).strip() if head else '', os.path.basename(url))
+            if doi:
+                print(f'Found in Crossref from the converted text: {doi} — saving as paper...', file=sys.stderr)
+                with open(pdf_path, 'rb') as f:
+                    return None, None, {'redirect_doi': doi, 'pdf_bytes': f.read(),
+                                        'converted': (content, images_dict, method)}
 
     if not content or len(content.split()) < MIN_WORDS:
         print('PDF conversion produced no usable content.', file=sys.stderr)
@@ -4357,6 +4369,9 @@ def main(argv=None):
     parser.add_argument('--created',  default=None)
     parser.add_argument('--filename', default=None)
     parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'googlebot', 'wayback', 'archive-is'])
+    parser.add_argument('--doi', default=None,
+                        help='PDFs: the paper\'s DOI when it is known (e.g. a PDF saved from a shadow library); '
+                             'saves it as a paper without searching')
     parser.add_argument('--keep-pdf', action=argparse.BooleanOptionalAction, default=None,
                         help='papers and PDFs: also save the original PDF next to the note, with the same name '
                              '(default: KEEP_PDF)')
@@ -4497,24 +4512,36 @@ def main(argv=None):
 
     # Plain PDFs: download, scan first page for DOI, route accordingly
     if ENABLE_PDF and is_pdf_url(url):
-        note, images_dict, meta = build_pdf(url, args.project, args.created)
+        if args.doi:   # DOI given: no need to search for it
+            doi = re.sub(r'^(https?://(dx\.)?doi\.org/|doi:)', '', args.doi.strip(), flags=re.I)
+            if os.path.isabs(url):
+                with open(url, 'rb') as f:
+                    note, images_dict, meta = None, None, {'redirect_doi': doi, 'pdf_bytes': f.read()}
+            else:
+                note, images_dict, meta = None, None, {'redirect_doi': doi}
+        else:
+            note, images_dict, meta = build_pdf(url, args.project, args.created)
         redirect_doi = meta.get('redirect_doi') if meta else None
         if redirect_doi:
             # First page had a DOI — re-route to build_paper
             doi_url = f'https://doi.org/{redirect_doi}'
-            if args.project is None:
-                note, _, _meta = build_paper(doi_url, None, args.created)
-                if not note:
-                    return
-                print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
-                return
             pdf_file = None
             if meta.get('pdf_bytes'):   # reuse the PDF we already have instead of fetching one
                 fd, pdf_file = tempfile.mkstemp(suffix='.pdf')
                 with os.fdopen(fd, 'wb') as f:
                     f.write(meta['pdf_bytes'])
+            if args.project is None:
+                try:
+                    note, _, _meta = build_paper(doi_url, None, args.created, pdf_file=pdf_file, converted=meta.get('converted'))
+                finally:
+                    if pdf_file:
+                        os.remove(pdf_file)
+                if not note:
+                    return
+                print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
+                return
             try:
-                note, images_dict, meta = build_paper(doi_url, args.project, args.created, pdf_file=pdf_file)
+                note, images_dict, meta = build_paper(doi_url, args.project, args.created, pdf_file=pdf_file, converted=meta.get('converted'))
             finally:
                 if pdf_file:
                     os.remove(pdf_file)
