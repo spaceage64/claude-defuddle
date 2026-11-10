@@ -4688,6 +4688,9 @@ def main(argv=None):
             save_dir = get_save_dir(vault, args.project)
         elif not note:
             return
+        elif args.project is None:   # read-only: print instead of saving
+            print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
+            return
         else:
             title    = meta.get('title', '')
             filename = args.filename or generate_filename(title)
