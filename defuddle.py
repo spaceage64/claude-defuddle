@@ -64,6 +64,9 @@ DATALAB_API_KEY = _apikey('Datalab')
 # ║    'local'         — local marker only (ignores Datalab key)                 ║
 # ║    'datalab'       — Datalab API only (no local fallback)                    ║
 PDF_PROCESSOR = 'local_first'
+# ║  MARKER_PRECISE: False = normal (quick, but inline math can break).          ║
+# ║  True = precise: full-page OCR, inline math re-read by the LLM (slower).     ║
+MARKER_PRECISE = False
 # ║                                                                              ║
 # ║  AI enrichment — provider for summaries, tags, chapters, and filenames.      ║
 # ║  Always falls back to Claude CLI if the provider fails or has no key.        ║
@@ -1819,14 +1822,18 @@ def pdf_to_markdown(pdf_path):
         use_llm = bool(marker_service and (AI_API_KEY or AI_LLM == 'ollama'))
         with tempfile.TemporaryDirectory() as out_dir:
             cmd = ['marker_single', pdf_path, '--output_dir', out_dir, '--output_format', 'markdown']
+            if MARKER_PRECISE:
+                cmd += ['--force_ocr']   # without it inline math can stay broken text (*Xt* instead of $X_t$)
             if use_llm:
                 cmd += ['--use_llm', '--llm_service', marker_service]
+                if MARKER_PRECISE:
+                    cmd += ['--redo_inline_math']
                 if key_flag and AI_API_KEY:
                     cmd += [key_flag, AI_API_KEY]
                 print(f'Running local marker (with {AI_LLM} LLM)...', file=sys.stderr)
             else:
                 print('Running local marker...', file=sys.stderr)
-            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=3600)
+            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=4 * 3600)
             md_files = glob.glob(os.path.join(out_dir, '**', '*.md'), recursive=True)
             if not md_files:
                 error = '\n'.join([l for l in r.stderr.splitlines() if l.strip()][-5:])

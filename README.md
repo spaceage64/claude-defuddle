@@ -248,6 +248,15 @@ For DOI and arXiv papers, the skill:
 
 The PDF processor order is controlled by `PDF_PROCESSOR` in `defuddle.py` (default: `local_first`).
 
+Local `marker` has two quality settings, chosen with `MARKER_PRECISE` in `defuddle.py`:
+
+| Setting | What it does | Best for |
+|---|---|---|
+| `MARKER_PRECISE = False` (default) | Normal conversion: about a minute or two per paper | Papers with little math |
+| `MARKER_PRECISE = True` | Runs OCR on every page and has the AI provider re-read inline math: roughly 5–15 minutes per paper | Math-heavy papers: in normal mode, inline math like `$X_t$` can come out as broken text like `*Xt*` |
+
+Times are from an Apple Silicon Mac. The setting has no effect on Datalab, or on arXiv papers converted from their LaTeX source.
+
 To enable Datalab, add your key to `~/.claude/CLAUDE.md`:
 
 ```markdown
