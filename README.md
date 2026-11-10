@@ -104,16 +104,18 @@ Claude's job is just: trigger the skill, get the finished note, save it.
 ---
 tags:
   - project/myproject
-  - defuddle/doc
   - python
   - packaging
 created: "2026-03-14"
 title: "How to publish a Python package"
 description: "A step-by-step guide to publishing a Python package to PyPI using modern tooling."
-url: "https://example.com/python-packaging"
+url:
+  - "https://example.com/python-packaging"
 author: "Jane Smith"
 published: "2024-11-01"
 site: "example.com"
+words: 1840
+method: "defuddle-web"
 ---
 
 ---
@@ -134,6 +136,8 @@ A concise AI-generated summary of the article's key points...
 
 [full article content]
 ```
+
+`method` says where the content came from: `defuddle-web`, `defuddle-archive` (Wayback Machine or archive.is; the archived copy is added as a second `url`), `defuddle-youtube`, `defuddle-podcast`, `defuddle-arxiv`, `defuddle-marker` or `defuddle-datalab`.
 
 </details>
 

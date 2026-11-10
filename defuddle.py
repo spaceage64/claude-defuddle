@@ -140,16 +140,34 @@ def frontmatter_field(key, value, quote=True):
     return f'{key}: {val}'
 
 
-def build_frontmatter(defuddle_type, project, created, tags, extra_fields):
+# Frontmatter 'method' says where the content came from, not which internal fetch route was used
+_METHOD_LABELS = {'native': 'web', 'native-md': 'web', 'native-page': 'web', 'googlebot': 'web',
+                  'wayback': 'archive', 'archive-is': 'archive'}
+
+
+def method_field(method):
+    """'method: defuddle-…' frontmatter line: web, archive, youtube, podcast, arxiv, marker or datalab."""
+    return frontmatter_field('method', f'defuddle-{_METHOD_LABELS.get(method, method)}') if method else None
+
+
+def _with_archive(d, archive_url):
+    """Remember which archived copy the content came from (second 'url' value)."""
+    return dict(d, archive_url=archive_url) if d else {}
+
+
+def frontmatter_url(*urls):
+    """url is always a YAML list (one or more sources), so the property has one type vault-wide."""
+    urls = [u for u in urls if u]
+    return ('url:\n' + '\n'.join(f'  - {yaml_str(u)}' for u in urls)) if urls else None
+
+
+def build_frontmatter(project, created, tags, extra_fields):
     """Build a YAML frontmatter block from common fields plus source-specific extras.
 
     extra_fields is a list of pre-formatted YAML lines (or None to skip).
     """
-    fields = ['---', 'tags:', f'  - defuddle/{defuddle_type}']
-    if project:
-        fields.append(f'  - project/{project}')
-    for tag in tags:
-        fields.append(f'  - {tag}')
+    tags = ([f'project/{project}'] if project else []) + list(tags)
+    fields = ['---'] + (['tags:'] + [f'  - {t}' for t in tags] if tags else [])
     if created:
         fields.append(f'created: {created}')
     for line in [x for x in extra_fields if x is not None]:
@@ -651,7 +669,7 @@ def _dedup_note_tags(note):
     return note[:m.start()] + m.group(1) + '\n'.join(deduped) + '\n' + note[m.end():]
 
 
-def build_youtube(d, url, project, created, method=None):
+def build_youtube(d, url, project, created):
     title     = strip_title_suffix(d.get('title', ''))
     author    = d.get('author', '')
     published = (d.get('published') or '')[:10]
@@ -697,16 +715,16 @@ def build_youtube(d, url, project, created, method=None):
     contents_section = _toc_section(contents) + '\n\n' if transcript_body else ''
 
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter('video', project, created, all_tags, [
+    fm = build_frontmatter(project, created, all_tags, [
         frontmatter_field('title', title),
         f'description: {yaml_str(fm_description)}',
-        frontmatter_field('url', short_url),
+        frontmatter_url(short_url),
         frontmatter_field('channel', author),
         frontmatter_field('published', published),
         frontmatter_field('site', site),
-        frontmatter_field('method', method),
         frontmatter_field('duration', duration),
         frontmatter_field('words', words, quote=False) if words else None,
+        method_field('youtube'),
     ])
     summary = ai_summary if ai_summary else '[Summary to be added]'
 
@@ -989,6 +1007,8 @@ def build_apple_podcast(url, project, created, ttml_path):
     store_url  = meta.get('store_url', '')
     season     = meta.get('season')
     episode    = meta.get('episode')
+    # One 'episode' value: S02E08, or E08 when the show has no seasons
+    episode    = ((f'S{int(season):02d}' if season else '') + (f'E{int(episode):02d}' if episode is not None else '')) or None
 
     words = sum(len(chunk['text'].split()) for chunk in chunks)
 
@@ -1029,17 +1049,17 @@ def build_apple_podcast(url, project, created, ttml_path):
 
     # Frontmatter
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter('podcast', project, created, [t.lower() for t in ai_tags], [
+    fm = build_frontmatter(project, created, [t.lower() for t in ai_tags], [
         frontmatter_field('title',     title),
         f'description: {yaml_str(fm_description)}',
-        frontmatter_field('url',       url),
+        frontmatter_url(url),
         frontmatter_field('show',      show),
-        frontmatter_field('season',    season,  quote=False) if season is not None else None,
-        frontmatter_field('episode',   episode, quote=False) if episode is not None else None,
+        frontmatter_field('episode',   episode),
         frontmatter_field('published', published),
         frontmatter_field('site',      'Apple Podcasts'),
         frontmatter_field('duration',  duration),
         frontmatter_field('words',     words, quote=False) if words else None,
+        method_field('podcast'),
     ])
     summary = ai_summary if ai_summary else '[Summary to be added]'
     episode_art = f'\n![Episode art]({episode_img})\n' if episode_img else ''
@@ -1176,6 +1196,54 @@ def academic_target(tags, page_url):
 def is_paper_site(url):
     host = urlparse(url).netloc.lower().split(':')[0]
     return any(host == d or host.endswith('.' + d) for d in PAPER_SITES)
+
+_MONTHS = [('january', 'jan'), ('february', 'feb'), ('march', 'mar'), ('april', 'apr'), ('may',),
+           ('june', 'jun'), ('july', 'jul'), ('august', 'aug'), ('september', 'sept', 'sep'),
+           ('october', 'oct'), ('november', 'nov'), ('december', 'dec')]
+
+
+def _date_in_text(date, text):
+    """True when a YYYY-MM-DD date is written in text (ISO, 24-02-2026, 02/24/2026, 24 February 2026,
+    February 24, 2026)."""
+    y, m, d = date.split('-')
+    mi, di = int(m), int(d)
+    num = rf'0?{di}[-/.]0?{mi}[-/.]{y}|0?{mi}/0?{di}/{y}|{y}-{m}-{d}'
+    names = '|'.join(_MONTHS[mi - 1])
+    words = rf'\b0?{di}\.?\s+(?:{names})\.?\s+{y}|\b(?:{names})\.?\s+0?{di}(?:st|nd|rd|th)?,?\s+{y}'
+    return bool(re.search(rf'(?<!\d)(?:{num})(?!\d)|{words}', text, re.I))
+
+
+def _pdf_meta_people_date(path, text):
+    """Author(s) and creation date from the PDF's metadata (pdfinfo), kept only when the document
+    backs them up: a name whose last name appears in it, a date written out in it. Editor names
+    ('Microsoft Word', 'Owner'), user names and dates of exporting or scanning are dropped."""
+    if not shutil.which('pdfinfo'):
+        return [], ''
+    try:
+        out = subprocess.run(['pdfinfo', '-isodates', path], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return [], ''
+    field = lambda k: (re.search(rf'^{k}:\s*(.+)$', out, re.M) or [None, ''])[1].strip()
+    seen = (text[:6000] + '\n' + text[-3000:]).lower()   # title page and signature
+    raw = field('Author')
+    parts = re.split(r'\s*;\s*|\s+(?:and|&)\s+', raw)
+    if len(parts) == 1 and raw.count(',') == 1:           # "Hemert, Albert van" -> "Albert van Hemert"
+        last, first = (p.strip() for p in raw.split(','))
+        if first and len(last.split()) <= 2 and len(first.split()) <= 3:
+            parts = [f'{first} {last}']
+    elif len(parts) == 1 and ',' in raw and all(len(p.split()) >= 2 for p in raw.split(',')):
+        parts = [p.strip() for p in raw.split(',')]
+    authors = []
+    for name in parts:
+        words = name.split()
+        if (2 <= len(words) <= 4 and all(re.fullmatch(r"[^\W\d_][\w.'’-]*", w) for w in words)
+                and not re.search(r'microsoft|windows|adobe|acrobat|owner|admin|user|unknown|author', name, re.I)
+                and len(words[-1]) > 1 and words[-1].lower() in seen):
+            authors.append(name)
+    date = field('CreationDate')[:10]
+    if not (re.fullmatch(r'\d{4}-\d{2}-\d{2}', date) and _date_in_text(date, text)):
+        date = ''
+    return authors, date
 
 def _pdf_meta_title(path, raw=False):
     """The PDF's own Title metadata (pdfinfo), unless it is empty, a file name or an ID
@@ -3296,16 +3364,16 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
             kw_tags.append(kw_slug)
 
     author_lines = ([f'author:'] + [f'  - {yaml_str(a)}' for a in authors]) if authors else []
-    fm = build_frontmatter('paper', project, created, list(ai_tags) + kw_tags, [
+    fm = build_frontmatter(project, created, list(ai_tags) + kw_tags, [
         frontmatter_field('title', title),
-        f'description: {yaml_str(ai_desc)}' if ai_desc else None,
-        f'url: {url}',
+        f'description: {yaml_str(ai_desc or "[Description to be added]")}',
+        frontmatter_url(url),
         f'doi: {doi_str}' if doi_str else None,
         *author_lines,
         frontmatter_field('published', published),
         frontmatter_field('publication', journal),
-        frontmatter_field('method', method),
         f'words: {words}',
+        method_field(method),
     ])
 
     heading = f'# {title}' if title else ''
@@ -3356,6 +3424,7 @@ def build_pdf(url, project, created, skip_doi=False):
                 return None, None, {'redirect_doi': doi, 'pdf_bytes': f.read()}
 
         content, images_dict, method = pdf_to_markdown(pdf_path)
+        pdf_authors, pdf_published = _pdf_meta_people_date(pdf_path, content or '')
         if content and not doi and not skip_doi:
             # Scans without a text layer only become readable now: search Crossref with the converted text
             head = re.search(r'^#{1,2}\s+(.+)$', content, re.M)
@@ -3393,13 +3462,15 @@ def build_pdf(url, project, created, skip_doi=False):
             if len(parts) > 2:
                 site = fetch_defuddle(f'{p.scheme}://www.{".".join(parts[-2:])}').get('site', '')
 
-    fm = build_frontmatter('pdf', project, created, ai_tags_clean, [
+    fm = build_frontmatter(project, created, ai_tags_clean, [
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
-        *([] if local_path else [frontmatter_field('url', url)]),
+        *([] if local_path else [frontmatter_url(url)]),
+        *(['author:'] + [f'  - {yaml_str(a)}' for a in pdf_authors] if pdf_authors else []),
+        frontmatter_field('published', pdf_published),
         frontmatter_field('site', site),
-        frontmatter_field('method', method),
         frontmatter_field('words', words, quote=False),
+        method_field(method),
     ])
     summary = ai_summary or '[Summary to be added]'
     index = build_index(content)
@@ -3454,15 +3525,15 @@ def build_article(d, url, project, created, method=None):
     index = build_index(content)
 
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter('doc', project, created, ai_tags_clean, [
+    fm = build_frontmatter(project, created, ai_tags_clean, [
         frontmatter_field('title', title),
         f'description: {yaml_str(fm_description)}',
-        frontmatter_field('url', url),
+        frontmatter_url(url, d.get('archive_url')),   # archived copy as a second source
         *([f'author:\n  - {yaml_str(author)}'] if author else []),
         frontmatter_field('published', published),
         frontmatter_field('site', site),
-        frontmatter_field('method', method),
         frontmatter_field('words', words, quote=False) if words else None,
+        method_field(method),
     ])
     summary = ai_summary if ai_summary else '[Summary to be added]'
 
@@ -4238,7 +4309,7 @@ def fetch_for_method(url, method):
                 file=sys.stderr
             )
             return {}, 'wayback'
-        return fetch_html_as_markdown(archive_url, original_url=url) or {}, 'wayback'
+        return _with_archive(fetch_html_as_markdown(archive_url, original_url=url), archive_url), 'wayback'
     elif method == 'archive-is':
         archive_url = archive_is_snapshot(url)
         if not archive_url:
@@ -4247,7 +4318,7 @@ def fetch_for_method(url, method):
             d = fetch_defuddle(archive_url)
             if d:
                 d = clean_archive_content(d, url)
-            return d or {}, 'archive-is'
+            return _with_archive(d, archive_url), 'archive-is'
         print(
             f'archive.is requires a captcha for this URL.\n'
             f'Please visit this URL, save the page, and solve the captcha:\n'
@@ -4811,7 +4882,7 @@ def main(argv=None):
                         if candidate.get('wordCount', 0) > MIN_WORDS and 'archive.is/' in archive_url:
                             candidate = clean_archive_content(candidate, url)
                     if candidate.get('wordCount', 0) > MIN_WORDS:
-                        d, used_method = candidate, method_name
+                        d, used_method = _with_archive(candidate, archive_url), method_name
                         break
 
             if not used_method:
@@ -4834,7 +4905,7 @@ def main(argv=None):
 
     # Save mode: build note, write to vault
     if ENABLE_YOUTUBE and is_youtube(url):
-        note = build_youtube(d, url, args.project, args.created, method=used_method)
+        note = build_youtube(d, url, args.project, args.created)
     else:
         note = build_article(d, url, args.project, args.created, method=used_method)
 
