@@ -163,6 +163,7 @@ A concise AI-generated summary of the article's key points...
 |---|---|---|
 | [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→Markdown (default); version 2 also needs `llama-server` | `pipx install marker-pdf` and `brew install llama.cpp` |
 | Datalab API key | Cloud PDF→Markdown fallback | [datalab.to](https://datalab.to): free accounts get $10 in credits (roughly 10–15 cents per paper) |
+| tesseract | OCR text layer for scanned PDFs (`OCR_PDF`) | `brew install tesseract` |
 | poppler | Sharp arXiv PDF figures (200 dpi); reads PDF text for the shadow library check | `brew install poppler` |
 | Ghostscript | Renders EPS figures of arXiv papers (skipped with a warning without it) | `brew install ghostscript` |
 | [uv](https://docs.astral.sh/uv/) | Runs PyMuPDF in isolation for PDF compression | `brew install uv` |
@@ -264,7 +265,7 @@ The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To us
 
 Times are from an Apple Silicon Mac. The setting has no effect on Datalab, or on arXiv papers converted from their LaTeX source.
 
-**Keeping the PDF.** With `--keep-pdf`, or always with `KEEP_PDF = True` in `defuddle.py`, the original PDF is saved next to the note under the same name (`--no-keep-pdf` skips it for one run). When `ENABLE_PDF_COMPRESSION` is on (the default) and [uv](https://docs.astral.sh/uv/) is installed, it is compressed with PyMuPDF: images above 160 dpi go to 150 dpi, fonts are trimmed, and forms and protected files are left alone.
+**Keeping the PDF.** With `--keep-pdf`, or always with `KEEP_PDF = True` in `defuddle.py`, the original PDF is saved next to the note under the same name (`--no-keep-pdf` skips it for one run). When `ENABLE_PDF_COMPRESSION` is on (the default) and [uv](https://docs.astral.sh/uv/) is installed, it is compressed with PyMuPDF: images above 160 dpi go to 150 dpi, fonts are trimmed, and forms and protected files are left alone. With `OCR_PDF = True` (needs `tesseract` and `uv`), a saved PDF whose pages have no text layer, such as an old scan, first gets an invisible OCR text layer so it can be searched and selected; the scan images stay untouched, so it only grows by the text (a few KB per page), and compression runs afterwards as usual.
 
 **PDFs without a DOI on them.** Older scans and working papers often don't print their DOI. defuddle then looks for one in the file name (Elsevier `1-s2.0-…-main.pdf`, SSRN `ssrn-….pdf`, arXiv IDs), the PDF's metadata (Elsevier PIIs) and finally Crossref's title search, and only uses a result whose title appears on the PDF's first pages. A local PDF is then converted as a paper with full metadata, without downloading it again. Scans without a text layer are looked up again after conversion, with the OCR'd text. If you already know the DOI, pass `--doi` and no search is needed. If a converted note has under 70% of the words in the PDF's own text layer, the conversion is retried once and otherwise saved with a `WARNING`. It also warns when equation numbers or appendix titles printed in the PDF are missing from the note (a gap in the middle that the word count hides), and when a display equation has unbalanced brackets. Marker's heading levels are tidied up from the section numbering (1., I., A., a), (i), 2.1 …), and bold lines that are section titles become headings.
 

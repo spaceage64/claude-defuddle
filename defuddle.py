@@ -61,6 +61,10 @@ GRAYSCALE_FIGURES        = False
 ENABLE_PDF_COMPRESSION   = True
 # ║  Keep PDF — also save the original PDF of papers and PDFs next to the        ║
 # ║  note (as with --keep-pdf; --no-keep-pdf skips it for one run).              ║
+# ║  OCR — saved PDFs whose pages have no text layer (scans) get an invisible    ║
+# ║  OCR text layer, so they can be searched and selected; the scan images stay  ║
+# ║  as they are. Runs before compression. Requires: tesseract, uv.              ║
+OCR_PDF = False
 KEEP_PDF = False
 # ║  Parallel jobs — links processed at the same time when several are given.    ║
 PARALLEL_JOBS = 4
@@ -4261,6 +4265,75 @@ def optimize_grayscale_figures(paths):
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
 
+_PDF_OCR = '''
+import sys, pymupdf
+pymupdf.TOOLS.mupdf_display_errors(False)
+src, out, tessdata = sys.argv[1:4]
+doc = pymupdf.open(src)
+font = pymupdf.Font('helv')
+done = 0
+for page in doc:
+    if len(page.get_text('words')) >= 50:       # the page already has a text layer
+        continue
+    tp = page.get_textpage_ocr(language='eng', dpi=300, full=True, tessdata=tessdata)
+    words = page.get_text('words', textpage=tp)
+    if not words:
+        continue
+    tw = pymupdf.TextWriter(page.rect)          # all of a page's text in one go keeps the file small
+    for x0, y0, x1, y1, word, *_ in words:
+        w = font.text_length(word, fontsize=1)
+        size = min((x1 - x0) / w if w else y1 - y0, (y1 - y0) * 1.1)
+        tw.append((x0, y1 - (y1 - y0) * 0.2), word, font=font, fontsize=size)
+    tw.write_text(page, render_mode=3)          # invisible: searchable and selectable only
+    done += 1
+if done:
+    doc.save(out, garbage=4, deflate=True, clean=True)
+print(done)
+'''
+
+def _tessdata_dir():
+    """Folder with Tesseract's language data (TESSDATA_PREFIX, else what tesseract reports), or None."""
+    if os.environ.get('TESSDATA_PREFIX'):
+        return os.environ['TESSDATA_PREFIX']
+    try:
+        out = subprocess.run(['tesseract', '--list-langs'], capture_output=True, text=True, timeout=20)
+        m = re.search(r'"([^"]+)"', out.stdout + out.stderr)
+        return m.group(1) if m else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def _ocr_pdf(path):
+    """Add an invisible OCR text layer to the pages of a PDF that have no text (scans), in place.
+    The scan images are left untouched, so the file only grows by the text (a few KB per page)."""
+    words = _pdf_text_words(path) or 0
+    try:
+        pages = int(re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', path], capture_output=True,
+                                                                text=True).stdout, re.M).group(1))
+    except Exception:
+        pages = 0
+    if pages and words / pages >= 50:
+        return                                          # has a text layer already
+    if not shutil.which('tesseract') or not shutil.which('uv'):
+        print('The PDF has no text layer; install tesseract (and uv) to add one with OCR_PDF.', file=sys.stderr)
+        return
+    tessdata = _tessdata_dir()
+    if not tessdata:
+        return
+    print('Adding an OCR text layer to the PDF...', file=sys.stderr, flush=True)
+    out = path + '.ocr.pdf'
+    try:
+        r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pymupdf', 'python', '-c', _PDF_OCR,
+                            path, out, tessdata], capture_output=True, text=True, timeout=3600)
+        done = int((r.stdout.strip().splitlines() or ['0'])[-1])
+        if done and os.path.exists(out):
+            os.replace(out, path)
+            print(f'Added an OCR text layer to {done} page{"s" if done != 1 else ""}', file=sys.stderr)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    finally:
+        if os.path.exists(out):
+            os.remove(out)
+
 _PDF_COMPRESS = '''
 import sys, pymupdf
 src, out = sys.argv[1:3]
@@ -4322,6 +4395,8 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
     with open(pdf_path, 'wb') as f:
         f.write(data)
     print(f'Saved the original PDF as {filename}.pdf next to the note')
+    if OCR_PDF:
+        _ocr_pdf(pdf_path)
     if ENABLE_PDF_COMPRESSION:
         _compress_pdf(pdf_path)
 
