@@ -55,7 +55,7 @@ ENABLE_IMAGE_COMPRESSION = True
 # ║  Grayscale figures (with compression) — requires: uv. Grey images (scanned   ║
 # ║  graphs, line art) become PNG with 8 grey levels, or 32 when 8 would show    ║
 # ║  bands in smooth shading; photos and colour images are left alone.           ║
-GRAYSCALE_FIGURES        = True
+GRAYSCALE_FIGURES        = False
 # ║  PDF compression (--keep-pdf) — requires: uv                                 ║
 # ║  Images above 160 dpi go to 150 dpi; fonts are trimmed.                      ║
 ENABLE_PDF_COMPRESSION   = True
