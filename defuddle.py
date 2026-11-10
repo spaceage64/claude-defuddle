@@ -8,7 +8,7 @@ Usage:
         --url "<url>" --project "<project>" --created "YYYY-MM-DD"
 """
 
-import sys, json, re, argparse, subprocess, os, html, glob, shutil, tempfile, time
+import sys, json, re, argparse, subprocess, os, html, glob, shutil, tempfile, time, unicodedata
 from urllib.parse import urlparse, urlunparse, quote, urljoin
 from datetime import datetime, timezone
 
@@ -39,6 +39,11 @@ ENABLE_PDF      = True   # Enables plain PDF URL support
 # ║  Shadow library — Optional shadow library base URL for paywalled papers      ║
 # ║  (e.g. https://sci-hub.example). Set to '' to disable.                       ║
 SHADOW_BASE_URL = ''
+# ║  Downloads folder — watched for the PDF you save from the shadow library.    ║
+# ║  '' = the system default (macOS, Windows, Linux XDG). Example: '~/Downloads' ║
+DOWNLOADS_DIR = ''
+# ║  Seconds to wait for that PDF before giving up.                              ║
+SHADOW_WAIT   = 600
 # ║                                                                              ║
 # ║  Images — download and localise images into a /img subfolder.                ║
 # ║  If False, images are left as external URLs in the note.                     ║
@@ -1732,39 +1737,127 @@ def fetch_doi_pdf(doi, tmp_dir):
         return pdf_path
     return None
 
-def fetch_shadow_pdf(doi, tmp_dir):
-    """Try to fetch PDF from the configured shadow library."""
-    base = SHADOW_BASE_URL.rstrip('/')
-    result = subprocess.run(
-        ['curl', '-sL', '--max-time', '20', f'{base}/{doi}'],
-        capture_output=True, timeout=25
-    )
-    html_text = result.stdout.decode('utf-8', errors='replace')
-    for pattern in [
-        r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+\.pdf[^"\']*)["\'][^>]+name=["\']citation_pdf_url["\']',
-        r'<object[^>]+data=["\']([^"\']+\.pdf[^"\']*)["\']',
-        r'<embed[^>]+src=["\']([^"\']+\.pdf[^"\']*)["\']',
-        r'<iframe[^>]+src=["\']([^"\']+\.pdf[^"\']*)["\']',
-        r'"pdf_url"\s*:\s*"([^"]+)"',
-        r"'pdf_url'\s*:\s*'([^']+)'",
-        r'href=["\']([^"\']+\.pdf(?:[^"\'#]*)?)["\']',
-        r'src=["\']([^"\']+\.pdf(?:[^"\'#]*)?)["\']',
-    ]:
-        m = re.search(pattern, html_text, re.IGNORECASE)
-        if m:
-            pdf_url = m.group(1)
-            if pdf_url.startswith('//'):
-                pdf_url = 'https:' + pdf_url
-            elif not pdf_url.startswith('http'):
-                pdf_url = base + pdf_url
-            pdf_path = os.path.join(tmp_dir, 'paper.pdf')
-            subprocess.run(
-                ['curl', '-sL', '--max-time', '30', '-o', pdf_path, pdf_url],
-                timeout=35
-            )
-            if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
-                return pdf_path
+def downloads_dir():
+    """The folder the browser saves to: DOWNLOADS_DIR, else the system default."""
+    if DOWNLOADS_DIR:
+        return os.path.expanduser(DOWNLOADS_DIR)
+    if sys.platform == 'win32':
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders') as key:
+                return winreg.QueryValueEx(key, '{374DE290-123F-4565-9164-39C4925E467B}')[0]
+        except OSError:
+            pass
+    elif sys.platform.startswith('linux'):
+        try:
+            # Prints $HOME when no download dir is configured
+            path = subprocess.run(['xdg-user-dir', 'DOWNLOAD'], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+            if path and os.path.normpath(path) != os.path.expanduser('~'):
+                return path
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return os.path.join(os.path.expanduser('~'), 'Downloads')
+
+_PDF_TEXT = """
+import sys, pymupdf
+pymupdf.TOOLS.mupdf_display_errors(False)
+doc = pymupdf.open(sys.argv[1])
+print(''.join(doc[i].get_text() for i in range(min(2, len(doc)))))
+"""
+
+def _pdf_first_pages_text(path):
+    """Text of the first two pages: pdftotext, else PyMuPDF via uv, else a raw byte scan."""
+    cmds = []
+    if shutil.which('pdftotext'):
+        cmds.append(['pdftotext', '-l', '2', '-q', path, '-'])
+    if shutil.which('uv'):
+        cmds.append(['uv', 'run', '--no-project', '--quiet', '--with', 'pymupdf', 'python', '-c', _PDF_TEXT, path])
+    for cmd in cmds:
+        try:
+            text = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+            if text.strip():
+                return text
+        except (OSError, subprocess.SubprocessError):
+            pass
+    with open(path, 'rb') as f:
+        raw = f.read(65536)
+    return b' '.join(re.findall(rb'[\x20-\x7e]{4,}', raw)).decode('ascii', errors='ignore')
+
+def _pdf_matches(text, doi, title):
+    """True when the text of a PDF's first pages carries this DOI, or else this title."""
+    text = text.lower()
+    if re.sub(r'\s+', '', doi.lower()) in re.sub(r'\s+', '', text):
+        return True
+    # Letters and digits only: survives line breaks and hyphenation in the title
+    key = re.sub(r'[^a-z0-9]', '', _slug(title or ''))
+    return len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text))
+
+def wait_for_shadow_pdf(doi, title=''):
+    """Open the shadow library page in the browser and wait for the user to save the PDF.
+
+    Shadow libraries sit behind JavaScript browser checks (e.g. DDoS-Guard) that curl
+    can't pass, so the download happens in the user's browser. Returns the path of the
+    new PDF in the downloads folder whose first pages show this DOI (or title), or None
+    after SHADOW_WAIT. PDFs of other papers are skipped, so several runs can wait at once.
+    Partial downloads (.crdownload, .part, .download) are ignored; the file is left in place.
+    """
+    import webbrowser
+    url    = f'{SHADOW_BASE_URL.rstrip("/")}/{doi}'
+    folder = downloads_dir()
+    if not os.path.isdir(folder):
+        print(f'Downloads folder not found: {folder} (set DOWNLOADS_DIR).', file=sys.stderr)
+        print(f'Download the PDF manually and pass the local file to defuddle: {url}', file=sys.stderr)
+        return None
+    start  = time.time()
+    before = set(os.listdir(folder))
+    limit  = f'{SHADOW_WAIT // 60} min' if SHADOW_WAIT >= 120 else f'{SHADOW_WAIT} s'
+    print(f'Opening shadow library in your browser: {url}', file=sys.stderr)
+    print(f'Save the PDF to {folder} — waiting up to {limit}...', file=sys.stderr, flush=True)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    sizes, checked = {}, {}
+    while time.time() < start + SHADOW_WAIT:
+        time.sleep(2)
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if not name.lower().endswith('.pdf'):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if name in before and st.st_mtime < start:
+                continue
+            if any(n in names for n in (name + '.part', name + '.crdownload', name + '.download')):
+                continue
+            # Firefox creates the final name empty while writing .part; wait for a stable size
+            if st.st_size > 1000 and sizes.get(name) == st.st_size:
+                key = (st.st_size, st.st_mtime)
+                if checked.get(name) == key:
+                    continue
+                checked[name] = key
+                with open(path, 'rb') as f:
+                    if f.read(5) != b'%PDF-':
+                        continue
+                text = _pdf_first_pages_text(path)
+                if _pdf_matches(text, doi, title):
+                    print(f'Found {name}', file=sys.stderr)
+                    return path
+                other = extract_doi_from_pdf_text(text)
+                why   = f'it is a different paper (DOI {other})' if other else f'no DOI {doi} or matching title on its first pages'
+                print(f'Skipping {name}: {why}', file=sys.stderr, flush=True)
+            sizes[name] = st.st_size
+    print(f'No PDF for DOI {doi} appeared in {folder} within {limit}.', file=sys.stderr)
+    if checked:
+        print('If one of the skipped PDFs is this paper, pass its path to defuddle.', file=sys.stderr)
     return None
 
 def pdf_to_markdown(pdf_path):
@@ -2478,8 +2571,7 @@ def build_paper(url, project, created):
                 pdf_path = fetch_doi_pdf(doi, tmp_dir)
             if not pdf_path and doi:
                 if SHADOW_BASE_URL:
-                    print(f'Trying shadow library ({SHADOW_BASE_URL.rstrip("/")})...', file=sys.stderr)
-                    pdf_path = fetch_shadow_pdf(doi, tmp_dir)
+                    pdf_path = wait_for_shadow_pdf(doi, meta.get('title', ''))
                 else:
                     print('Paper is not publicly accessible and no shadow library is configured (set SHADOW_BASE_URL).', file=sys.stderr)
             if not pdf_path:
@@ -2563,7 +2655,7 @@ def build_paper(url, project, created):
 
     kw_tags = []
     for kw in paper_keywords:
-        kw_slug = re.sub(r'[^a-z0-9]+', '-', kw.lower()).strip('-')
+        kw_slug = _slug(kw)
         if kw_slug:
             kw_tags.append(kw_slug)
 
@@ -2752,6 +2844,17 @@ def format_saved_path(project, filename):
     return '/'.join(parts)
 
 
+_TRANSLIT = str.maketrans({'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'ø': 'o', 'ł': 'l', 'đ': 'd',
+                            'ð': 'd', 'þ': 'th', 'ı': 'i'})
+
+
+def _slug(text):
+    """Kebab-case ASCII slug; diacritics are dropped (Guéant -> gueant), not split on."""
+    text = unicodedata.normalize('NFKD', text.lower().translate(_TRANSLIT))
+    text = ''.join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]+', '-', text).strip('-')
+
+
 def generate_filename(title, max_words=None):
     """Generate a kebab-case filename from a title using the configured AI provider.
     Falls back to filtering title words by length if the AI call fails."""
@@ -2762,7 +2865,7 @@ def generate_filename(title, max_words=None):
 
     def _clean(raw):
         name = raw.strip().lower().splitlines()[0]
-        return re.sub(r'[^a-z0-9]+', '-', name).strip('-')
+        return _slug(name)
 
     if title and (AI_API_KEY or AI_LLM == 'ollama'):
         try:
@@ -2810,7 +2913,7 @@ def generate_filename(title, max_words=None):
             pass
 
     # Fallback: filter words by decreasing minimum length until we get 3
-    words = re.findall(r'[a-zA-Z0-9]+', title)
+    words = [w for w in _slug(title or '').split('-') if w]
     for min_len in (4, 3, 2, 0):
         filtered = [w.lower() for w in words if len(w) > min_len]
         if len(filtered) >= 3:
@@ -3646,7 +3749,7 @@ def main():
             return
         title    = meta.get('title', '')
         authors  = meta.get('authors', [])
-        last_name = re.sub(r'[^a-z0-9]+', '-', authors[0].split()[-1].lower()).strip('-') if authors else ''
+        last_name = _slug(authors[0].split()[-1]) if authors else ''
         ai_name  = generate_filename(title)
         filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
         vault    = get_vault_path()
@@ -3676,7 +3779,7 @@ def main():
                 return
             note, images_dict, meta = build_paper(doi_url, args.project, args.created)
             authors  = meta.get('authors', [])
-            last_name = re.sub(r'[^a-z0-9]+', '-', authors[0].split()[-1].lower()).strip('-') if authors else ''
+            last_name = _slug(authors[0].split()[-1]) if authors else ''
             ai_name  = generate_filename(meta.get('title', ''))
             filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
             vault    = get_vault_path()

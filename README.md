@@ -244,7 +244,7 @@ For DOI and arXiv papers, the skill:
 1. Tries to fetch the arXiv LaTeX source directly (best quality)
 2. Falls back to local [Marker](https://github.com/VikParuchuri/marker) for PDF→markdown
 3. Falls back to the Datalab API if Marker isn't installed
-4. Optionally tries a shadow library for restricted papers
+4. Optionally opens a shadow library in your browser for paywalled papers (see below)
 
 The PDF processor order is controlled by `PDF_PROCESSOR` in `defuddle.py` (default: `local_first`).
 
@@ -270,6 +270,15 @@ SHADOW_BASE_URL = 'https://your-shadow-library.example'
 ```
 
 Set it to `''` to disable. The shadow library needs to support this URL format: `https://example.domain/10.1103/PhysRevB.57.6107`
+
+Shadow libraries usually sit behind a browser check (e.g. DDoS-Guard) that scripts can't pass, so defuddle doesn't download from them itself. Instead it opens the paper's page in your browser and watches your downloads folder: save the PDF there and processing continues on its own. Only a PDF whose first pages show the paper's DOI (or, failing that, its title) is used, so downloads of other papers are skipped and several runs can wait at once. Text is read with `pdftotext` (poppler), PyMuPDF via `uv`, or a raw byte scan as a last resort. The PDF stays in your downloads folder.
+
+```python
+DOWNLOADS_DIR = ''    # '' = system default; set a path if your browser saves elsewhere
+SHADOW_WAIT   = 600   # seconds to wait for the PDF
+```
+
+The default downloads folder is `~/Downloads` on macOS, the Downloads known folder on Windows (also when it was moved), and `xdg-user-dir DOWNLOAD` on Linux (falling back to `~/Downloads`). Partial downloads (`.crdownload`, `.part`, `.download`) are ignored until they finish.
 
 ---
 

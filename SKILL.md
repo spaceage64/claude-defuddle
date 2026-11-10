@@ -37,6 +37,7 @@ python3 ~/.claude/skills/defuddle/defuddle.py \
 - `--filename`: optional override; script auto-generates from the title via AI if omitted
 - `--method`: force a specific fetch method instead of the auto-cascade (articles only)
 - `--keep-pdf` (papers and PDFs): also save the original PDF next to the note, with the same name (`{filename}.pdf`), compressed when `ENABLE_PDF_COMPRESSION` is on. Use only when the user asks to keep the PDF.
+- Papers behind a shadow library: the script opens the shadow library page in the user's browser and waits (up to `SHADOW_WAIT`, default 10 min) for a new PDF in their downloads folder, then continues. Run paper commands in the background and check their output after about 30 seconds; when it shows `Opening shadow library in your browser`, tell the user to save the PDF from that page (give the URL so they can click it if no browser opened). The PDF is left in their downloads folder.
 
 Notes are saved to `{vault}/{folder}/defuddle/` regardless of source type.
 
