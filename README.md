@@ -264,7 +264,11 @@ The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To us
 
 Times are from an Apple Silicon Mac. The setting has no effect on Datalab, or on arXiv papers converted from their LaTeX source.
 
-**Keeping the PDF.** With `--keep-pdf`, the original PDF is saved next to the note under the same name. When `ENABLE_PDF_COMPRESSION` is on (the default) and [uv](https://docs.astral.sh/uv/) is installed, it is compressed with PyMuPDF: images above 160 dpi go to 150 dpi, fonts are trimmed, and forms and protected files are left alone.
+**Keeping the PDF.** With `--keep-pdf`, or always with `KEEP_PDF = True` in `defuddle.py`, the original PDF is saved next to the note under the same name (`--no-keep-pdf` skips it for one run). When `ENABLE_PDF_COMPRESSION` is on (the default) and [uv](https://docs.astral.sh/uv/) is installed, it is compressed with PyMuPDF: images above 160 dpi go to 150 dpi, fonts are trimmed, and forms and protected files are left alone.
+
+**PDFs without a DOI on them.** Older scans and working papers often don't print their DOI. defuddle then looks for one in the file name (Elsevier `1-s2.0-…-main.pdf`, SSRN `ssrn-….pdf`, arXiv IDs), the PDF's metadata (Elsevier PIIs) and finally Crossref's title search, and only uses a result whose title appears on the PDF's first pages. A local PDF is then converted as a paper with full metadata, without downloading it again. If a converted note has far fewer words than the PDF's own text layer, the conversion is retried once and otherwise saved with a `WARNING`.
+
+**Several links at once.** Pass several links in one command and they are processed `PARALLEL_JOBS` at a time (default 4), each in its own process. Mostly the waiting (downloads, AI calls, the shadow library) overlaps, so a batch of papers finishes roughly 2–3× faster.
 
 **Paper figures.** For arXiv papers converted from LaTeX, figures are collected from every subfolder (e.g. `figures/`) and matched by path, file name or name without extension (as `\includegraphics` often omits it). PDF and EPS figures are rendered at 200 dpi and saved as PNG or JPG; figures made of several sub-figures keep all of them.
 

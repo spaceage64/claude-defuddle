@@ -55,6 +55,11 @@ ENABLE_IMAGE_COMPRESSION = True
 # ║  PDF compression (--keep-pdf) — requires: uv                                 ║
 # ║  Images above 160 dpi go to 150 dpi; fonts are trimmed.                      ║
 ENABLE_PDF_COMPRESSION   = True
+# ║  Keep PDF — also save the original PDF of papers and PDFs next to the        ║
+# ║  note (as with --keep-pdf; --no-keep-pdf skips it for one run).              ║
+KEEP_PDF = False
+# ║  Parallel jobs — links processed at the same time when several are given.    ║
+PARALLEL_JOBS = 4
 # ║                                                                              ║
 # ║  Datalab — converts paper PDFs to markdown via cloud API.                    ║
 # ║  Get key at https://datalab.to — free accounts get $10 in credits.           ║
@@ -669,7 +674,7 @@ def build_youtube(d, url, project, created, method=None):
 
     # Collect and deduplicate tags (no # prefix — Obsidian adds it in display)
     desc_tags = extract_desc_tags(desc)
-    ai_tags_clean = [t.lower() for t in ai_tags]
+    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
     all_tags = list(dict.fromkeys(desc_tags + ai_tags_clean))
 
     # Remove hashtags from description text
@@ -1164,6 +1169,60 @@ def is_paper_site(url):
     host = urlparse(url).netloc.lower().split(':')[0]
     return any(host == d or host.endswith('.' + d) for d in PAPER_SITES)
 
+def _pdf_meta_title(path, raw=False):
+    """The PDF's own Title metadata (pdfinfo), unless it is empty, a file name or an ID
+    (raw=True returns it as is)."""
+    if not shutil.which('pdfinfo'):
+        return ''
+    try:
+        out = subprocess.run(['pdfinfo', path], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    m = re.search(r'^Title:\s*(.+)$', out, re.M)
+    title = m.group(1).strip() if m else ''
+    if raw:
+        return title
+    if len(title) < 10 or re.match(r'(PII|DOI)\b', title, re.I) or re.search(r'\.(pdf|docx?|tex|dvi)$|^Microsoft Word|^untitled', title, re.I):
+        return ''
+    return title
+
+def _title_on_pages(title, text):
+    """True when this title appears in the text (letters and digits only, so line breaks don't matter)."""
+    key = re.sub(r'[^a-z0-9]', '', _slug(title or ''))
+    return len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text or ''))
+
+def crossref_doi_for_pdf(text, hint='', name=''):
+    """DOI for a PDF without a printed one: search Crossref with its title (or first-page
+    text) and accept a result only if that result's title appears on the PDF's first pages.
+    name: the PDF's file name; publishers' download names carry an ID (Elsevier
+    1-s2.0-{PII}-main.pdf, SSRN ssrn-{id}.pdf, arXiv {id}v2.pdf)."""
+    m = re.match(r'1-s2\.0-(S?[0-9X]{16,17})', name or '', re.I)
+    if m:
+        pii = m.group(1).upper()
+        doi = _crossref_pii_doi(pii if pii.startswith('S') else 'S' + pii) or _crossref_pii_doi(pii.lstrip('S'))
+        if doi:
+            return doi
+    m = re.match(r'ssrn[-_](?:id)?(\d{4,8})\b', name or '', re.I)
+    if m and _title_on_pages((get_paper_metadata(f'10.2139/ssrn.{m.group(1)}') or {}).get('title', ''), text):
+        return f'10.2139/ssrn.{m.group(1)}'
+    m = re.match(r'(\d{4}\.\d{4,5})(?:v\d+)?\.pdf$', name or '', re.I)
+    if m:
+        return f'10.48550/arXiv.{m.group(1)}'
+    # Elsevier PIIs, e.g. 0304-405X(81)90020-9 (often the PDF's Title) or S0304405X14001548
+    for src in (hint, text):
+        m = re.search(r'\b(S?\d{4}-?\d{3}[\dX]\(\d\d\)\d{5}-?[\dX]|S\d{4}\d{3}[\dX]\d{8}[\dX])', src or '')
+        if m:
+            doi = _crossref_pii_doi(re.sub(r'[^0-9A-Za-z]', '', m.group(1)).upper())
+            if doi:
+                return doi
+    clean_hint = '' if re.match(r'(PII|DOI)\b', hint or '', re.I) else hint
+    for query in dict.fromkeys(q for q in (clean_hint, re.sub(r'\s+', ' ', text or '')[:300]) if q and q.strip()):
+        msg = _crossref(f'works?query.bibliographic={quote(query)}&rows=5&select=DOI,title')
+        for item in (msg or {}).get('items', []):
+            if _title_on_pages(' '.join(item.get('title') or []), text):
+                return item['DOI']
+    return None
+
 def _crossref(path):
     """GET a Crossref API path and return its 'message', or None."""
     try:
@@ -1347,7 +1406,7 @@ def _get_paper_metadata_arxiv(arxiv_id):
         title = (entry.findtext('atom:title', '', ns) or '').strip().replace('\n', ' ')
         authors = []
         for a in entry.findall('atom:author', ns):
-            name = (a.findtext('atom:name', '', ns) or '').strip()
+            name = _clean_author(a.findtext('atom:name', '', ns) or '')
             if name:
                 authors.append(name)
         published = (entry.findtext('atom:published', '', ns) or '')[:10]
@@ -1356,6 +1415,23 @@ def _get_paper_metadata_arxiv(arxiv_id):
                 'journal': journal_ref, 'doi': f'10.48550/arXiv.{arxiv_id}'}
     except Exception:
         return {}
+
+_NAME_PARTICLES = {'van', 'von', 'der', 'den', 'de', 'del', 'della', 'di', 'da', 'du', 'la', 'le', 'ten', 'ter'}
+
+def _clean_author(name):
+    """Tidy an author name from Crossref/arXiv: 'A.Craig' -> 'A. Craig', and names in
+    capitals ('ROBERT A. SCHWARTZ') -> 'Robert A. Schwartz' (keeping McX, O'X, van der)."""
+    name = re.sub(r'\s+', ' ', name).strip()
+    name = re.sub(r'\b([A-Z])\.(?=[A-Z][a-z])', r'\1. ', name)
+    letters = [c for c in name if c.isalpha()]
+    if letters and all(c.isupper() for c in letters):
+        def word(w, first):
+            if not first and w.lower() in _NAME_PARTICLES:
+                return w.lower()
+            w = '-'.join(p[:1] + p[1:].lower() for p in w.split('-'))
+            return re.sub(r"^(Mc|O')([a-z])", lambda m: m.group(1) + m.group(2).upper(), w)
+        name = ' '.join(word(w, i == 0) for i, w in enumerate(name.split()))
+    return name
 
 def get_paper_metadata(doi):
     """Fetch paper metadata from CrossRef API, with arXiv API fallback."""
@@ -1373,9 +1449,10 @@ def get_paper_metadata(doi):
         data = json.loads(result.stdout.decode('utf-8', errors='replace'))
         work = data.get('message', {})
         title = ' '.join(work.get('title', [''])).strip()
+        title = re.sub('[\u2010\u2011]', '-', title)   # Crossref's Unicode hyphens
         authors = []
         for a in work.get('author', []):
-            name = f'{a.get("given", "")} {a.get("family", "")}'.strip()
+            name = _clean_author(f'{a.get("given", "")} {a.get("family", "")}')
             if name:
                 authors.append(name)
         date_parts = (work.get('published') or work.get('issued') or {}).get('date-parts', [[]])[0]
@@ -2136,6 +2213,48 @@ def pdf_to_markdown(pdf_path):
                         pass
             return markdown, images_dict, 'marker'
 
+    def _convert():
+        return _convert_with_processor(_try_local, _try_datalab)
+
+    result = _convert()
+    if result is not None:
+        expected = _pdf_text_words(pdf_path)
+        got = len(result[0].split())
+        if expected and expected > 500 and got < expected / 3:
+            print(f'Conversion looks incomplete ({got} of about {expected} words) — retrying once...', file=sys.stderr)
+            retry = _convert()
+            if retry is not None and len(retry[0].split()) > got:
+                result, got = retry, len(retry[0].split())
+            if got < expected / 3:
+                print(f'WARNING: conversion looks incomplete ({got} of about {expected} words in the PDF\'s '
+                      'text layer); check the note against the PDF.', file=sys.stderr)
+
+    if result is None:
+        print(
+            'PDF conversion failed. Install local marker with: pipx install marker-pdf\n'
+            'Or set a Datalab API key in ~/.claude/CLAUDE.md.',
+            file=sys.stderr
+        )
+        return '', {}, ''
+
+    markdown, images, method = result
+    return _clean_pdf_markdown(markdown, images), images, method
+
+
+def _pdf_text_words(path):
+    """Word count of a PDF's text layer (pdftotext), or None when it has none or pdftotext is missing."""
+    if not shutil.which('pdftotext'):
+        return None
+    try:
+        text = subprocess.run(['pdftotext', '-q', path, '-'], capture_output=True, text=True,
+                              errors='replace', timeout=300).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return len(text.split()) or None
+
+
+def _convert_with_processor(_try_local, _try_datalab):
+    """Run the PDF processors in PDF_PROCESSOR order; the first result, or None."""
     if PDF_PROCESSOR == 'local':
         result = _try_local()
     elif PDF_PROCESSOR == 'datalab':
@@ -2150,17 +2269,7 @@ def pdf_to_markdown(pdf_path):
         if result is None:
             print('Datalab unavailable — falling back to local marker...', file=sys.stderr)
             result = _try_local()
-
-    if result is None:
-        print(
-            'PDF conversion failed. Install local marker with: pipx install marker-pdf\n'
-            'Or set a Datalab API key in ~/.claude/CLAUDE.md.',
-            file=sys.stderr
-        )
-        return '', {}, ''
-
-    markdown, images, method = result
-    return _clean_pdf_markdown(markdown, images), images, method
+    return result
 
 
 def _thumbnail_pixels(data):
@@ -2670,8 +2779,10 @@ def _strip_html_preserve_math(text):
             i += 1
     return ''.join(result)
 
-def build_paper(url, project, created):
-    """Fetch an academic paper and build an Obsidian note."""
+def build_paper(url, project, created, pdf_file=None):
+    """Fetch an academic paper and build an Obsidian note.
+    pdf_file: a PDF of this paper already at hand (e.g. a local file whose first page
+    named the DOI); used instead of downloading one."""
     doi      = extract_doi(url)
     arxiv_id = extract_arxiv_id_from_url(url)
     if doi and not arxiv_id:
@@ -2741,8 +2852,8 @@ def build_paper(url, project, created):
                                 break
 
         if not content:
-            pdf_path = None
-            if arxiv_id:
+            pdf_path = pdf_file
+            if not pdf_path and arxiv_id:
                 print(f'Trying arXiv PDF ({arxiv_id})...', file=sys.stderr)
                 arxiv_pdf_url = f'https://arxiv.org/pdf/{arxiv_id}'
                 arxiv_pdf_path = os.path.join(tmp_dir, 'arxiv.pdf')
@@ -2891,9 +3002,21 @@ def build_pdf(url, project, created, skip_doi=False):
             raw = _f.read(65536)
         first_page = b' '.join(re.findall(rb'[\x20-\x7e]{4,}', raw)).decode('ascii', errors='ignore')
         doi = extract_doi_from_pdf_text(first_page)
+        pdf_title = _pdf_meta_title(pdf_path)
+        if not doi and not skip_doi:
+            # Text layer of the first pages (raw bytes are usually compressed), then Crossref
+            text = _pdf_first_pages_text(pdf_path)
+            doi = extract_doi_from_pdf_text(text)
+            if doi and not _title_on_pages((get_paper_metadata(doi) or {}).get('title', ''), text):
+                doi = None   # a cited paper's DOI, not this one's
+            if not doi:
+                doi = crossref_doi_for_pdf(text, _pdf_meta_title(pdf_path, raw=True), os.path.basename(url))
+                if doi:
+                    print(f'Found in Crossref by title: {doi}', file=sys.stderr)
         if doi and not skip_doi:
-            print(f'DOI found on first page: {doi} — processing as paper...', file=sys.stderr)
-            return None, None, {'redirect_doi': doi}
+            print(f'DOI found: {doi} — processing as paper...', file=sys.stderr)
+            with open(pdf_path, 'rb') as f:
+                return None, None, {'redirect_doi': doi, 'pdf_bytes': f.read()}
 
         content, images_dict, method = pdf_to_markdown(pdf_path)
 
@@ -2907,11 +3030,11 @@ def build_pdf(url, project, created, skip_doi=False):
         title = title_match.group(1).strip()
         content = content[title_match.end():].lstrip('\n')
     else:
-        title = re.sub(r'[-_]+', ' ', os.path.splitext(pdf_name)[0]).strip()
+        title = pdf_title or re.sub(r'[-_]+', ' ', os.path.splitext(pdf_name)[0]).strip()
 
     words = len(content.split())
     ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, '', content)
-    ai_tags_clean = [t.lower() for t in ai_tags]
+    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
 
     if local_path:
         site = ''
@@ -2979,7 +3102,7 @@ def build_article(d, url, project, created, method=None):
 
     # Gemini enrichment
     ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, author, content)
-    ai_tags_clean = [t.lower() for t in ai_tags]
+    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
 
     # Build index from article headings
     index = build_index(content)
@@ -3832,20 +3955,63 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
         _compress_pdf(pdf_path)
 
 
+def run_batch(urls, argv):
+    """Process several links, PARALLEL_JOBS at a time, each in its own defuddle process.
+    Progress lines are prefixed with the link's number; each link's output follows when it is done."""
+    from concurrent.futures import ThreadPoolExecutor
+    rest, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == '--url':
+            skip = True
+        elif not a.startswith('--url=') and a not in urls:
+            rest.append(a)
+    print(f'Processing {len(urls)} links, {PARALLEL_JOBS} at a time...', file=sys.stderr, flush=True)
+
+    def one(n, url):
+        with tempfile.TemporaryFile('w+', encoding='utf-8') as out:
+            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), url] + rest,
+                                 stdout=out, stderr=subprocess.PIPE, text=True)
+            for line in p.stderr:
+                print(f'[{n}] {line}', end='', file=sys.stderr, flush=True)
+            p.wait()
+            out.seek(0)
+            return p.returncode, out.read()
+
+    with ThreadPoolExecutor(max(1, PARALLEL_JOBS)) as ex:
+        futures = [ex.submit(one, n, u) for n, u in enumerate(urls, 1)]
+        codes = []
+        for n, (url, fut) in enumerate(zip(urls, futures), 1):
+            code, out = fut.result()
+            codes.append(code)
+            print(f'\n=== [{n}] {url}{"" if code == 0 else f" (failed, exit {code})"} ===')
+            print(out.strip())
+    return 0 if all(c == 0 for c in codes) else 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('url_pos',    nargs='?', default=None, metavar='URL')
+    parser.add_argument('url_pos',    nargs='*', default=[], metavar='URL')
     parser.add_argument('--url',      default=None)
     parser.add_argument('--project',  default=None)
     parser.add_argument('--created',  default=None)
     parser.add_argument('--filename', default=None)
     parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'googlebot', 'wayback', 'archive-is'])
-    parser.add_argument('--keep-pdf', action='store_true',
-                        help='papers and PDFs: also save the original PDF next to the note, with the same name')
+    parser.add_argument('--keep-pdf', action=argparse.BooleanOptionalAction, default=None,
+                        help='papers and PDFs: also save the original PDF next to the note, with the same name '
+                             '(default: KEEP_PDF)')
     argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(argv)
 
-    raw_url = args.url or args.url_pos
+    if args.keep_pdf is None:
+        args.keep_pdf = KEEP_PDF
+    urls = ([args.url] if args.url else []) + args.url_pos
+    if len(urls) > 1:
+        if args.filename:
+            parser.error('--filename works with one link at a time')
+        sys.exit(run_batch(urls, argv))
+    raw_url = urls[0] if urls else None
     if not raw_url:
         parser.error('URL required as first argument or via --url')
 
@@ -3979,9 +4145,22 @@ def main(argv=None):
             doi_url = f'https://doi.org/{redirect_doi}'
             if args.project is None:
                 note, _, _meta = build_paper(doi_url, None, args.created)
+                if not note:
+                    return
                 print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
                 return
-            note, images_dict, meta = build_paper(doi_url, args.project, args.created)
+            pdf_file = None
+            if meta.get('pdf_bytes'):   # reuse the PDF we already have instead of fetching one
+                fd, pdf_file = tempfile.mkstemp(suffix='.pdf')
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(meta['pdf_bytes'])
+            try:
+                note, images_dict, meta = build_paper(doi_url, args.project, args.created, pdf_file=pdf_file)
+            finally:
+                if pdf_file:
+                    os.remove(pdf_file)
+            if not note:
+                return
             authors  = meta.get('authors', [])
             last_name = _slug(authors[0].split()[-1]) if authors else ''
             ai_name  = generate_filename(meta.get('title', ''))
@@ -4003,7 +4182,10 @@ def main(argv=None):
             f.write(note)
         print(f'Saved to {format_saved_path(args.project, filename)}')
         if args.keep_pdf:
-            save_original_pdf(save_dir, filename, source=url)
+            if meta and meta.get('pdf'):
+                save_original_pdf(save_dir, filename, meta=meta)
+            else:
+                save_original_pdf(save_dir, filename, source=url)
         return
 
     # Apple Podcasts: local TTML transcript, no HTTP cascade needed
