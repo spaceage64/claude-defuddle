@@ -2005,6 +2005,28 @@ def latex_to_markdown(tex_path, tmp_dir):
     md = re.sub(r'^---\n.*?\n---\n\n?', '', md, count=1, flags=re.DOTALL)
     return md.strip()
 
+def openalex_free(doi):
+    """Free copies of a paper according to OpenAlex: (direct PDF links, page with the free
+    version or None). The page is for publishers that block scripts but show the PDF in a browser."""
+    data = _get_json(f'https://api.openalex.org/works/doi:{quote(doi)}?select=open_access,best_oa_location,locations')
+    if not data or not (data.get('open_access') or {}).get('is_oa'):
+        return [], None
+    locs = [data.get('best_oa_location') or {}] + [l for l in data.get('locations') or [] if l.get('is_oa')]
+    pdfs = list(dict.fromkeys(l['pdf_url'] for l in locs if l.get('pdf_url')))
+    page = next((l.get('landing_page_url') or l.get('pdf_url') for l in locs if l.get('landing_page_url') or l.get('pdf_url')), None)
+    return pdfs, page
+
+def _download_pdf(url, tmp_dir, name='free.pdf'):
+    """Download a PDF link; the path if it really is a PDF, else None."""
+    path = os.path.join(tmp_dir, name)
+    try:
+        subprocess.run(['curl', '-sL', '--max-time', '60', '-o', path, url], capture_output=True, timeout=65)
+        with open(path, 'rb') as f:
+            ok = f.read(5) == b'%PDF-' and os.path.getsize(path) > 1000
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    return path if ok else None
+
 def fetch_doi_pdf(doi, tmp_dir):
     """Try to download PDF by following a DOI redirect."""
     pdf_path = os.path.join(tmp_dir, 'paper.pdf')
@@ -2075,8 +2097,8 @@ def _pdf_matches(text, doi, title):
     key = re.sub(r'[^a-z0-9]', '', _slug(title or ''))
     return len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text))
 
-def wait_for_shadow_pdf(doi, title=''):
-    """Open the shadow library page in the browser and wait for the user to save the PDF.
+def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
+    """Open the shadow library page (or another page: url, label) in the browser and wait for the user to save the PDF.
 
     Shadow libraries sit behind JavaScript browser checks (e.g. DDoS-Guard) that curl
     can't pass, so the download happens in the user's browser. Returns the path of the
@@ -2085,7 +2107,7 @@ def wait_for_shadow_pdf(doi, title=''):
     Partial downloads (.crdownload, .part, .download) are ignored; the file is left in place.
     """
     import webbrowser
-    url    = f'{SHADOW_BASE_URL.rstrip("/")}/{doi}'
+    url    = url or f'{SHADOW_BASE_URL.rstrip("/")}/{doi}'
     folder = downloads_dir()
     if not os.path.isdir(folder):
         print(f'Downloads folder not found: {folder} (set DOWNLOADS_DIR).', file=sys.stderr)
@@ -2094,7 +2116,7 @@ def wait_for_shadow_pdf(doi, title=''):
     start  = time.time()
     before = set(os.listdir(folder))
     limit  = f'{SHADOW_WAIT // 60} min' if SHADOW_WAIT >= 120 else f'{SHADOW_WAIT} s'
-    print(f'Opening shadow library in your browser: {url}', file=sys.stderr)
+    print(f'Opening {label} in your browser: {url}', file=sys.stderr)
     print(f'Save the PDF to {folder} — waiting up to {limit}...', file=sys.stderr, flush=True)
     try:
         webbrowser.open(url)
@@ -3168,6 +3190,17 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
             if not pdf_path and doi:
                 print('Trying direct PDF download...', file=sys.stderr)
                 pdf_path = fetch_doi_pdf(doi, tmp_dir)
+            if not pdf_path and doi:
+                # A free copy (OpenAlex) before the shadow library: a direct PDF link, else the
+                # free page in the browser (publishers like ams.org block scripts)
+                free_pdfs, free_page = openalex_free(doi)
+                for link in free_pdfs:
+                    print(f'Trying free copy ({urlparse(link).netloc})...', file=sys.stderr)
+                    pdf_path = _download_pdf(link, tmp_dir)
+                    if pdf_path:
+                        break
+                if not pdf_path and free_page:
+                    pdf_path = wait_for_shadow_pdf(doi, meta.get('title', ''), url=free_page, label='the free version')
             if not pdf_path and doi:
                 if SHADOW_BASE_URL:
                     pdf_path = wait_for_shadow_pdf(doi, meta.get('title', ''))

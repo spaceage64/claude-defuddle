@@ -248,7 +248,8 @@ Papers get a note with the abstract, keywords as tags and the bibliography. For 
 1. Tries the arXiv LaTeX source first (best quality)
 2. Falls back to local [Marker](https://github.com/VikParuchuri/marker) for PDF→Markdown
 3. Falls back to the Datalab API if Marker isn't installed
-4. Optionally opens a shadow library in your browser for paywalled papers (see below)
+4. Looks for a free copy in [OpenAlex](https://openalex.org) (publisher, repository or author version): downloads it, or opens its page in your browser when that site blocks scripts
+5. Optionally opens a shadow library in your browser for paywalled papers (see below)
 
 The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To use Datalab, add your key to `~/.claude/CLAUDE.md`:
 
