@@ -4252,27 +4252,69 @@ def fetch_googlebot(url):
     return d
 
 
+_TABLE_SEP = re.compile(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$')
+_LIST_START = re.compile(r'([-*+]|\d+[.)])\s')
+
+
+def tidy_source_md(content):
+    """Repair hand-written site markdown that Obsidian won't render (e.g. Databento docs):
+    tables without a header separator row, links padded as [ text ]( url ), and
+    paragraph continuation lines with stray leading spaces."""
+    content = re.sub(r'\[[ \t]+([^\]\n]*?)[ \t]*\]\([ \t]*([^\s)]+)[ \t]*\)', r'[\1](\2)', content)
+    content = re.sub(r'\[([^\]\n]*?)[ \t]+\]\(([^\s)]+)\)', r'[\1](\2)', content)
+    out, in_fence = [], False
+    for line in content.split('\n'):
+        prev = out[-1] if out else ''
+        if line.lstrip().startswith(('```', '~~~')):
+            in_fence = not in_fence
+        elif not in_fence:
+            # First row of a table block: add the separator row if the source has none
+            if (prev.startswith('|') and not (len(out) > 1 and out[-2].startswith('|'))
+                    and line.startswith('|') and not _TABLE_SEP.match(line)):
+                out.append('| ' + ' | '.join('---' for _ in prev.strip().strip('|').split('|')) + ' |')
+            # Indented continuation of a plain paragraph line
+            elif (line[:1] == ' ' and line.strip() and prev.strip() and prev[:1] not in ' \t|>#'
+                    and not _LIST_START.match(prev) and not _LIST_START.match(line.lstrip())):
+                line = line.lstrip()
+        out.append(line)
+    return '\n'.join(out)
+
+
 def fetch_direct_md(url):
-    """Look for a direct link to the page's raw .md source in the HTML.
-    If found, fetches it and resolves wikilink images using the same base path.
-    Returns a defuddle-style dict or None."""
+    """Fetch the page's raw .md source: {page}.md (Databento, ReadMe e.g. Alpaca, and other docs
+    platforms serve it there, linked or not), else Obsidian Publish's preloadPage source.
+    Resolves wikilink images using the same base path. Returns a defuddle-style dict or None."""
     try:
-        result = subprocess.run(['curl', '-sL', url], capture_output=True, timeout=30)
-        raw = result.stdout.decode('utf-8', errors='replace')
+        result = subprocess.run(['curl', '-sL', '-w', '\n%{url_effective}', url], capture_output=True, timeout=30)
+        raw, _, final_url = result.stdout.decode('utf-8', errors='replace').rpartition('\n')
 
-        # Find a .md file URL in the HTML — must be on the same domain as the original URL
-        # (prevents picking up random GitHub/CDN markdown files from paywall redirect pages)
+        # Only the page's own source: docs sites also link other pages' .md files (and paywall
+        # redirect pages random GitHub/CDN ones). Error pages are rejected below.
         original_netloc = urlparse(url).netloc
-        md_m = re.search(r'https?://[^\s"\'<>&]+/[^\s"\'<>&/?#]+\.md(?=[?#"\'<>\s]|$)', raw)
-        if not md_m or urlparse(md_m.group(0)).netloc != original_netloc:
-            return None
-        md_url = md_m.group(0)
+        own_md = (final_url or url).split('#')[0].split('?')[0].rstrip('/') + '.md'
+        publish_md = re.findall(r'preloadPage=\w+\("(https://[^"]+\.md)"\)', raw)
 
-        # Fetch the raw .md file
-        md_result = subprocess.run(['curl', '-sL', md_url], capture_output=True, timeout=30)
-        content = md_result.stdout.decode('utf-8', errors='replace').strip()
+        # Fetch the raw .md file (an HTML error page is not markdown)
+        for md_url in [own_md] + publish_md[:1]:
+            md_result = subprocess.run(['curl', '-sL', '-w', '\n%{http_code} %{content_type}', md_url],
+                                       capture_output=True, timeout=30)
+            body, _, status = md_result.stdout.decode('utf-8', errors='replace').rpartition('\n')
+            if status.startswith('200') and 'html' not in status:
+                break
+        else:
+            return None
+        content = tidy_source_md(re.sub(r'\A---\n.*?\n---\n', '', body.strip(), flags=re.S))
         if not content or len(content.split()) < MIN_WORDS:
             return None
+        # A page built mostly from code (e.g. Databento's API reference) can have a .md source
+        # with only a snippet: then the page itself is the better source
+        page_text = re.sub(r'<[^>]+>', ' ', re.sub(r'(?is)<(script|style|svg)\b.*?</\1>', ' ', raw))
+        if len(content.split()) < 0.1 * len(page_text.split()):
+            return None
+        # Links to sibling pages' .md sources → the pages themselves
+        if md_url == own_md:
+            content = re.sub(r'(\]\(https?://' + re.escape(original_netloc) + r'/[^)\s#]+?)\.md(?=[)#])',
+                             r'\1', content)
 
         # Resolve ![[image.ext]] wikilinks using base path + Assets/
         base_m = re.match(r'(https?://[^/]+/[^/]+/[a-f0-9]+/)', md_url)
@@ -4284,12 +4326,16 @@ def fetch_direct_md(url):
                 content, flags=re.IGNORECASE
             )
 
-        # Extract title from first # heading
-        title_m = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
-        title = title_m.group(1).strip() if title_m else ''
-        # Strip the leading # heading from content (build_article re-adds it)
+        # Extract title from first # heading outside code blocks (a "# comment" in code is not one)
+        title_m = next((m for m in re.finditer(r'^#\s+(.+)$', content, re.MULTILINE)
+                        if content[:m.start()].count('```') % 2 == 0), None)
+        title = title_m.group(1).strip() if title_m else unquote(md_url.rsplit('/', 1)[1][:-3])
+        # Strip the leading # heading from content (build_article re-adds it), plus a short
+        # preamble before it (e.g. "Source: {url}"), but never real body text
         if title_m:
-            content = content[title_m.end():].lstrip()
+            before = content[:title_m.start()]
+            rest = content[title_m.end():].lstrip()
+            content = before.rstrip() + '\n\n' + rest if len(before.split()) > 10 else rest
 
         netloc = urlparse(url).netloc
         return {
@@ -4958,7 +5004,7 @@ def main(argv=None):
         # Auto-cascade: native-md → native-page → googlebot → wayback → archive-is
         d, used_method = {}, None
 
-        # 1. native-md: direct .md source (e.g. Obsidian Publish)
+        # 1. native-md: the page's own .md source (docs platforms, Obsidian Publish)
         candidate = fetch_direct_md(url)
         if candidate and candidate.get('wordCount', 0) > MIN_WORDS:
             d, used_method = candidate, 'native-md'
