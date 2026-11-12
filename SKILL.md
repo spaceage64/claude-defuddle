@@ -13,7 +13,7 @@ Use Defuddle CLI to extract clean readable content from any web page — includi
 python3 ~/.claude/skills/defuddle/defuddle.py --url "<url>"
 ```
 
-Use the output to answer the user's question or complete the task. The script automatically detects the source type (article, YouTube, podcast, paper) and handles fetching accordingly. For articles, it falls back to archive.org / archive.is if the page is JS-rendered or paywalled.
+Use the output to answer the user's question or complete the task. The script automatically detects the source type (article, YouTube, podcast, paper) and handles fetching accordingly. For articles, it falls back to archive.org / archive.is if the page is JS-rendered, paywalled or shows an error page ("Page Not Found", "Page Not Available", ...).
 
 > [!warning] User Action Required — STOP
 > If stderr contains "captcha" or "archive it" (from `--method archive-is` or `--method wayback`), **STOP immediately. Do not try other URLs or workarounds.** Show the user the URL printed in the message and ask them to visit it and let you know when done — then retry with the same command. Alternatively, ask the user if WebFetch should be used instead.

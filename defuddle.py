@@ -201,10 +201,16 @@ def build_frontmatter(created, tags, extra_fields):
     return '\n'.join(fields)
 
 
+_TRACKING_PARAM = re.compile(r'utm_\w+|fbclid|gclid|dclid|gbraid|wbraid|msclkid|yclid|twclid|igshid|'
+                             r'mc_cid|mc_eid|_hsenc|_hsmi|mkt_tok|ref_src|ref_url|share_source|si', re.I)
+
+
 def clean_url(url):
-    """Strip fragment and query string from a URL."""
+    """Strip the fragment and tracking parameters (utm_*, fbclid, ...) from a URL. Other query
+    parameters stay: many pages are chosen by one (e.g. trader.aspx?id=symboldirdefs)."""
     p = urlparse(url)
-    return urlunparse((p.scheme, p.netloc, p.path, '', '', ''))
+    query = '&'.join(kv for kv in p.query.split('&') if kv and not _TRACKING_PARAM.fullmatch(kv.split('=', 1)[0]))
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, query, ''))
 
 
 def is_youtube(url):
@@ -4940,13 +4946,25 @@ def save_podcast(url, args):
     save_note(note, args, 'transcripts', filename, source_url=url)
 
 
+_ERROR_TITLE = re.compile(
+    r"^\s*(?:error\s*)?404\b|\b404\s*(?:error|not found)|\berror\s*404\b|^\s*not found\b|\bno longer available\b|"
+    r"\b(?:page|file|document)\s+(?:not found|not available|unavailable|(?:does not|doesn['’]t) exist|"
+    r"(?:could not|cannot|can['’]t) be found|(?:has been|was) (?:moved|removed|retired|deleted))", re.I)
+
+
+def usable(d):
+    """A fetch result worth keeping: enough words, and not an error page served with a normal
+    status (title "Page Not Found", "Page Not Available", ...), which the next method may get past."""
+    return bool(d) and d.get('wordCount', 0) > MIN_WORDS and not _ERROR_TITLE.search(d.get('title') or '')
+
+
 def fetch_article(url):
     """Auto-cascade: native-md → native-page → googlebot → wayback → archive-is.
     Returns (d, used_method, target): target is the paper or PDF to continue with when the page
     is a scholarly landing page, else None."""
     # 1. native-md: the page's own .md source (docs platforms, Obsidian Publish)
     candidate = fetch_direct_md(url)
-    if candidate and candidate.get('wordCount', 0) > MIN_WORDS:
+    if usable(candidate):
         return candidate, 'native-md', None
 
     # 2. native-page: defuddle parse
@@ -4955,12 +4973,12 @@ def fetch_article(url):
     target = academic_target(candidate.get('metaTags'), url) if ENABLE_PAPER else None
     if target and target != url:
         return {}, None, target
-    if candidate.get('wordCount', 0) > MIN_WORDS:
+    if usable(candidate):
         return candidate, 'native-page', None
 
     # 3. googlebot: Googlebot UA + script-strip
     candidate = fetch_googlebot(url)
-    if candidate and candidate.get('wordCount', 0) > MIN_WORDS:
+    if usable(candidate):
         candidate = dict(candidate)
         candidate['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
         return candidate, 'googlebot', None
@@ -4979,11 +4997,12 @@ def fetch_article(url):
                 candidate = fetch_defuddle(archive_url)
                 if candidate.get('wordCount', 0) > MIN_WORDS and 'archive.is/' in archive_url:
                     candidate = clean_archive_content(candidate, url)
-            if candidate.get('wordCount', 0) > MIN_WORDS:
+            if usable(candidate):
                 return _with_archive(candidate, archive_url), method_name, None
 
     print(
-        f'Page appears JS-rendered and no archive snapshot could be retrieved.\n'
+        f'No usable copy found: the page appears JS-rendered or shows an error page, and no archive\n'
+        f'snapshot could be retrieved.\n'
         f'Please visit this URL, save the page, and solve the captcha:\n'
         f'https://archive.is/?url={quote(url, safe=":/?")}',
         file=sys.stderr

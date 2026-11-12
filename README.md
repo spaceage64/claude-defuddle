@@ -221,7 +221,7 @@ AI_MODEL = 'llama3.2'
 
 <br>
 
-- **Web pages** — ads and clutter are stripped, and the note gets an AI summary, a heading index and frontmatter. JS-rendered or paywalled pages fall back to the Wayback Machine or archive.is.
+- **Web pages** — ads and clutter are stripped, and the note gets an AI summary, a heading index and frontmatter. JS-rendered or paywalled pages, and pages that show an error page, fall back to the Wayback Machine or archive.is. Tracking parameters (utm_*, fbclid, ...) are removed from links; other query parameters are kept.
 - **YouTube transcripts** — manual captions first (better quality), then auto-generated ones. Duplicated lines from rolling captions are removed automatically.
 - **YouTube chapters** — the video's own chapter markers are used; without them, the AI adds logical chapter breaks.
 - **Videos without subtitles** — the note still gets the title, channel and full description, with "No subtitles available for this video." in place of the transcript. YouTube links never go through the archive fallbacks.
