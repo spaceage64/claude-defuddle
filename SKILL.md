@@ -10,8 +10,11 @@ Use Defuddle CLI to extract clean readable content from any web page — includi
 ## Fetch and present
 
 ```bash
-python3 ~/.claude/skills/defuddle/defuddle.py --url "<url>"
+python3 ~/.claude/skills/defuddle/defuddle.py "<url>" ["<url2>" ...]
 ```
+
+> [!important] Several links → one command
+> Pass all links to **one** `defuddle.py` call. The script runs them in parallel (`PARALLEL_JOBS` at a time, default 4) and prints each link's output under `=== [n] url ===`. Never loop over links in the shell or start them one after another; for papers, run that one command in the background.
 
 Use the output to answer the user's question or complete the task. The script automatically detects the source type (article, YouTube, podcast, paper) and handles fetching accordingly. For articles, it falls back to archive.org / archive.is if the page is JS-rendered, paywalled or shows an error page ("Page Not Found", "Page Not Available", ...).
 
@@ -29,7 +32,7 @@ Use the output to answer the user's question or complete the task. The script au
 
 ```bash
 python3 ~/.claude/skills/defuddle/defuddle.py \
-  --url "<url>" --project "{folder}" --created "{YYYY-MM-DD}" \
+  "<url>" ["<url2>" ...] --project "{folder}" --created "{YYYY-MM-DD}" \
   [--filename "kebab-case-name"] [--method native|native-md|native-page|googlebot|wayback|archive-is] \
   [--download] [--video-quality 720p] [--audio-quality 64k] [--keep-pdf | --no-keep-pdf] [--doi "<doi>"]
 ```
@@ -40,7 +43,7 @@ python3 ~/.claude/skills/defuddle/defuddle.py \
 - `--keep-pdf` / `--no-keep-pdf` (papers and PDFs): save the original PDF next to the note, with the same name (`{filename}.pdf`), compressed when `ENABLE_PDF_COMPRESSION` is on. The default comes from `KEEP_PDF` in `defuddle.py`; pass `--keep-pdf` or `--no-keep-pdf` when the user asks otherwise.
 - `--download` (YouTube only): also save the video to `vid/{filename}-001.mp4` next to the note (subtitles, chapters, metadata, thumbnail embedded) and embed the local file instead of YouTube. Use only when the user asks to download/keep a local copy. Takes several minutes for long videos — run it in the background.
 - `--video-quality` / `--audio-quality`: optional caps (max height e.g. `720p`; max audio kbps e.g. `64k` — ~48–64k is plenty for speech). `0` skips that track: `--video-quality 0` saves audio only to `aud/{filename}-001.m4a`; `--audio-quality 0` saves video without sound. Either option implies `--download`. Omitted → highest quality.
-- Several links: pass them all in one command (`defuddle.py <url1> <url2> ...` with the same options; not with `--filename`). They run `PARALLEL_JOBS` at a time (default 4), each link's progress lines are prefixed with its number, and each link's output follows under `=== [n] url ===`. Prefer this over separate commands; run it in the background when papers are involved.
+- Several links: one command with all of them (see “Several links → one command” above), sharing the same options; `--filename` works with one link only. Progress lines are prefixed with the link's number.
 - `--doi` (local PDFs and PDF links): when you know the paper's DOI — e.g. the user saved the PDF from a shadow library page for a DOI you gave them, or named the paper — pass it, and the PDF is saved as a paper with full metadata without any search.
 - PDFs without a printed DOI are looked up in Crossref (file name IDs, Elsevier PIIs, then title; for scans without a text layer, again with the converted text) and saved as papers when the found title appears on the PDF's first pages; a local PDF is reused, not downloaded again. A `WARNING: conversion looks incomplete` line means the note has under 70% of the words in the PDF's text layer — tell the user. Likewise relay `WARNING:` lines about missing equations, missing appendices or equations with unbalanced brackets, and offer to re-convert the affected pages.
 - Before running defuddle on a paper (DOI, publisher, index or repository link, or a PDF without a known DOI), tell the user first, in one line: *"If a browser tab opens, save the PDF to your Downloads folder — I'll continue automatically."* defuddle may open a free-version or shadow-library page that the user has to save the PDF from, and the tab should never come as a surprise. Skip this for arXiv links and local PDFs given with `--doi`.
