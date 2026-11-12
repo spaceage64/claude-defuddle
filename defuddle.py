@@ -8,9 +8,13 @@ Usage:
         --url "<url>" --project "<project>" --created "YYYY-MM-DD"
 """
 
-import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata
+import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64
 from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+
+BROWSER_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 
 import io
 if isinstance(sys.stdout, io.TextIOWrapper):
@@ -70,8 +74,10 @@ ENABLE_PDF_COMPRESSION   = True
 # ║  as they are. Runs before compression. Requires: tesseract, uv.              ║
 OCR_PDF = False
 KEEP_PDF = False
-# ║  Parallel jobs — links processed at the same time when several are given.    ║
+# ║  Parallel jobs — links processed at the same time when several are given,    ║
+# ║  and images downloaded at the same time for one note.                        ║
 PARALLEL_JOBS = 4
+IMAGE_JOBS    = 6
 # ║                                                                              ║
 # ║  Datalab — converts paper PDFs to markdown via cloud API.                    ║
 # ║  Get key at https://datalab.to — free accounts get $10 in credits.           ║
@@ -111,15 +117,20 @@ MARKER_PRECISE = False
 # ║               Set AI_MODEL to any pulled model, e.g. llama3.2                ║
 # ║  AI_MODEL can be a list: the next model is tried when one is overloaded      ║
 # ║  or rate-limited (HTTP 429/5xx, timeout), before falling back to Claude.     ║
+# ║  AI_OLDER_MODELS: for a Gemini '-latest' alias, also try this many older     ║
+# ║  versions of it, newest first, found in Gemini's model list when needed.     ║
+# ║  Older models are usually less busy than the newest.                         ║
 AI_LLM      = 'gemini'
-AI_MODEL    = ['gemini-flash-lite-latest', 'gemini-flash-latest']
+AI_MODEL    = 'gemini-flash-lite-latest'
+AI_OLDER_MODELS = 2
 AI_BASE_URL = ''
 # ║                                                                              ║
 # ║  Claude fallback model (used when AI provider fails or has no key).          ║
 # ║  Set to '' to use Claude Code's default model.                               ║
-# ║    claude-haiku-4-5  — fast, cheap, good for structured output (default)     ║
-# ║    claude-sonnet-4-6 — higher quality, slower and more expensive             ║
-AI_FALLBACK_MODEL = 'claude-haiku-4-5'  
+# ║  Aliases always point at the newest model of that family:                    ║
+# ║    haiku  — fast, cheap, good for structured output (default)                ║
+# ║    sonnet — higher quality, slower and more expensive                        ║
+AI_FALLBACK_MODEL = 'haiku'
 # ║                                                                              ║
 # ║  Minimum word count to consider a fetch attempt successful. Few words        ║
 # ║  indicate and error and may trigger alternative processing methods.          ║
@@ -135,6 +146,13 @@ FILENAME_WORDS = 3
 
 # Derived from AI_LLM — not user-configured.
 AI_API_KEY = _apikey({'gemini': 'Gemini', 'openai': 'OpenAI'}.get(AI_LLM, ''))
+
+
+def curl(url, *options, max_time=15, text=False, follow=True, capture=True):
+    """Run curl -s on url (following redirects unless follow=False) with extra curl options,
+    stopped after max_time seconds. Returns the CompletedProcess: stdout as bytes, or str with text=True."""
+    return subprocess.run(['curl', '-sL' if follow else '-s', '--max-time', str(max_time), *options, url],
+                          capture_output=capture, text=text, timeout=max_time + 5)
 
 
 def yaml_str(s):
@@ -595,24 +613,51 @@ def download_youtube(url, save_dir, filename_base, video_quality=None, audio_qua
     return f'{sub}/{name}.{ext}'
 
 
-def ai_request(prompt, timeout=60):
+def older_gemini_models(alias):
+    """Older stable versions of a Gemini '-latest' alias's family, newest first, from Gemini's model
+    list (e.g. gemini-flash-lite-latest → gemini-3.1-flash-lite, gemini-2.5-flash-lite). The newest
+    version is left out: that is the one the alias points at. [] for other names or when the list fails."""
+    family = re.fullmatch(r'gemini-(.+)-latest', alias)
+    if not family:
+        return []
+    try:
+        r = curl(f'https://generativelanguage.googleapis.com/v1beta/models?key={AI_API_KEY}&pageSize=1000', max_time=10)
+        listed = json.loads(r.stdout).get('models', [])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    versions = []
+    for m in listed:
+        v = re.fullmatch(rf'models/(gemini-(\d+(?:\.\d+)*)-{re.escape(family.group(1))})', m.get('name', ''))
+        if v and 'generateContent' in m.get('supportedGenerationMethods', []):
+            versions.append((tuple(map(int, v.group(2).split('.'))), v.group(1)))
+    return [name for _, name in sorted(versions, reverse=True)[1:]]
+
+
+def ai_request(prompt, timeout=60, json_reply=False):
     """Send a prompt to the provider configured by AI_LLM / AI_MODEL and return the reply text.
     With a list of models, an overloaded or rate-limited one (HTTP 429/5xx, timeout) passes to the
-    next. Raises when all fail; callers then fall back to the Claude CLI."""
+    next, and then to AI_OLDER_MODELS older versions of a Gemini '-latest' alias. json_reply asks the
+    provider for valid JSON only. Raises when all fail; callers then fall back to the Claude CLI."""
     import urllib.request as _urlreq, urllib.error as _urlerr
     models = [AI_MODEL] if isinstance(AI_MODEL, str) else list(AI_MODEL)
-    for i, model in enumerate(models):
+    older = AI_LLM == 'gemini' and AI_OLDER_MODELS > 0   # older versions not added yet
+    i = 0
+    while i < len(models):
+        model = models[i]
+        last = i == len(models) - 1 and not older
         if AI_LLM == 'gemini':
             url  = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}'
-            body = {'contents': [{'parts': [{'text': prompt}]}]}
+            body = {'contents': [{'parts': [{'text': prompt}]}],
+                    **({'generationConfig': {'responseMimeType': 'application/json'}} if json_reply else {})}
             headers, pick = {}, lambda d: d['candidates'][0]['content']['parts'][0]['text']
         elif AI_LLM == 'openai':
             url  = (AI_BASE_URL.rstrip('/') + '/chat/completions') if AI_BASE_URL else 'https://api.openai.com/v1/chat/completions'
-            body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}]}
+            body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}],
+                    **({'response_format': {'type': 'json_object'}} if json_reply else {})}
             headers, pick = {'Authorization': f'Bearer {AI_API_KEY}'}, lambda d: d['choices'][0]['message']['content']
         elif AI_LLM == 'ollama':
             url  = 'http://localhost:11434/api/generate'
-            body = {'model': model, 'prompt': prompt, 'stream': False}
+            body = {'model': model, 'prompt': prompt, 'stream': False, **({'format': 'json'} if json_reply else {})}
             headers, pick = {}, lambda d: d['response']
         else:
             raise ValueError(f'Unsupported AI_LLM: {AI_LLM!r}')
@@ -620,14 +665,18 @@ def ai_request(prompt, timeout=60):
                               headers={'Content-Type': 'application/json', **headers})
         try:
             # An overloaded model can hang instead of answering 503: don't wait long when another follows
-            with _urlreq.urlopen(req, timeout=timeout if i == len(models) - 1 else min(timeout, 20)) as r:
+            with _urlreq.urlopen(req, timeout=timeout if last else min(timeout, 20)) as r:
                 return pick(json.loads(r.read()))
         except (_urlerr.HTTPError, TimeoutError, _urlerr.URLError) as e:
             busy = isinstance(e, TimeoutError) or getattr(e, 'code', 0) in (429, 500, 502, 503, 504) \
                    or isinstance(getattr(e, 'reason', None), TimeoutError)
+            if busy and older and i == len(models) - 1:
+                older = False
+                models += [m for m in older_gemini_models(models[0]) if m not in models][:AI_OLDER_MODELS]
             if not busy or i == len(models) - 1:
                 raise
             print(f'{model} unavailable ({e}) — trying {models[i + 1]}...', file=sys.stderr)
+        i += 1
 
 
 def ai_enrich(title, author, content, needs_chapters=False):
@@ -676,7 +725,7 @@ Content:
     # Try configured provider via direct API call
     if AI_API_KEY or AI_LLM == 'ollama':
         try:
-            return _parse(ai_request(prompt))
+            return _parse(ai_request(prompt, json_reply=True))
         except Exception as e:
             print(f'{AI_LLM} enrichment failed ({e}) — falling back to Claude...', file=sys.stderr)
 
@@ -684,7 +733,7 @@ Content:
     try:
         result = subprocess.run(
             ['claude', '-p', prompt, '--model', AI_FALLBACK_MODEL, '--output-format', 'text'] if AI_FALLBACK_MODEL else ['claude', '-p', prompt, '--output-format', 'text'],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120
         )
         return _parse(result.stdout)
     except Exception:
@@ -938,20 +987,28 @@ def get_podcast_metadata(episode_id, show_id=None):
 
     # 1. Try local SQLite
     db_path = os.path.join(PODCASTS_LIBRARY, 'Documents', 'MTLibrary.sqlite')
+    row = None
     if os.path.exists(db_path):
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
-        c = conn.cursor()
-        c.execute('''
-            SELECT e.ZCLEANEDTITLE, e.ZAUTHOR, e.ZITUNESSUBTITLE,
-                   e.ZDURATION, e.ZPUBDATE, e.ZGUID,
-                   p.ZTITLE, p.ZFEEDURL, p.ZSTORECLEANURL,
-                   e.ZSEASONNUMBER, e.ZEPISODENUMBER
-            FROM ZMTEPISODE e
-            JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
-            WHERE e.ZSTORETRACKID = ?
-        ''', (int(episode_id),))
-        row = c.fetchone()
-        conn.close()
+        # Title, description and duration moved over app versions (ZCLEANEDTITLE, ZITUNESSUBTITLE and
+        # ZDURATION on the episode before 2026); a layout this doesn't know falls back to iTunes below
+        try:
+            conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+            try:
+                row = conn.execute('''
+                    SELECT COALESCE(e.ZTITLE, e.ZITUNESTITLE), e.ZAUTHOR, d.ZPLAINTEXT,
+                           m.ZDURATION, e.ZPUBDATE, e.ZGUID,
+                           p.ZTITLE, p.ZFEEDURL, p.ZSTORECLEANURL,
+                           e.ZSEASONNUMBER, e.ZEPISODENUMBER
+                    FROM ZMTEPISODE e
+                    JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
+                    LEFT JOIN ZMTEPISODEDESCRIPTION d ON d.Z_PK = e.ZDESCRIPTIONOBJECT
+                    LEFT JOIN ZMTMEDIAENCLOSURE m ON m.Z_PK = e.ZCURRENTMEDIAENCLOSURE
+                    WHERE e.ZSTORETRACKID = ?
+                ''', (int(episode_id),)).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            print(f'Podcasts library not readable ({e}) — using the iTunes API...', file=sys.stderr)
         if row:
             pub_unix = (row[4] + 978307200) if row[4] else None
             pub_date = datetime.fromtimestamp(pub_unix, tz=timezone.utc).strftime('%Y-%m-%d') if pub_unix else ''
@@ -979,8 +1036,7 @@ def get_podcast_metadata(episode_id, show_id=None):
         while ep is None:
             api_url = (f'https://itunes.apple.com/lookup?id={show_id}'
                        f'&entity=podcastEpisode&limit=200&offset={offset}')
-            result = subprocess.run(['curl', '-sL', '--max-time', '15', api_url],
-                                    capture_output=True, timeout=20)
+            result = curl(api_url)
             data = json.loads(result.stdout.decode('utf-8', errors='replace'))
             batch = [r for r in data.get('results', []) if r.get('kind') == 'podcast-episode']
             if not batch:
@@ -1058,8 +1114,7 @@ def get_podcast_chapters(meta):
     if not feed_url or not guid:
         return [], ''
     try:
-        result = subprocess.run(['curl', '-sL', '--max-time', '15', feed_url],
-                                capture_output=True, timeout=20)
+        result = curl(feed_url)
         feed = result.stdout.decode('utf-8', errors='replace')
         items = re.split(r'<item[\s>]', feed, flags=re.IGNORECASE)
         chapters_url = ''
@@ -1075,8 +1130,7 @@ def get_podcast_chapters(meta):
                 break
         if not chapters_url:
             return [], episode_img
-        result = subprocess.run(['curl', '-sL', '--max-time', '15', chapters_url],
-                                capture_output=True, timeout=20)
+        result = curl(chapters_url)
         data = json.loads(result.stdout.decode('utf-8', errors='replace'))
         chapters = [
             {
@@ -1092,12 +1146,14 @@ def get_podcast_chapters(meta):
         return [], ''
 
 
-def build_apple_podcast(url, project, created, ttml_path):
-    """Build an Obsidian note for an Apple Podcasts episode from a local TTML transcript."""
+def build_apple_podcast(url, project, created, ttml_path, meta=None):
+    """Build an Obsidian note for an Apple Podcasts episode from a local TTML transcript.
+    meta: the episode's get_podcast_metadata() result, when the caller already has it."""
     episode_id = apple_podcast_id(url)
     show_id    = apple_show_id(url)
     chunks     = parse_ttml(ttml_path)
-    meta       = get_podcast_metadata(episode_id, show_id) if episode_id else {}
+    if meta is None:
+        meta   = get_podcast_metadata(episode_id, show_id) if episode_id else {}
 
     title      = meta.get('title', '')
     show       = meta.get('show', '')
@@ -1409,8 +1465,7 @@ def _crossref(path):
     """GET a Crossref API path and return its 'message', or None (one retry: it occasionally doesn't answer)."""
     for attempt in range(2):
         try:
-            r = subprocess.run(['curl', '-sL', '--max-time', '15', f'https://api.crossref.org/{path}'],
-                               capture_output=True, timeout=20)
+            r = curl(f'https://api.crossref.org/{path}')
             return json.loads(r.stdout.decode('utf-8', errors='replace'))['message']
         except Exception:
             if attempt == 0:
@@ -1420,7 +1475,7 @@ def _crossref(path):
 def _get_json(url):
     """GET a JSON API, or None."""
     try:
-        r = subprocess.run(['curl', '-sL', '--max-time', '15', url], capture_output=True, timeout=20)
+        r = curl(url)
         return json.loads(r.stdout.decode('utf-8', errors='replace'))
     except Exception:
         return None
@@ -1516,7 +1571,7 @@ def paper_site_doi(url):
         if m and _crossref(f'works/10.2307/{m.group(1)}'):
             return f'10.2307/{m.group(1)}'
     try:
-        r = subprocess.run(['curl', '-sL', '--max-time', '15', url], capture_output=True, timeout=20)
+        r = curl(url)
         page = r.stdout.decode('utf-8', errors='replace')
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1528,12 +1583,7 @@ def paper_site_doi(url):
 
 def extract_academia_pdf_url(url):
     """Fetch an Academia.edu page and return (pdf_url, doi). Either may be None."""
-    result = subprocess.run(
-        ['curl', '-sL', '--max-time', '15', '-A',
-         'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-         url],
-        capture_output=True, timeout=20
-    )
+    result = curl(url, '-A', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)')
     html = result.stdout.decode('utf-8', errors='replace')
     pdf_url = None
     for pattern in [
@@ -1577,11 +1627,7 @@ def _get_paper_metadata_arxiv(arxiv_id):
     """Fetch paper metadata from the arXiv API (Atom feed)."""
     try:
         import xml.etree.ElementTree as ET
-        result = subprocess.run(
-            ['curl', '-sL', '--max-time', '10',
-             f'https://export.arxiv.org/api/query?id_list={arxiv_id}'],
-            capture_output=True, timeout=15
-        )
+        result = curl(f'https://export.arxiv.org/api/query?id_list={arxiv_id}', max_time=10)
         root = ET.fromstring(result.stdout.decode('utf-8', errors='replace'))
         ns = {'atom': 'http://www.w3.org/2005/Atom',
               'arxiv': 'http://arxiv.org/schemas/atom'}
@@ -1625,12 +1671,7 @@ def get_paper_metadata(doi):
     if arxiv_id:
         return _get_paper_metadata_arxiv(arxiv_id)
     try:
-        result = subprocess.run(
-            ['curl', '-sL', '--max-time', '10',
-             '-H', 'User-Agent: defuddle/1.0 (mailto:user@example.com)',
-             f'https://api.crossref.org/works/{doi}'],
-            capture_output=True, timeout=15
-        )
+        result = curl(f'https://api.crossref.org/works/{doi}', '-H', 'User-Agent: defuddle/1.0 (mailto:user@example.com)', max_time=10)
         data = json.loads(result.stdout.decode('utf-8', errors='replace'))
         work = data.get('message', {})
         title = ' '.join(work.get('title', [''])).strip()
@@ -1659,11 +1700,7 @@ def get_paper_metadata(doi):
 def find_arxiv_id(doi):
     """Look up arXiv preprint for a DOI via Semantic Scholar."""
     try:
-        result = subprocess.run(
-            ['curl', '-sL', '--max-time', '10',
-             f'https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=externalIds'],
-            capture_output=True, timeout=15
-        )
+        result = curl(f'https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=externalIds', max_time=10)
         data = json.loads(result.stdout.decode('utf-8', errors='replace'))
         return data.get('externalIds', {}).get('ArXiv')
     except Exception:
@@ -1673,11 +1710,7 @@ def get_arxiv_latex(arxiv_id, tmp_dir):
     """Download arXiv LaTeX source and return path to main .tex file."""
     import tarfile as tarmod, gzip as gzmod
     src_path = os.path.join(tmp_dir, 'source.bin')
-    subprocess.run(
-        ['curl', '-sL', '--max-time', '30', '-o', src_path,
-         f'https://arxiv.org/e-print/{arxiv_id}'],
-        timeout=35
-    )
+    curl(f'https://arxiv.org/e-print/{arxiv_id}', '-o', src_path, max_time=30, capture=False)
     if not os.path.exists(src_path) or os.path.getsize(src_path) < 100:
         return None
     extract_dir = os.path.join(tmp_dir, 'source')
@@ -2189,7 +2222,7 @@ def _download_pdf(url, tmp_dir, name='free.pdf'):
     """Download a PDF link; the path if it really is a PDF, else None."""
     path = os.path.join(tmp_dir, name)
     try:
-        subprocess.run(['curl', '-sL', '--max-time', '60', '-o', path, url], capture_output=True, timeout=65)
+        curl(url, '-o', path, max_time=60)
         with open(path, 'rb') as f:
             ok = f.read(5) == b'%PDF-' and os.path.getsize(path) > 1000
     except (OSError, subprocess.SubprocessError):
@@ -2199,11 +2232,7 @@ def _download_pdf(url, tmp_dir, name='free.pdf'):
 def fetch_doi_pdf(doi, tmp_dir):
     """Try to download PDF by following a DOI redirect."""
     pdf_path = os.path.join(tmp_dir, 'paper.pdf')
-    result = subprocess.run(
-        ['curl', '-sL', '--max-time', '20', '-o', pdf_path,
-         '-w', '%{content_type}', f'https://doi.org/{doi}'],
-        capture_output=True, text=True, timeout=25
-    )
+    result = curl(f'https://doi.org/{doi}', '-o', pdf_path, '-w', '%{content_type}', max_time=20, text=True)
     if 'pdf' in result.stdout.lower() and \
             os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
         return pdf_path
@@ -2341,15 +2370,7 @@ def pdf_to_markdown(pdf_path):
         if not DATALAB_API_KEY:
             return None
         print('Converting PDF via Datalab Marker API...', file=sys.stderr)
-        result = subprocess.run(
-            ['curl', '-sL', '-X', 'POST',
-             'https://www.datalab.to/api/v1/marker',
-             '-H', f'X-Api-Key: {DATALAB_API_KEY}',
-             '-F', f'file=@{pdf_path}',
-             '-F', 'output_format=markdown',
-             '-F', 'mode=balanced'],
-            capture_output=True, timeout=60
-        )
+        result = curl('https://www.datalab.to/api/v1/marker', '-X', 'POST', '-H', f'X-Api-Key: {DATALAB_API_KEY}', '-F', f'file=@{pdf_path}', '-F', 'output_format=markdown', '-F', 'mode=balanced', max_time=55)
         try:
             data = json.loads(result.stdout.decode('utf-8', errors='replace'))
             check_url = data.get('request_check_url')
@@ -2357,10 +2378,7 @@ def pdf_to_markdown(pdf_path):
                 print('Waiting for Datalab conversion...', file=sys.stderr)
                 for _ in range(60):
                     time.sleep(5)
-                    poll = subprocess.run(
-                        ['curl', '-sL', check_url, '-H', f'X-Api-Key: {DATALAB_API_KEY}'],
-                        capture_output=True, timeout=15
-                    )
+                    poll = curl(check_url, '-H', f'X-Api-Key: {DATALAB_API_KEY}', max_time=10)
                     status = json.loads(poll.stdout.decode('utf-8', errors='replace'))
                     if status.get('status') == 'complete':
                         return status.get('markdown', ''), status.get('images', {}), 'datalab'
@@ -2408,14 +2426,13 @@ def pdf_to_markdown(pdf_path):
                 return None
             with open(md_files[0], encoding='utf-8') as f:
                 markdown = f.read()
-            import base64 as _b64
             _IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
             images_dict = {}
             for img_file in glob.glob(os.path.join(out_dir, '**', '*'), recursive=True):
                 if os.path.splitext(img_file)[1].lower() in _IMG_EXT:
                     try:
                         with open(img_file, 'rb') as f:
-                            images_dict[os.path.basename(img_file)] = _b64.b64encode(f.read()).decode()
+                            images_dict[os.path.basename(img_file)] = base64.b64encode(f.read()).decode()
                     except Exception:
                         pass
             return markdown, images_dict, 'marker'
@@ -2624,12 +2641,11 @@ def _thumbnail_pixels(data):
 def _drop_duplicate_images(md, images):
     """Remove an image that directly follows a nearly identical one: PDF converters sometimes detect
     one figure twice, with slightly different crops. A figure repeated later on is left alone."""
-    import base64 as b64mod
     out, pos, prev_end, prev_pixels = [], 0, None, None
     for m in re.finditer(r'!\[[^\]]*\]\(([^)\s]+)\)', md):
         raw = _find_image(images, m.group(1))
         try:
-            pixels = _thumbnail_pixels(b64mod.b64decode(raw.split(',', 1)[1] if ',' in raw else raw)) if raw else None
+            pixels = _thumbnail_pixels(base64.b64decode(raw.split(',', 1)[1] if ',' in raw else raw)) if raw else None
         except Exception:
             pixels = None
         if (pixels and prev_pixels and len(pixels) == len(prev_pixels) and not md[prev_end:m.start()].strip()
@@ -2860,8 +2876,13 @@ def _metadata_from_latex(tex_path):
         else:
             raw_author = _latex_braced_arg(content, 'author')
             raw_author = re.sub(r'\\(?:thanks|tnoteref|fnref|corref)\{[^{}]*\}', '', raw_author)
-            for name in re.split(r'\\and\b', raw_author):
-                name = _latex_strip_markup(name)
+            raw_author = re.sub(r'(?<!\\)%.*', '', raw_author)                              # comments
+            raw_author = re.sub(r'\\(?:[hv]space\*?\{[^{}]*\}|footnotemark(?:\[[^\]]*\])?)', '', raw_author)
+            raw_author = re.sub(r'\\(L|l|O|o|ss)(?:\{\}|\b\s*)',                             # \L{}ukasz → Łukasz
+                                lambda m: {'L': 'Ł', 'l': 'ł', 'O': 'Ø', 'o': 'ø', 'ss': 'ß'}[m.group(1)], raw_author)
+            # \and, \And, \AND separate authors; within one, lines after \\ are affiliations and e-mails
+            for name in re.split(r'\\and\b', raw_author, flags=re.I):
+                name = _latex_strip_markup(re.split(r'\\\\', name.strip())[0])
                 if name:
                     authors.append(name)
 
@@ -3280,7 +3301,8 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     if doi and not arxiv_id:
         arxiv_id = extract_arxiv_id_from_doi(doi)
 
-    meta = get_paper_metadata(doi) if doi else {}
+    # arxiv.org/abs links have no DOI: their LaTeX \author block can hold e-mails and affiliations
+    meta = get_paper_metadata(doi) if doi else _get_paper_metadata_arxiv(arxiv_id) if arxiv_id else {}
 
     if not arxiv_id and doi and not converted:   # a converted PDF needs no preprint
         print('Checking for arXiv preprint...', file=sys.stderr)
@@ -3319,7 +3341,6 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                         # Collect figure files from the source dir (and its subfolders, e.g. figures/)
                         # before tmp_dir is cleaned up, keyed by their path relative to it. PDF/EPS
                         # figures are rendered to PNG/JPG by download_images → finalize_image.
-                        import base64 as _b64mod
                         _IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.pdf', '.eps', '.ps'}
                         src_dir = os.path.dirname(tex_path)
                         for _root, _dirs, _files in os.walk(src_dir):
@@ -3329,7 +3350,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                                     _rel = os.path.relpath(_full, src_dir).replace(os.sep, '/')
                                     try:
                                         with open(_full, 'rb') as _f:
-                                            images_dict[_rel] = _b64mod.b64encode(_f.read()).decode()
+                                            images_dict[_rel] = base64.b64encode(_f.read()).decode()
                                     except Exception:
                                         pass
                         # Build citation key → number map from .bbl if present
@@ -3351,11 +3372,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 print(f'Trying arXiv PDF ({arxiv_id})...', file=sys.stderr)
                 arxiv_pdf_url = f'https://arxiv.org/pdf/{arxiv_id}'
                 arxiv_pdf_path = os.path.join(tmp_dir, 'arxiv.pdf')
-                result = subprocess.run(
-                    ['curl', '-sL', '--max-time', '30', '-o', arxiv_pdf_path,
-                     '-w', '%{content_type}', arxiv_pdf_url],
-                    capture_output=True, text=True, timeout=35
-                )
+                result = curl(arxiv_pdf_url, '-o', arxiv_pdf_path, '-w', '%{content_type}', max_time=30, text=True)
                 if 'pdf' in result.stdout.lower() and \
                         os.path.exists(arxiv_pdf_path) and os.path.getsize(arxiv_pdf_path) > 1000:
                     pdf_path = arxiv_pdf_path
@@ -3460,7 +3477,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
         if kw_slug:
             kw_tags.append(kw_slug)
 
-    author_lines = ([f'author:'] + [f'  - {yaml_str(a)}' for a in authors]) if authors else []
+    author_lines = (['author:'] + [f'  - {yaml_str(a)}' for a in authors]) if authors else []
     fm = build_frontmatter(created, list(ai_tags) + kw_tags, [
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
@@ -3553,10 +3570,7 @@ def build_pdf(url, project, created, skip_doi=False):
             _shutil.copy2(local_path, pdf_path)
         else:
             print('Downloading PDF...', file=sys.stderr)
-            subprocess.run(
-                ['curl', '-sL', '-o', pdf_path, url],
-                capture_output=True, timeout=120
-            )
+            curl(url, '-o', pdf_path, max_time=115)
         if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 1024:
             print('Failed to download PDF or file too small.', file=sys.stderr)
             return '', {}, {}
@@ -3731,7 +3745,7 @@ def generate_filename(title, max_words=None):
             result = subprocess.run(
                 ['claude', '-p', ai_prompt, '--output-format', 'text']
                 + (['--model', AI_FALLBACK_MODEL] if AI_FALLBACK_MODEL else []),
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30
             )
             name = _clean(result.stdout)
             if name:
@@ -4013,37 +4027,31 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
     source_url: the original article URL, used as Referer on a retry when the
     first download fails image validation (e.g. CDN hotlink protection).
 
-    Returns updated content with rewritten img/ paths.
+    Downloads run IMAGE_JOBS at a time. Returns updated content with rewritten img/ paths.
     """
-    import base64 as b64mod
     # The source may contain escaped parentheses (\( \)) and be followed by a "title"
     pattern = re.compile(r'!\[(.*?)\]\(((?:\\.|[^)\\])+?)(?:\s+"[^"]*")?\)', re.DOTALL)
     if not pattern.search(content):
         return content
 
     img_dir = os.path.join(docs_dir, 'img')
-    seen = {}   # original src → local_name (or None if failed)
-    counter = [0]
+    _src = lambda m: re.sub(r'\\([()])', r'\1', m.group(2))
+    # Unique sources in page order; skip inline data, already-local files, and video embeds (YouTube / vid/)
+    srcs = list(dict.fromkeys(src for src in map(_src, pattern.finditer(content))
+                              if not (src.startswith(('data:', 'img/', 'vid/')) or is_youtube(src))))
+    if not srcs:
+        return content
+    # Create img/ only once there is a real image to save
+    os.makedirs(img_dir, exist_ok=True)
 
-    def replace_img(m):
-        alt, src = m.group(1), re.sub(r'\\([()])', r'\1', m.group(2))
-        # Skip inline data, already-local files, and video embeds (YouTube / vid/)
-        if src.startswith(('data:', 'img/', 'vid/')) or is_youtube(src):
-            return m.group(0)
-        if src in seen:
-            return f'![{alt}](img/{seen[src]})' if seen[src] else m.group(0)
-
-        # Create img/ only once there is a real image to save
-        os.makedirs(img_dir, exist_ok=True)
-        counter[0] += 1
-        local_name = None
-        tmp_path = os.path.join(img_dir, f'{filename_base}-{counter[0]:03d}.download')
-
+    def fetch(i, src):
+        """Save one image under a temporary name; returns its final path, or None."""
+        tmp_path = os.path.join(img_dir, f'.{filename_base}-{i}.download')
+        final = None
         if src.startswith('http'):
             # Download from URL
             def _curl(extra_args=()):
-                cmd = ['curl', '-sL', src, '-o', tmp_path] + list(extra_args)
-                r = subprocess.run(cmd, capture_output=True, timeout=30)
+                r = curl(src, '-o', tmp_path, *extra_args, max_time=30)
                 return (r.returncode == 0 and os.path.exists(tmp_path)
                         and os.path.getsize(tmp_path) > 0
                         and _is_valid_image(tmp_path))
@@ -4053,15 +4061,11 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
                 if not ok and source_url:
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
-                    ok = _curl([
-                        '-H', f'Referer: {source_url}',
-                        '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    ])
+                    ok = _curl(['-H', f'Referer: {source_url}', '-A', BROWSER_UA])
                 if ok:
                     final = finalize_image(tmp_path)
-                    local_name = os.path.basename(final) if final else None
             except Exception:
-                local_name = None
+                final = None
         elif images_dict:
             # Decode from base64 dict (Datalab or arXiv)
             # Exact path first, then file name, then name without extension (see _find_image)
@@ -4070,21 +4074,26 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
                 try:
                     data = raw.split(',', 1)[1] if ',' in raw else raw
                     with open(tmp_path, 'wb') as f:
-                        f.write(b64mod.b64decode(data))
+                        f.write(base64.b64decode(data))
                     final = finalize_image(tmp_path)
-                    local_name = os.path.basename(final) if final else None
                 except Exception:
-                    local_name = None
-
+                    final = None
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)   # failed download, or not an image
-        seen[src] = local_name
-        if not local_name:
-            counter[0] -= 1  # keep numbering gapless when a download fails
-        return f'![{alt}](img/{local_name})' if local_name else m.group(0)
+        return final
 
-    content = pattern.sub(replace_img, content)
-    saved = [os.path.join(img_dir, n) for n in dict.fromkeys(seen.values()) if n]
+    with ThreadPoolExecutor(max(1, IMAGE_JOBS)) as ex:
+        finals = list(ex.map(fetch, range(len(srcs)), srcs))
+
+    # Number the saved images in page order; failed ones keep their link and leave no gap
+    seen = {}   # original src → local_name
+    for src, final in zip(srcs, finals):
+        if final:
+            seen[src] = f'{filename_base}-{len(seen) + 1:03d}{os.path.splitext(final)[1]}'
+            os.replace(final, os.path.join(img_dir, seen[src]))
+    content = pattern.sub(lambda m: f'![{m.group(1)}](img/{seen[_src(m)]})' if _src(m) in seen else m.group(0),
+                          content)
+    saved = [os.path.join(img_dir, n) for n in seen.values()]
     if saved and ENABLE_IMAGE_COMPRESSION and GRAYSCALE_FIGURES:
         for old, new in optimize_grayscale_figures(saved).items():
             content = content.replace(f'(img/{os.path.basename(old)})', f'(img/{os.path.basename(new)})')
@@ -4162,10 +4171,7 @@ def fetch_html_as_markdown(url, original_url=None, user_agent=None):
     """Fetch URL HTML, convert to markdown. Returns defuddle-style dict or None.
     original_url is used for site/metadata if fetching an archive URL."""
     try:
-        cmd = ['curl', '-sL', url]
-        if user_agent:
-            cmd += ['-A', user_agent]
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        result = curl(url, *(['-A', user_agent] if user_agent else []), max_time=25)
         if not result.stdout:
             return None
         raw = result.stdout.decode('utf-8', errors='replace')
@@ -4198,11 +4204,7 @@ def resolve_wikilink_images(content, url):
     if not wikilink_pattern.search(content):
         return content
     try:
-        result = subprocess.run(
-            ['curl', '-sL', url, '-A',
-             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'],
-            capture_output=True, timeout=30
-        )
+        result = curl(url, '-A', BROWSER_UA, max_time=25)
         html_str = result.stdout.decode('utf-8', errors='replace')
         img_map = {}
         for img_m in re.finditer(r'<img[^>]*/?>',  html_str, re.IGNORECASE):
@@ -4268,7 +4270,7 @@ def fetch_direct_md(url):
     platforms serve it there, linked or not), else Obsidian Publish's preloadPage source.
     Resolves wikilink images using the same base path. Returns a defuddle-style dict or None."""
     try:
-        result = subprocess.run(['curl', '-sL', '-w', '\n%{url_effective}', url], capture_output=True, timeout=30)
+        result = curl(url, '-w', '\n%{url_effective}', max_time=25)
         raw, _, final_url = result.stdout.decode('utf-8', errors='replace').rpartition('\n')
 
         # Only the page's own source: docs sites also link other pages' .md files (and paywall
@@ -4279,8 +4281,7 @@ def fetch_direct_md(url):
 
         # Fetch the raw .md file (an HTML error page is not markdown)
         for md_url in [own_md] + publish_md[:1]:
-            md_result = subprocess.run(['curl', '-sL', '-w', '\n%{http_code} %{content_type}', md_url],
-                                       capture_output=True, timeout=30)
+            md_result = curl(md_url, '-w', '\n%{http_code} %{content_type}', max_time=25)
             body, _, status = md_result.stdout.decode('utf-8', errors='replace').rpartition('\n')
             if status.startswith('200') and 'html' not in status:
                 break
@@ -4337,7 +4338,7 @@ def wayback_snapshot(url):
     """Return the most recent Wayback Machine snapshot URL, or None."""
     try:
         api = f'https://archive.org/wayback/available?url={quote(url, safe="")}'
-        result = subprocess.run(['curl', '-s', api], capture_output=True, text=True, timeout=15)
+        result = curl(api, max_time=10, text=True, follow=False)
         data = json.loads(result.stdout)
         snapshot = data.get('archived_snapshots', {}).get('closest', {})
         if snapshot.get('available'):
@@ -4371,10 +4372,7 @@ def clean_archive_content(d, original_url):
 def archive_is_snapshot(url):
     """Return the most recent archive.is snapshot URL if one exists, or None."""
     try:
-        result = subprocess.run(
-            ['curl', '-sI', f'https://archive.is/newest/{url}'],
-            capture_output=True, text=True, timeout=15
-        )
+        result = curl(f'https://archive.is/newest/{url}', '-I', max_time=10, text=True, follow=False)
         for line in result.stdout.split('\n'):
             if line.lower().startswith('location:'):
                 loc = line.split(':', 1)[1].strip()
@@ -4389,12 +4387,7 @@ def archive_is_snapshot(url):
 def archive_is_save(url):
     """Submit URL to archive.is and return snapshot URL, or None."""
     try:
-        result = subprocess.run(
-            ['curl', '-s', '-D', '-', '-o', '/dev/null', '-X', 'POST',
-             '-d', f'url={quote(url, safe="")}&anyway=1',
-             'https://archive.is/submit/'],
-            capture_output=True, text=True, timeout=90
-        )
+        result = curl('https://archive.is/submit/', '-D', '-', '-o', '/dev/null', '-X', 'POST', '-d', f'url={quote(url, safe="")}&anyway=1', max_time=85, text=True, follow=False)
         for line in result.stdout.split('\n'):
             line = line.strip()
             if line.lower().startswith('location:'):
@@ -4638,8 +4631,7 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'original.pdf')
             try:
-                subprocess.run(['curl', '-sL', '--max-time', '120', '-o', path, source],
-                               capture_output=True, timeout=125)
+                curl(source, '-o', path, max_time=120)
                 with open(path, 'rb') as f:
                     data = f.read()
             except Exception:
@@ -4660,7 +4652,6 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
 def run_batch(urls, argv):
     """Process several links, PARALLEL_JOBS at a time, each in its own defuddle process.
     Progress lines are prefixed with the link's number; each link's output follows when it is done."""
-    from concurrent.futures import ThreadPoolExecutor
     rest, skip = [], False
     for a in argv:
         if skip:
@@ -4692,7 +4683,52 @@ def run_batch(urls, argv):
     return 0 if all(c == 0 for c in codes) else 1
 
 
-def main(argv=None):
+def in_background(fn, *args, **kwargs):
+    """Start fn(*args, **kwargs) in a thread and return its Future (.result() waits for it).
+    Used to run the filename AI call while the note is being built."""
+    ex = ThreadPoolExecutor(1)
+    future = ex.submit(fn, *args, **kwargs)
+    ex.shutdown(wait=False)
+    return future
+
+
+def read_only(args):
+    """No --project and no --category: print the content instead of saving it."""
+    return args.project is None and args.category is None
+
+
+def print_note(note):
+    """Print a built note without its frontmatter (read-only mode)."""
+    print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
+
+
+def save_note(note, args, subdir, filename, images_dict=None, source_url=None, finish=None):
+    """Write a note to {vault}/[category/][project/]{subdir}/{filename}.md, with its images in img/.
+    finish(note, save_dir) can change the note just before it is written. Returns the folder."""
+    save_dir = get_save_dir(get_vault_path(), args.category, args.project, subdir)
+    os.makedirs(save_dir, exist_ok=True)
+    if ENABLE_IMAGES:
+        note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=source_url)
+    if finish:
+        note = finish(note, save_dir)
+    note = _dedup_note_tags(note)
+    with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
+        f.write(note)
+    print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
+    return save_dir
+
+
+def paper_filename(args, meta):
+    """{first author's last name}-{AI filename from the title}, unless --filename is given."""
+    if args.filename:
+        return args.filename
+    authors   = meta.get('authors', [])
+    last_name = _slug(authors[0].split()[-1]) if authors else ''
+    ai_name   = generate_filename(meta.get('title', ''))
+    return f'{last_name}-{ai_name}' if last_name else ai_name
+
+
+def parse_args(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument('url_pos',    nargs='*', default=[], metavar='URL')
     parser.add_argument('--url',      default=None)
@@ -4716,94 +4752,75 @@ def main(argv=None):
     parser.add_argument('--keep-pdf', action=argparse.BooleanOptionalAction, default=None,
                         help='papers and PDFs: also save the original PDF next to the note, with the same name '
                              '(default: KEEP_PDF)')
-    argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(argv)
     if args.video_quality == args.audio_quality == 0:
         parser.error('--video-quality and --audio-quality cannot both be 0')
     # 0 is a valid value (skip that track), so test for None rather than truthiness
     if args.video_quality is not None or args.audio_quality is not None:
         args.download = True
-
     if args.keep_pdf is None:
         args.keep_pdf = KEEP_PDF
-    urls = ([args.url] if args.url else []) + args.url_pos
-    if len(urls) > 1:
-        if args.filename:
-            parser.error('--filename works with one link at a time')
-        sys.exit(run_batch(urls, argv))
-    raw_url = urls[0] if urls else None
-    if not raw_url:
-        parser.error('URL required as first argument or via --url')
-
     if not args.created:
-        import datetime
-        args.created = datetime.date.today().isoformat()
+        args.created = datetime.now().date().isoformat()
+    args.urls = ([args.url] if args.url else []) + args.url_pos
+    if len(args.urls) > 1 and args.filename:
+        parser.error('--filename works with one link at a time')
+    if not args.urls:
+        parser.error('URL required as first argument or via --url')
+    return args
 
-    _is_special = (
-        os.path.isabs(raw_url) or
-        (ENABLE_PAPER   and is_paper_url(raw_url)) or
-        (ENABLE_PODCAST and is_apple_podcast(raw_url)) or
-        (ENABLE_YOUTUBE and is_youtube(raw_url))
-    )
-    url = raw_url if _is_special else clean_url(raw_url)
-    academia_doi = None
 
-    # Academia.edu: extract PDF URL from page, then re-route through normal pipeline
-    if is_academia_url(url):
-        print('Detected Academia.edu page — extracting PDF URL...', file=sys.stderr)
-        pdf_url, academia_doi = extract_academia_pdf_url(url)
-        if pdf_url:
-            print(f'Found PDF: {pdf_url}', file=sys.stderr)
-            note, images_dict, meta = build_pdf(pdf_url, args.project, args.created, skip_doi=True)
-            if not note:
-                return
-            title    = meta.get('title', '')
-            filename = args.filename or generate_filename(title)
-            vault    = get_vault_path()
-            save_dir = get_save_dir(vault, args.category, args.project, 'docs')
-            if args.project is not None or args.category is not None:
-                os.makedirs(save_dir, exist_ok=True)
-                if ENABLE_IMAGES:
-                    note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=pdf_url)
-                note = _dedup_note_tags(note)
-                with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
-                    f.write(note)
-                print(f'Saved to {format_saved_path(args.category, args.project, "docs", filename)}')
-                if args.keep_pdf:
-                    save_original_pdf(save_dir, filename, source=pdf_url)
-            else:
-                print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
-            return
-        elif ENABLE_PAPER and academia_doi and SHADOW_BASE_URL:
-            print(f'PDF not publicly available — trying shadow library for DOI {academia_doi}...', file=sys.stderr)
-            shadow_url = SHADOW_BASE_URL.rstrip('/') + '/' + academia_doi
-            url = shadow_url
-            # Fall through to the paper pipeline below
-        else:
-            msg = 'PDF requires login.'
-            if academia_doi:
-                msg += f' DOI: {academia_doi}'
-            msg += ' Download the PDF manually and pass the local file location to defuddle.'
-            print(msg, file=sys.stderr)
-            return
+def route_academia(url, args):
+    """Academia.edu: save the page's PDF, or continue with the paper's DOI through the shadow library.
+    Returns (url to continue with or None when done, the paper's DOI if found)."""
+    print('Detected Academia.edu page — extracting PDF URL...', file=sys.stderr)
+    pdf_url, academia_doi = extract_academia_pdf_url(url)
+    if pdf_url:
+        print(f'Found PDF: {pdf_url}', file=sys.stderr)
+        note, images_dict, meta = build_pdf(pdf_url, args.project, args.created, skip_doi=True)
+        if not note:
+            return None, academia_doi
+        if read_only(args):
+            print_note(note)
+            return None, academia_doi
+        filename = args.filename or generate_filename(meta.get('title', ''))
+        save_dir = save_note(note, args, 'docs', filename, images_dict, source_url=pdf_url)
+        if args.keep_pdf:
+            save_original_pdf(save_dir, filename, source=pdf_url)
+        return None, academia_doi
+    if ENABLE_PAPER and academia_doi and SHADOW_BASE_URL:
+        print(f'PDF not publicly available — trying shadow library for DOI {academia_doi}...', file=sys.stderr)
+        # Continue with the paper pipeline
+        return SHADOW_BASE_URL.rstrip('/') + '/' + academia_doi, academia_doi
+    msg = 'PDF requires login.'
+    if academia_doi:
+        msg += f' DOI: {academia_doi}'
+    msg += ' Download the PDF manually and pass the local file location to defuddle.'
+    print(msg, file=sys.stderr)
+    return None, academia_doi
 
-    # SSRN: derive DOI from abstract_id and route to paper pipeline
-    if ENABLE_PAPER and is_ssrn_url(url):
+
+def paper_url(url, raw_url):
+    """Rewrite paper links (SSRN, arXiv PDF/HTML, publisher and index pages, shadow library,
+    doi.org variants) to the form the paper pipeline expects. Returns None to stop."""
+    if not ENABLE_PAPER:
+        return url
+    # SSRN: derive DOI from abstract_id
+    if is_ssrn_url(url):
         ssrn_doi = extract_ssrn_doi(url)
-        if ssrn_doi:
-            print(f'Detected SSRN paper — using DOI {ssrn_doi}...', file=sys.stderr)
-            url = f'https://doi.org/{ssrn_doi}'
-        else:
+        if not ssrn_doi:
             print('Could not extract abstract_id from SSRN URL.', file=sys.stderr)
-            return
+            return None
+        print(f'Detected SSRN paper — using DOI {ssrn_doi}...', file=sys.stderr)
+        url = f'https://doi.org/{ssrn_doi}'
 
     # arXiv PDF and HTML links: use the abstract page, so the LaTeX source route is tried
     m = re.match(r'https?://(?:www\.)?arxiv\.org/(?:pdf|html)/(\d{4}\.\d{4,5}(?:v\d+)?)(?:\.pdf)?/?$', raw_url)
-    if ENABLE_PAPER and m:
+    if m:
         url = f'https://arxiv.org/abs/{m.group(1)}'
 
     # Publisher and paper-index pages (ScienceDirect, Wiley, PubMed, ...): find the DOI
-    if ENABLE_PAPER and is_paper_site(raw_url) and not m:
+    elif is_paper_site(raw_url):
         pub_doi = paper_site_doi(raw_url)
         if pub_doi:
             print(f'Detected paper page — using DOI {pub_doi}...', file=sys.stderr)
@@ -4813,7 +4830,7 @@ def main(argv=None):
                   'pass the DOI link instead. Reading it as an article...', file=sys.stderr)
 
     # Normalize shadow library URLs to canonical doi.org form
-    if ENABLE_PAPER and is_shadow_url(url):
+    if is_shadow_url(url):
         doi_part = extract_doi_from_shadow(url)
         if doi_part:
             url = f'https://doi.org/{doi_part}'
@@ -4821,153 +4838,228 @@ def main(argv=None):
             print('Shadow library URL detected but no DOI found in path.', file=sys.stderr)
 
     # Normalize doi.org URLs to canonical form (strip dx., www., etc.)
-    if ENABLE_PAPER and 'doi.org' in url and 'arxiv.org' not in url:
+    if 'doi.org' in url and 'arxiv.org' not in url:
         doi_part = extract_doi(url)
         if doi_part:
             url = f'https://doi.org/{doi_part}'
+    return url
 
-    # Academic papers: DOI / arXiv / shadow library
+
+def save_paper(url, args, academia_doi=None, pdf_file=None, converted=None, pdf_source=None):
+    """Academic papers (DOI / arXiv / shadow library) → papers/. pdf_file and converted reuse a PDF
+    and its conversion that the caller already has; pdf_source is where that PDF came from."""
+    if read_only(args):
+        note, _, _ = build_paper(url, None, args.created, pdf_file=pdf_file, converted=converted)
+        if note:
+            print_note(note)
+        return
+    note, images_dict, meta = build_paper(url, args.project, args.created, pdf_file=pdf_file, converted=converted)
+    if not note:
+        if academia_doi:
+            print(f'Paper not found in shadow library either. Download the PDF manually and pass the local file location to defuddle. DOI: {academia_doi}', file=sys.stderr)
+        return
+    filename = paper_filename(args, meta)
+    save_dir = save_note(note, args, 'papers', filename, images_dict, source_url=pdf_source or url)
+    if args.keep_pdf:
+        if pdf_source and not meta.get('pdf'):
+            save_original_pdf(save_dir, filename, source=pdf_source)
+        else:
+            save_original_pdf(save_dir, filename, meta=meta)
+
+
+def save_pdf(url, args):
+    """Plain PDFs (links and local files): scan the first pages for a DOI and continue as a paper
+    when there is one, else save the PDF's text to docs/."""
+    if args.doi:   # DOI given: no need to search for it
+        doi = re.sub(r'^(https?://(dx\.)?doi\.org/|doi:)', '', args.doi.strip(), flags=re.I)
+        note, images_dict, meta = None, None, {'redirect_doi': doi}
+        if os.path.isabs(url):
+            with open(url, 'rb') as f:
+                meta['pdf_bytes'] = f.read()
+    else:
+        note, images_dict, meta = build_pdf(url, args.project, args.created)
+
+    if meta and meta.get('redirect_doi'):
+        # First page had a DOI — continue as a paper, reusing the PDF we already have
+        pdf_file = None
+        if meta.get('pdf_bytes'):
+            fd, pdf_file = tempfile.mkstemp(suffix='.pdf')
+            with os.fdopen(fd, 'wb') as f:
+                f.write(meta['pdf_bytes'])
+        try:
+            save_paper(f'https://doi.org/{meta["redirect_doi"]}', args, pdf_file=pdf_file,
+                       converted=meta.get('converted'), pdf_source=url)
+        finally:
+            if pdf_file:
+                os.remove(pdf_file)
+        return
+    if not note:
+        return
+    if read_only(args):
+        print_note(note)
+        return
+    filename = args.filename or generate_filename(meta.get('title', ''))
+    save_dir = save_note(note, args, 'docs', filename, images_dict, source_url=url)
+    if args.keep_pdf:
+        if meta and meta.get('pdf'):
+            save_original_pdf(save_dir, filename, meta=meta)
+        else:
+            save_original_pdf(save_dir, filename, source=url)
+
+
+def save_podcast(url, args):
+    """Apple Podcasts: local TTML transcript, no HTTP cascade needed → transcripts/."""
+    episode_id = apple_podcast_id(url)
+    ttml_path  = find_podcast_ttml(episode_id) if episode_id else None
+    if not ttml_path:
+        deep_link = re.sub(r'^https://', 'podcasts://', url)
+        print(
+            f'Podcast transcript not found locally.\n'
+            f'Open the episode in the Podcasts app and view its transcript:\n\n'
+            f'  {deep_link}\n\n'
+            f'Once the transcript has loaded, re-run this command.',
+            file=sys.stderr
+        )
+        return
+    if read_only(args):
+        for chunk in parse_ttml(ttml_path):
+            speaker_label = re.sub(r'SPEAKER_(\d+)', r'Speaker \1', chunk['speaker'])
+            print(f'[{fmt_tc(chunk["time"])}] **{speaker_label}:** {chunk["text"]}')
+        return
+    meta  = get_podcast_metadata(episode_id, apple_show_id(url))
+    show  = meta.get('show', '')
+    title = meta.get('title', '')
+    # Strip words containing digits (e.g. "S10E5", "256") from episode title
+    cleaned_title = ' '.join(w for w in title.split() if not re.search(r'\d', w)).strip()
+    show_slug = in_background(generate_filename, show, max_words=2) if show and not args.filename else None
+    ep_slug   = in_background(generate_filename, cleaned_title or title) if not args.filename else None
+    # Canonical URL: keep only ?i= param
+    clean_pod_url = re.sub(r'[?&]i=(\d+).*', r'?i=\1', url)
+    note = build_apple_podcast(clean_pod_url, args.project, args.created, ttml_path, meta=meta)
+    filename = args.filename or (f'{show_slug.result()}-{ep_slug.result()}' if show_slug else ep_slug.result())
+    save_note(note, args, 'transcripts', filename, source_url=url)
+
+
+def fetch_article(url):
+    """Auto-cascade: native-md → native-page → googlebot → wayback → archive-is.
+    Returns (d, used_method, target): target is the paper or PDF to continue with when the page
+    is a scholarly landing page, else None."""
+    # 1. native-md: the page's own .md source (docs platforms, Obsidian Publish)
+    candidate = fetch_direct_md(url)
+    if candidate and candidate.get('wordCount', 0) > MIN_WORDS:
+        return candidate, 'native-md', None
+
+    # 2. native-page: defuddle parse
+    candidate = fetch_defuddle(url)
+    # Scholarly pages (repositories, preprint servers, ...): continue as the paper or its PDF
+    target = academic_target(candidate.get('metaTags'), url) if ENABLE_PAPER else None
+    if target and target != url:
+        return {}, None, target
+    if candidate.get('wordCount', 0) > MIN_WORDS:
+        return candidate, 'native-page', None
+
+    # 3. googlebot: Googlebot UA + script-strip
+    candidate = fetch_googlebot(url)
+    if candidate and candidate.get('wordCount', 0) > MIN_WORDS:
+        candidate = dict(candidate)
+        candidate['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
+        return candidate, 'googlebot', None
+
+    # 4. Archive fallbacks
+    for get_archive_url, method_name in [
+        (wayback_snapshot,    'wayback'),
+        (archive_is_snapshot, 'archive-is'),
+        (archive_is_save,     'archive-is'),
+    ]:
+        archive_url = get_archive_url(url)
+        if archive_url:
+            if method_name == 'wayback':
+                candidate = fetch_html_as_markdown(archive_url, original_url=url) or {}
+            else:
+                candidate = fetch_defuddle(archive_url)
+                if candidate.get('wordCount', 0) > MIN_WORDS and 'archive.is/' in archive_url:
+                    candidate = clean_archive_content(candidate, url)
+            if candidate.get('wordCount', 0) > MIN_WORDS:
+                return _with_archive(candidate, archive_url), method_name, None
+
+    print(
+        f'Page appears JS-rendered and no archive snapshot could be retrieved.\n'
+        f'Please visit this URL, save the page, and solve the captcha:\n'
+        f'https://archive.is/?url={quote(url, safe=":/?")}',
+        file=sys.stderr
+    )
+    return {}, None, None
+
+
+def save_web(url, args, d, used_method):
+    """Web pages and YouTube videos → docs/ or transcripts/."""
+    youtube = ENABLE_YOUTUBE and is_youtube(url)
+    if read_only(args):
+        if args.download:
+            print('--download only works when saving (--project/--category) — skipped.', file=sys.stderr)
+        if youtube:
+            present_youtube(d, url)
+        else:
+            print(d.get('content', ''), end='')
+        return
+
+    # Don't save an empty note
+    if d.get('wordCount', 0) <= MIN_WORDS and not youtube:
+        print('No content retrieved — skipping save.', file=sys.stderr)
+        return
+
+    title = d.get('title', '') or title_from_content(d.get('content', ''))
+    filename = None if args.filename else in_background(generate_filename, title)
+    if youtube:
+        note = build_youtube(d, url, args.project, args.created)
+    else:
+        note = build_article(d, url, args.project, args.created, method=used_method)
+    filename = args.filename or filename.result()
+
+    def finish(note, save_dir):
+        if not (args.download and youtube):
+            return note
+        local = download_youtube(url, save_dir, filename, args.video_quality, args.audio_quality)
+        if not local:
+            print('WARNING: download failed after 2 attempts — nothing saved locally; '
+                  'the note keeps the YouTube embed.', file=sys.stderr)
+            return note
+        # Swap the YouTube embed for the local file; the URL stays in the frontmatter
+        return re.sub(r'^!\[\]\(https://youtu\.be/[^)]+\)$', f'![]({local})', note, count=1, flags=re.M)
+
+    save_note(note, args, 'transcripts' if is_youtube(url) else 'docs', filename, source_url=url, finish=finish)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(argv)
+    if len(args.urls) > 1:
+        sys.exit(run_batch(args.urls, argv))
+    raw_url = args.urls[0]
+
+    _is_special = (
+        os.path.isabs(raw_url) or
+        (ENABLE_PAPER   and is_paper_url(raw_url)) or
+        (ENABLE_PODCAST and is_apple_podcast(raw_url)) or
+        (ENABLE_YOUTUBE and is_youtube(raw_url))
+    )
+    url = raw_url if _is_special else clean_url(raw_url)
+
+    academia_doi = None
+    if is_academia_url(url):
+        url, academia_doi = route_academia(url, args)
+        if not url:
+            return
+    url = paper_url(url, raw_url)
+    if not url:
+        return
+
     if ENABLE_PAPER and is_paper_url(url):
-        if args.project is None and args.category is None:
-            note, _, _meta = build_paper(url, None, args.created)
-            print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
-            return
-        note, images_dict, meta = build_paper(url, args.project, args.created)
-        if not note:
-            if academia_doi:
-                print(f'Paper not found in shadow library either. Download the PDF manually and pass the local file location to defuddle. DOI: {academia_doi}', file=sys.stderr)
-            return
-        title    = meta.get('title', '')
-        authors  = meta.get('authors', [])
-        last_name = _slug(authors[0].split()[-1]) if authors else ''
-        ai_name  = generate_filename(title)
-        filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
-        vault    = get_vault_path()
-        papers_dir = get_save_dir(vault, args.category, args.project, 'papers')
-        os.makedirs(papers_dir, exist_ok=True)
-        if ENABLE_IMAGES:
-            note = download_images(note, papers_dir, filename, images_dict=images_dict, source_url=url)
-        note = _dedup_note_tags(note)
-        out_path = os.path.join(papers_dir, f'{filename}.md')
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write(note)
-        print(f'Saved to {format_saved_path(args.category, args.project, "papers", filename)}')
-        if args.keep_pdf:
-            save_original_pdf(papers_dir, filename, meta=meta)
-        return
-
-    # Plain PDFs: download, scan first page for DOI, route accordingly
+        return save_paper(url, args, academia_doi)
     if is_pdf_url(url):
-        if args.doi:   # DOI given: no need to search for it
-            doi = re.sub(r'^(https?://(dx\.)?doi\.org/|doi:)', '', args.doi.strip(), flags=re.I)
-            if os.path.isabs(url):
-                with open(url, 'rb') as f:
-                    note, images_dict, meta = None, None, {'redirect_doi': doi, 'pdf_bytes': f.read()}
-            else:
-                note, images_dict, meta = None, None, {'redirect_doi': doi}
-        else:
-            note, images_dict, meta = build_pdf(url, args.project, args.created)
-        redirect_doi = meta.get('redirect_doi') if meta else None
-        if redirect_doi:
-            # First page had a DOI — re-route to build_paper
-            doi_url = f'https://doi.org/{redirect_doi}'
-            pdf_file = None
-            if meta.get('pdf_bytes'):   # reuse the PDF we already have instead of fetching one
-                fd, pdf_file = tempfile.mkstemp(suffix='.pdf')
-                with os.fdopen(fd, 'wb') as f:
-                    f.write(meta['pdf_bytes'])
-            if args.project is None and args.category is None:
-                try:
-                    note, _, _meta = build_paper(doi_url, None, args.created, pdf_file=pdf_file, converted=meta.get('converted'))
-                finally:
-                    if pdf_file:
-                        os.remove(pdf_file)
-                if not note:
-                    return
-                print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
-                return
-            try:
-                note, images_dict, meta = build_paper(doi_url, args.project, args.created, pdf_file=pdf_file, converted=meta.get('converted'))
-            finally:
-                if pdf_file:
-                    os.remove(pdf_file)
-            if not note:
-                return
-            authors  = meta.get('authors', [])
-            last_name = _slug(authors[0].split()[-1]) if authors else ''
-            ai_name  = generate_filename(meta.get('title', ''))
-            filename = args.filename or (f'{last_name}-{ai_name}' if last_name else ai_name)
-            vault    = get_vault_path()
-            save_dir = get_save_dir(vault, args.category, args.project, 'papers')
-            subdir   = 'papers'
-        elif not note:
-            return
-        elif args.project is None and args.category is None:   # read-only: print instead of saving
-            print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
-            return
-        else:
-            title    = meta.get('title', '')
-            filename = args.filename or generate_filename(title)
-            vault    = get_vault_path()
-            save_dir = get_save_dir(vault, args.category, args.project, 'docs')
-            subdir   = 'docs'
-        os.makedirs(save_dir, exist_ok=True)
-        if ENABLE_IMAGES:
-            note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=url)
-        note = _dedup_note_tags(note)
-        with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
-            f.write(note)
-        print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
-        if args.keep_pdf:
-            if meta and meta.get('pdf'):
-                save_original_pdf(save_dir, filename, meta=meta)
-            else:
-                save_original_pdf(save_dir, filename, source=url)
-        return
-
-    # Apple Podcasts: local TTML transcript, no HTTP cascade needed
+        return save_pdf(url, args)
     if ENABLE_PODCAST and is_apple_podcast(url):
-        episode_id = apple_podcast_id(url)
-        ttml_path  = find_podcast_ttml(episode_id) if episode_id else None
-        if not ttml_path:
-            deep_link = re.sub(r'^https://', 'podcasts://', url)
-            print(
-                f'Podcast transcript not found locally.\n'
-                f'Open the episode in the Podcasts app and view its transcript:\n\n'
-                f'  {deep_link}\n\n'
-                f'Once the transcript has loaded, re-run this command.',
-                file=sys.stderr
-            )
-            return
-        if args.project is None and args.category is None:
-            # Present mode: print transcript text
-            for chunk in parse_ttml(ttml_path):
-                speaker_label = re.sub(r'SPEAKER_(\d+)', r'Speaker \1', chunk['speaker'])
-                print(f'[{fmt_tc(chunk["time"])}] **{speaker_label}:** {chunk["text"]}')
-            return
-        # Save mode
-        # Canonical URL: keep only ?i= param
-        clean_pod_url = re.sub(r'[?&]i=(\d+).*', r'?i=\1', url)
-        note = build_apple_podcast(clean_pod_url, args.project, args.created, ttml_path)
-        meta = get_podcast_metadata(episode_id, apple_show_id(url))
-        show  = meta.get('show', '')
-        title = meta.get('title', '')
-        # Strip words containing digits (e.g. "S10E5", "256") from episode title
-        cleaned_title = ' '.join(w for w in title.split() if not re.search(r'\d', w)).strip()
-        show_slug  = generate_filename(show, max_words=2) if show else ''
-        ep_slug    = generate_filename(cleaned_title or title)
-        filename   = args.filename or (f'{show_slug}-{ep_slug}' if show_slug else ep_slug)
-        vault    = get_vault_path()
-        transcripts_dir = get_save_dir(vault, args.category, args.project, 'transcripts')
-        os.makedirs(transcripts_dir, exist_ok=True)
-        if ENABLE_IMAGES:
-            note = download_images(note, transcripts_dir, filename, source_url=url)
-        note = _dedup_note_tags(note)
-        out_path = os.path.join(transcripts_dir, f'{filename}.md')
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write(note)
-        print(f'Saved to {format_saved_path(args.category, args.project, "transcripts", filename)}')
-        return
+        return save_podcast(url, args)
 
     # YouTube: defuddle's page parse plus yt-dlp, no archive cascade. A video without subtitles
     # has only a few words but isn't JS-rendered, and archives don't have its transcript either
@@ -4976,110 +5068,15 @@ def main(argv=None):
         if not d:
             print('Could not read this video (defuddle and yt-dlp both failed).', file=sys.stderr)
             return
-        if args.project is None and args.category is None:
-            if args.download:
-                print('--download only works when saving (--project/--category) — skipped.', file=sys.stderr)
-            present_youtube(d, url)
-            return
     elif args.method:
         d, used_method = fetch_for_method(url, args.method)
     else:
-        # Auto-cascade: native-md → native-page → googlebot → wayback → archive-is
-        d, used_method = {}, None
-
-        # 1. native-md: the page's own .md source (docs platforms, Obsidian Publish)
-        candidate = fetch_direct_md(url)
-        if candidate and candidate.get('wordCount', 0) > MIN_WORDS:
-            d, used_method = candidate, 'native-md'
-
-        # 2. native-page: defuddle parse
-        if not used_method:
-            candidate = fetch_defuddle(url)
-            # Scholarly pages (repositories, preprint servers, ...): continue as the paper or its PDF
-            target = academic_target(candidate.get('metaTags'), url) if ENABLE_PAPER else None
-            if target and target != url:
-                kind = 'DOI ' + target.split('doi.org/', 1)[1] if 'doi.org/' in target else 'its PDF'
-                print(f'Scholarly page detected — using {kind}...', file=sys.stderr)
-                return main([target if a == raw_url else a for a in argv])
-            if candidate.get('wordCount', 0) > MIN_WORDS:
-                d, used_method = candidate, 'native-page'
-
-        # 3. googlebot: Googlebot UA + script-strip
-        if not used_method:
-            candidate = fetch_googlebot(url)
-            if candidate and candidate.get('wordCount', 0) > MIN_WORDS:
-                candidate = dict(candidate)
-                candidate['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
-                d, used_method = candidate, 'googlebot'
-
-        # 4. Archive fallbacks
-        if not used_method:
-            for get_archive_url, method_name in [
-                (wayback_snapshot,    'wayback'),
-                (archive_is_snapshot, 'archive-is'),
-                (archive_is_save,     'archive-is'),
-            ]:
-                archive_url = get_archive_url(url)
-                if archive_url:
-                    if method_name == 'wayback':
-                        candidate = fetch_html_as_markdown(archive_url, original_url=url) or {}
-                    else:
-                        candidate = fetch_defuddle(archive_url)
-                        if candidate.get('wordCount', 0) > MIN_WORDS and 'archive.is/' in archive_url:
-                            candidate = clean_archive_content(candidate, url)
-                    if candidate.get('wordCount', 0) > MIN_WORDS:
-                        d, used_method = _with_archive(candidate, archive_url), method_name
-                        break
-
-            if not used_method:
-                print(
-                    f'Page appears JS-rendered and no archive snapshot could be retrieved.\n'
-                    f'Please visit this URL, save the page, and solve the captcha:\n'
-                    f'https://archive.is/?url={quote(url, safe=":/?")}',
-                    file=sys.stderr
-                )
-
-    # Present mode (no --project and no --category): output raw content
-    if args.project is None and args.category is None:
-        if args.download:
-            print('--download only works when saving (--project/--category) — skipped.', file=sys.stderr)
-        print(d.get('content', ''), end='')
-        return
-
-    # Don't save an empty note
-    if d.get('wordCount', 0) <= MIN_WORDS and not (ENABLE_YOUTUBE and is_youtube(url)):
-        print('No content retrieved — skipping save.', file=sys.stderr)
-        return
-
-    # Save mode: build note, write to vault
-    if ENABLE_YOUTUBE and is_youtube(url):
-        note = build_youtube(d, url, args.project, args.created)
-    else:
-        note = build_article(d, url, args.project, args.created, method=used_method)
-
-    title = d.get('title', '') or title_from_content(d.get('content', ''))
-    filename = args.filename or generate_filename(title)
-
-    vault   = get_vault_path()
-    subdir  = 'transcripts' if is_youtube(url) else 'docs'
-    save_dir = get_save_dir(vault, args.category, args.project, subdir)
-    os.makedirs(save_dir, exist_ok=True)
-    if ENABLE_IMAGES:
-        note = download_images(note, save_dir, filename, source_url=url)
-    if args.download and ENABLE_YOUTUBE and is_youtube(url):
-        local = download_youtube(url, save_dir, filename, args.video_quality, args.audio_quality)
-        if local:
-            # Swap the YouTube embed for the local file; the URL stays in the frontmatter
-            note = re.sub(r'^!\[\]\(https://youtu\.be/[^)]+\)$', f'![]({local})', note, count=1, flags=re.M)
-        else:
-            print('WARNING: download failed after 2 attempts — nothing saved locally; '
-                  'the note keeps the YouTube embed.', file=sys.stderr)
-    note = _dedup_note_tags(note)
-    out_path = os.path.join(save_dir, f'{filename}.md')
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(note)
-    print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
-
+        d, used_method, target = fetch_article(url)
+        if target:
+            kind = 'DOI ' + target.split('doi.org/', 1)[1] if 'doi.org/' in target else 'its PDF'
+            print(f'Scholarly page detected — using {kind}...', file=sys.stderr)
+            return main([target if a == raw_url else a for a in argv])
+    save_web(url, args, d, used_method)
 
 if __name__ == '__main__':
     main()
