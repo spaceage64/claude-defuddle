@@ -97,7 +97,9 @@ MARKER_PRECISE = False
 # ║    'gemini' — Google Gemini API. Add to ~/.claude/CLAUDE.md:                 ║
 # ║               **Gemini**: `your-api-key`                                     ║
 # ║               Free key: https://aistudio.google.com/apikey                   ║
-# ║               Models: gemini-2.0-flash | gemini-2.5-flash | gemini-2.5-pro   ║
+# ║               '-latest' aliases always point at Google's newest model:       ║
+# ║               gemini-flash-lite-latest | gemini-flash-latest |               ║
+# ║               gemini-pro-latest                                              ║
 # ║    'openai' — Any OpenAI-compatible API. Add to ~/.claude/CLAUDE.md:         ║
 # ║               **OpenAI**: `your-api-key`                                     ║
 # ║               Set AI_BASE_URL for non-OpenAI endpoints, e.g.:                ║
@@ -107,8 +109,10 @@ MARKER_PRECISE = False
 # ║               Leave AI_BASE_URL = '' for standard OpenAI.                    ║
 # ║    'ollama' — Local Ollama server (no key needed). https://ollama.com        ║
 # ║               Set AI_MODEL to any pulled model, e.g. llama3.2                ║
+# ║  AI_MODEL can be a list: the next model is tried when one is overloaded      ║
+# ║  or rate-limited (HTTP 429/5xx, timeout), before falling back to Claude.     ║
 AI_LLM      = 'gemini'
-AI_MODEL    = 'gemini-3.1-flash-lite'
+AI_MODEL    = ['gemini-flash-lite-latest', 'gemini-flash-latest']
 AI_BASE_URL = ''
 # ║                                                                              ║
 # ║  Claude fallback model (used when AI provider fails or has no key).          ║
@@ -591,14 +595,47 @@ def download_youtube(url, save_dir, filename_base, video_quality=None, audio_qua
     return f'{sub}/{name}.{ext}'
 
 
+def ai_request(prompt, timeout=60):
+    """Send a prompt to the provider configured by AI_LLM / AI_MODEL and return the reply text.
+    With a list of models, an overloaded or rate-limited one (HTTP 429/5xx, timeout) passes to the
+    next. Raises when all fail; callers then fall back to the Claude CLI."""
+    import urllib.request as _urlreq, urllib.error as _urlerr
+    models = [AI_MODEL] if isinstance(AI_MODEL, str) else list(AI_MODEL)
+    for i, model in enumerate(models):
+        if AI_LLM == 'gemini':
+            url  = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}'
+            body = {'contents': [{'parts': [{'text': prompt}]}]}
+            headers, pick = {}, lambda d: d['candidates'][0]['content']['parts'][0]['text']
+        elif AI_LLM == 'openai':
+            url  = (AI_BASE_URL.rstrip('/') + '/chat/completions') if AI_BASE_URL else 'https://api.openai.com/v1/chat/completions'
+            body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}]}
+            headers, pick = {'Authorization': f'Bearer {AI_API_KEY}'}, lambda d: d['choices'][0]['message']['content']
+        elif AI_LLM == 'ollama':
+            url  = 'http://localhost:11434/api/generate'
+            body = {'model': model, 'prompt': prompt, 'stream': False}
+            headers, pick = {}, lambda d: d['response']
+        else:
+            raise ValueError(f'Unsupported AI_LLM: {AI_LLM!r}')
+        req = _urlreq.Request(url, data=json.dumps(body).encode(),
+                              headers={'Content-Type': 'application/json', **headers})
+        try:
+            # An overloaded model can hang instead of answering 503: don't wait long when another follows
+            with _urlreq.urlopen(req, timeout=timeout if i == len(models) - 1 else min(timeout, 20)) as r:
+                return pick(json.loads(r.read()))
+        except (_urlerr.HTTPError, TimeoutError, _urlerr.URLError) as e:
+            busy = isinstance(e, TimeoutError) or getattr(e, 'code', 0) in (429, 500, 502, 503, 504) \
+                   or isinstance(getattr(e, 'reason', None), TimeoutError)
+            if not busy or i == len(models) - 1:
+                raise
+            print(f'{model} unavailable ({e}) — trying {models[i + 1]}...', file=sys.stderr)
+
+
 def ai_enrich(title, author, content, needs_chapters=False):
     """Call an AI model for description, summary, tags, and optionally chapters.
 
     Uses the provider configured by AI_LLM / AI_MODEL via direct API call.
     Falls back to the Claude CLI (always available in Claude Code) if the call fails.
     """
-    import urllib.request as _urlreq
-
     if not content or len(content.split()) < MIN_WORDS:
         return '', '', [], []
 
@@ -636,40 +673,10 @@ Content:
             data.get('chapters', [])
         )
 
-    def _api_call():
-        """Direct API call to the configured AI provider. Returns raw response text."""
-        body: bytes
-        req: _urlreq.Request
-        if AI_LLM == 'gemini':
-            url  = f'https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent?key={AI_API_KEY}'
-            body = json.dumps({'contents': [{'parts': [{'text': prompt}]}]}).encode()
-            req  = _urlreq.Request(url, data=body, headers={'Content-Type': 'application/json'})
-            with _urlreq.urlopen(req, timeout=120) as r:
-                data = json.loads(r.read())
-            return data['candidates'][0]['content']['parts'][0]['text']
-        if AI_LLM == 'openai':
-            url  = (AI_BASE_URL.rstrip('/') + '/chat/completions') if AI_BASE_URL else 'https://api.openai.com/v1/chat/completions'
-            body = json.dumps({'model': AI_MODEL, 'messages': [{'role': 'user', 'content': prompt}]}).encode()
-            req  = _urlreq.Request(url, data=body, headers={
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {AI_API_KEY}',
-            })
-            with _urlreq.urlopen(req, timeout=120) as r:
-                data = json.loads(r.read())
-            return data['choices'][0]['message']['content']
-        if AI_LLM == 'ollama':
-            url  = 'http://localhost:11434/api/generate'
-            body = json.dumps({'model': AI_MODEL, 'prompt': prompt, 'stream': False}).encode()
-            req  = _urlreq.Request(url, data=body, headers={'Content-Type': 'application/json'})
-            with _urlreq.urlopen(req, timeout=120) as r:
-                data = json.loads(r.read())
-            return data['response']
-        raise ValueError(f'Unsupported AI_LLM: {AI_LLM!r}')
-
     # Try configured provider via direct API call
     if AI_API_KEY or AI_LLM == 'ollama':
         try:
-            return _parse(_api_call())
+            return _parse(ai_request(prompt))
         except Exception as e:
             print(f'{AI_LLM} enrichment failed ({e}) — falling back to Claude...', file=sys.stderr)
 
@@ -3703,7 +3710,6 @@ def _slug(text):
 def generate_filename(title, max_words=None):
     """Generate a kebab-case filename from a title using the configured AI provider.
     Falls back to filtering title words by length if the AI call fails."""
-    import urllib.request as _urlreq
     n = max_words or FILENAME_WORDS
     ai_prompt = f'Give me a 1 to {n} word kebab-case filename (no extension) for an article titled "{title}". Drop apostrophes instead of hyphenating them (O\'Hara -> ohara). Return ONLY the filename, nothing else.'
 
@@ -3713,31 +3719,7 @@ def generate_filename(title, max_words=None):
 
     if title and (AI_API_KEY or AI_LLM == 'ollama'):
         try:
-            if AI_LLM == 'gemini':
-                url  = f'https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent?key={AI_API_KEY}'
-                body = json.dumps({'contents': [{'parts': [{'text': ai_prompt}]}]}).encode()
-                req  = _urlreq.Request(url, data=body, headers={'Content-Type': 'application/json'})
-                with _urlreq.urlopen(req, timeout=30) as r:
-                    data = json.loads(r.read())
-                raw = data['candidates'][0]['content']['parts'][0]['text']
-            elif AI_LLM == 'openai':
-                url  = (AI_BASE_URL.rstrip('/') + '/chat/completions') if AI_BASE_URL else 'https://api.openai.com/v1/chat/completions'
-                body = json.dumps({'model': AI_MODEL, 'messages': [{'role': 'user', 'content': ai_prompt}]}).encode()
-                req  = _urlreq.Request(url, data=body, headers={
-                    'Content-Type': 'application/json', 'Authorization': f'Bearer {AI_API_KEY}'})
-                with _urlreq.urlopen(req, timeout=30) as r:
-                    data = json.loads(r.read())
-                raw = data['choices'][0]['message']['content']
-            elif AI_LLM == 'ollama':
-                url  = 'http://localhost:11434/api/generate'
-                body = json.dumps({'model': AI_MODEL, 'prompt': ai_prompt, 'stream': False}).encode()
-                req  = _urlreq.Request(url, data=body, headers={'Content-Type': 'application/json'})
-                with _urlreq.urlopen(req, timeout=30) as r:
-                    data = json.loads(r.read())
-                raw = data['response']
-            else:
-                raw = ''
-            name = _clean(raw)
+            name = _clean(ai_request(ai_prompt, timeout=30))
             if name:
                 return name
         except Exception:
@@ -3747,7 +3729,8 @@ def generate_filename(title, max_words=None):
     if title and shutil.which('claude'):
         try:
             result = subprocess.run(
-                ['claude', '-p', ai_prompt, '--output-format', 'text'],
+                ['claude', '-p', ai_prompt, '--output-format', 'text']
+                + (['--model', AI_FALLBACK_MODEL] if AI_FALLBACK_MODEL else []),
                 capture_output=True, text=True, timeout=30
             )
             name = _clean(result.stdout)
