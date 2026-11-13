@@ -4363,10 +4363,10 @@ def generate_filename(title, max_words=None):
     return '-'.join(w.lower() for w in words[:3]) if words else 'untitled'
 
 
-def fetch_defuddle(url):
+def fetch_defuddle(url, user_agent=None):
     """Fetch a URL via defuddle CLI and return parsed JSON dict, or {} on failure."""
     result = subprocess.run(
-        ['defuddle', 'parse', url, '--json', '--md'],
+        ['defuddle', 'parse', url, '--json', '--md', *(['--user-agent', user_agent] if user_agent else [])],
         capture_output=True, text=True, timeout=60
     )
     try:
@@ -4830,14 +4830,45 @@ def resolve_wikilink_images(content, url):
         return content
 
 
+def parse_fallback(fetch_url, url, user_agent=None):
+    """A fallback copy of url (fetched as Googlebot, or an archive snapshot) parsed like a normal
+    web page, so only the real content is kept; the script-strip conversion only when the parser
+    finds nothing usable. Links into the Wayback Machine point to the live page again; archived
+    images keep their snapshot URL (the original may be gone)."""
+    d = fetch_defuddle(fetch_url, user_agent)
+    if not usable(d):
+        d = fetch_html_as_markdown(fetch_url, original_url=url, user_agent=user_agent) or {}
+    if not d:
+        return {}
+    d = dict(d)
+    content = re.sub(r'(!\[[^\]]*\]\()?' + _WAYBACK_PREFIX.pattern,
+                     lambda m: m.group(0) if m.group(1) else '', d.get('content') or '')
+    d['content'], d['wordCount'] = content, len(content.split())
+    if not d.get('site') or 'archive' in d['site'].lower():
+        d['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
+    return d
+
+
 def fetch_google(url):
-    """Fetch page as Google UA, strip scripts, convert to markdown."""
-    d = fetch_html_as_markdown(url, user_agent='Googlebot/2.1 (+http://www.google.com/bot.html)')
+    """Fetch page as Googlebot (some sites serve it the full page) and parse it."""
+    d = parse_fallback(url, url, GOOGLEBOT_UA)
     if d:
-        d = dict(d)
         d['content'] = resolve_wikilink_images(d['content'], url)
         d['wordCount'] = len(d['content'].split())
     return d
+
+
+def fetch_wayback(url, archive_url):
+    """A Wayback snapshot parsed like the live page. The id_ form serves the page's original HTML
+    without the Wayback toolbar (date picker etc.), so nothing of the archive is left to strip."""
+    return parse_fallback(re.sub(r'(/web/\d+)[a-z_]*/', r'\1id_/', archive_url, count=1), url)
+
+
+def fetch_archive_is(url, archive_url):
+    """An archive.is snapshot parsed like the live page; archive.is has no plain-HTML form, so its
+    header and scroll footer are removed from the parsed content."""
+    d = fetch_defuddle(archive_url)
+    return clean_archive_content(d, url) if d.get('wordCount', 0) > MIN_WORDS else d
 
 
 _TABLE_SEP = re.compile(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$')
@@ -5017,11 +5048,7 @@ def fetch_for_method(url, method):
     elif method == 'native-page':
         return fetch_defuddle(url), 'native-page'
     elif method == 'google':
-        candidate = fetch_google(url)
-        if candidate:
-            candidate = dict(candidate)
-            candidate['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
-        return candidate or {}, 'google'
+        return fetch_google(url), 'google'
     elif method == 'wayback':
         archive_url = wayback_snapshot(url)
         if not archive_url:
@@ -5032,16 +5059,13 @@ def fetch_for_method(url, method):
                 file=sys.stderr
             )
             return {}, 'wayback'
-        return _with_archive(fetch_html_as_markdown(archive_url, original_url=url), archive_url), 'wayback'
+        return _with_archive(fetch_wayback(url, archive_url), archive_url), 'wayback'
     elif method == 'archive-is':
         archive_url = archive_is_snapshot(url)
         if not archive_url:
             archive_url = archive_is_save(url)
         if archive_url:
-            d = fetch_defuddle(archive_url)
-            if d:
-                d = clean_archive_content(d, url)
-            return _with_archive(d, archive_url), 'archive-is'
+            return _with_archive(fetch_archive_is(url, archive_url), archive_url), 'archive-is'
         print(
             f'archive.is requires a captcha for this URL.\n'
             f'Please visit this URL, save the page, and solve the captcha:\n'
@@ -6120,6 +6144,9 @@ def save_podcast(url, args):
     save_note(note, args, 'transcripts', filename, source_url=url)
 
 
+GOOGLEBOT_UA = 'Googlebot/2.1 (+http://www.google.com/bot.html)'
+_WAYBACK_PREFIX = re.compile(r'https?://web\.archive\.org/web/\d+(?:[a-z]{2}_)?/')
+
 _ERROR_TITLE = re.compile(
     r"^\s*(?:error\s*)?404\b|\b404\s*(?:error|not found)|\berror\s*404\b|^\s*not found\b|\bno longer available\b|"
     r"\b(?:page|file|document)\s+(?:not found|not available|unavailable|(?:does not|doesn['’]t) exist|"
@@ -6194,27 +6221,20 @@ def fetch_article(url):
     if usable(candidate):
         return candidate, 'native-page', None
 
-    # 3. google: Google UA + script-strip
+    # 3. google: fetched as Googlebot, parsed like a normal page
     candidate = fetch_google(url)
     if usable(candidate):
-        candidate = dict(candidate)
-        candidate['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
         return candidate, 'google', None
 
-    # 4. Archive fallbacks
-    for get_archive_url, method_name in [
-        (wayback_snapshot,    'wayback'),
-        (archive_is_snapshot, 'archive-is'),
-        (archive_is_save,     'archive-is'),
+    # 4. Archive fallbacks: the archived page, parsed like a normal page
+    for get_archive_url, fetch, method_name in [
+        (wayback_snapshot,    fetch_wayback,    'wayback'),
+        (archive_is_snapshot, fetch_archive_is, 'archive-is'),
+        (archive_is_save,     fetch_archive_is, 'archive-is'),
     ]:
         archive_url = get_archive_url(url)
         if archive_url:
-            if method_name == 'wayback':
-                candidate = fetch_html_as_markdown(archive_url, original_url=url) or {}
-            else:
-                candidate = fetch_defuddle(archive_url)
-                if candidate.get('wordCount', 0) > MIN_WORDS and 'archive.is/' in archive_url:
-                    candidate = clean_archive_content(candidate, url)
+            candidate = fetch(url, archive_url)
             if usable(candidate):
                 return _with_archive(candidate, archive_url), method_name, None
 
