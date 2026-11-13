@@ -6126,10 +6126,54 @@ _ERROR_TITLE = re.compile(
     r"(?:could not|cannot|can['’]t) be found|(?:has been|was) (?:moved|removed|retired|deleted))", re.I)
 
 
+# Block pages (bot or IP refused, fake Googlebot detected); only looked for at the top of short pages
+_BLOCKED_PAGE = re.compile('|'.join([
+    r'\baccess\b.{0,60}\b(?:denied|blocked|refused)\b',                  # English
+    r'\b(?:you|your (?:ip|request|access))\b.{0,30}\b(?:been|was|is) blocked\b',
+    r'\b403\b.{0,20}\bforbidden\b',
+    r'\buser.?agent\b.{0,80}\bgooglebot\b',
+    r'\btoegang\b.{0,80}\b(?:geweigerd|geblokkeerd)\b',                 # Dutch
+    r'\bzugriff\b.{0,80}\b(?:verweigert|gesperrt|blockiert)\b',         # German
+    r'\bacc[eè]s\b.{0,60}\b(?:refus[ée]|interdit|bloqu[ée])\b',         # French
+    r'\bacceso\b.{0,60}\b(?:denegado|bloqueado|prohibido)\b',           # Spanish
+    r'\baccesso\b.{0,60}\b(?:negato|bloccato|vietato)\b',               # Italian
+    r'\bacesso\b.{0,60}\b(?:negado|bloqueado|proibido)\b',              # Portuguese
+    r'\b(?:åtkomst|adgang|tilgang)\b.{0,60}\b(?:nekad|nægtet|nektet|blockerad|blokeret|blokkert)\b',  # Scandinavian
+    r'\bdost[eę]p\b.{0,60}\b(?:zabroniony|zablokowany|odmówiony)\b|\bodmowa dost[eę]pu\b',  # Polish
+    r'\berişim\b.{0,60}\b(?:engellendi|reddedildi)\b',                  # Turkish
+    r'\bдоступ\b.{0,60}\b(?:запрещ[её]н|заблокирован|ограничен)',       # Russian
+    r'גישה.{0,60}(?:נחסמה|נדחתה|נחסם|אסורה|חסומה)',                      # Hebrew
+    r'الوصول.{0,30}(?:مرفوض|محظور)|رفض الوصول|تم حظر',                   # Arabic
+    r'アクセス.{0,20}(?:拒否|制限|禁止)',                                   # Japanese
+    r'(?:访问|訪問|存取).{0,10}(?:拒绝|拒絕|禁止|被封)|(?:拒绝|拒絕|禁止)(?:访问|訪問|存取)',  # Chinese
+    r'(?:접근|액세스).{0,10}(?:거부|차단)',                                   # Korean
+    r'\bдоступ\w*.{0,60}(?:заборонено|заблоковано|відмовлено)',          # Ukrainian
+    r'άρνηση πρόσβασης|πρόσβαση.{0,40}(?:απορρίφθηκε|απαγορεύεται|αποκλείστηκε)',  # Greek
+    r'\bp[řr][íi]stup\b.{0,40}\b(?:odepřen|zablokován|zakázán|zamietnutý|odmietnutý|zablokovaný)\b',  # Czech, Slovak
+    r'\bacces(?:ul)?\b.{0,40}\b(?:interzis|refuzat|blocat)\b',           # Romanian
+    r'\bhozzáférés\b.{0,40}\b(?:megtagadva|letiltva)\b',                 # Hungarian
+    r'\b(?:pääsy|käyttö)\b.{0,40}\b(?:estetty|evätty|kielletty)\b',      # Finnish
+    r'\bakses\b.{0,40}\b(?:ditolak|diblokir|disekat|dinafikan)\b',       # Indonesian, Malay
+    r'\btinanggihan ang (?:pag-)?access\b',                              # Tagalog
+    r'\bufikiaji\b.{0,40}\b(?:umekataliwa|umezuiwa|umekatazwa)\b',       # Swahili
+    r'truy cập.{0,30}(?:bị từ chối|bị chặn)',                            # Vietnamese
+    r'เข้าถึง.{0,20}(?:ปฏิเสธ|ถูกบล็อก)|ปฏิเสธการเข้าถึง',                       # Thai
+    r'(?:पहुँच|पहुंच|एक्सेस|प्रवेश).{0,20}(?:अस्वीकृत|अस्वीकार|निषेध|अवरुद्ध)',            # Hindi
+    r'(?:অ্যাক্সেস|প্রবেশ).{0,20}(?:অস্বীকৃত|অস্বীকার|নিষিদ্ধ|অবরুদ্ধ)',                 # Bengali
+    r'رسائی.{0,20}(?:انکار|ممنوع|مسدود)',                                  # Urdu
+    r'دسترسی.{0,20}(?:رد شد|ممنوع|مسدود)',                                 # Persian
+]), re.I | re.S)
+BLOCKED_PAGE_WORDS = 600
+
+
 def usable(d):
-    """A fetch result worth keeping: enough words, and not an error page served with a normal
-    status (title "Page Not Found", "Page Not Available", ...), which the next method may get past."""
-    return bool(d) and d.get('wordCount', 0) > MIN_WORDS and not _ERROR_TITLE.search(d.get('title') or '')
+    """A fetch result worth keeping: enough words, not an error page served with a normal status
+    (title "Page Not Found", "Page Not Available", ...) and not a short block page ("access denied",
+    fake Googlebot refused), which the next method may get past."""
+    if not d or d.get('wordCount', 0) <= MIN_WORDS or _ERROR_TITLE.search(d.get('title') or ''):
+        return False
+    head = (d.get('title') or '') + '\n' + (d.get('content') or '')[:1500]
+    return not (d.get('wordCount', 0) < BLOCKED_PAGE_WORDS and _BLOCKED_PAGE.search(head))
 
 
 def fetch_article(url):
@@ -6175,7 +6219,7 @@ def fetch_article(url):
                 return _with_archive(candidate, archive_url), method_name, None
 
     print(
-        f'No usable copy found: the page appears JS-rendered or shows an error page, and no archive\n'
+        f'No usable copy found: the page appears JS-rendered or shows an error or block page, and no archive\n'
         f'snapshot could be retrieved.\n'
         f'Please visit this URL, save the page, and solve the captcha:\n'
         f'https://archive.is/?url={quote(url, safe=":/?")}',
