@@ -804,10 +804,32 @@ def _heading_display(title):
     return s
 
 
+_SUP_SYMBOLS = {'TM': '™', 'tm': '™', '™': '™', 'R': '®', '®': '®', 'SM': '℠', 'sm': '℠',
+                '2122': '™', '00ae': '®', '00AE': '®', '2120': '℠'}   # also as Unicode codes (broken pages)
+_SUPERSCRIPT = str.maketrans('0123456789+-=()n', '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ')
+
+
+def sup_symbols(text):
+    """<sup>TM</sup> → ™, <sup>R</sup> → ®, <sup>SM</sup> → ℠ (marker writes superscripts as HTML)."""
+    return re.sub(r'<sup>\s*(' + '|'.join(_SUP_SYMBOLS) + r')\s*</sup>', lambda m: _SUP_SYMBOLS[m.group(1)], text)
+
+
+def clean_heading_text(text):
+    """A title or heading as plain text for links and frontmatter: ™/®/℠ as symbols, a footnote marker at
+    the end removed (…returns<sup>1</sup>), other superscripts as Unicode (R<sup>2</sup> → R²) or plain
+    text, '|' as ' / ' (it breaks [[#heading]] links), no trailing spaces."""
+    text = sup_symbols(text)
+    text = re.sub(r'\s*<sup>[^<]{1,4}</sup>\s*$', '', text)
+    text = re.sub(r'<sup>([^<]*)</sup>',
+                  lambda m: m.group(1).translate(_SUPERSCRIPT) if re.fullmatch(r'[0-9+\-=()n]+', m.group(1))
+                  else m.group(1), text)
+    text = re.sub(r'</?(?:sub|sup|em|strong|i|b|span)\b[^>]*>', '', text)
+    return re.sub(r'\s*\|\s*', ' / ', text).rstrip()
+
+
 def link_safe_headings(content):
-    """Headings that links can point to: '|' breaks a link ([[#A | B]] means target 'A ', shown as 'B'),
-    so it becomes ' / ', and trailing spaces (never intended) are removed."""
-    return re.sub(r'^(#{1,6} .*)$', lambda m: re.sub(r'\s*\|\s*', ' / ', m.group(1)).rstrip(), content, flags=re.M)
+    """Headings that links can point to, cleaned by clean_heading_text()."""
+    return re.sub(r'^(#{1,6} )(.*)$', lambda m: m.group(1) + clean_heading_text(m.group(2)), content, flags=re.M)
 
 
 def build_index(content, min_level=2):
@@ -2734,6 +2756,7 @@ def _clean_pdf_markdown(md, images):
     """Tidy marker/Datalab output for Obsidian: remove page anchors and links, descriptions without
     an image, and figures detected twice; split image descriptions that wrap other images; warn
     about display equations that won't render."""
+    md = sup_symbols(md)
     # The AI step sometimes wraps one panel's image inside another's description:
     # ![Description 1: ![](a.jpeg) | Description 2: caption](b.jpeg) -> both images
     md = re.sub(r'!\[Description \d+: (!\[[^\]]*\]\([^)\s]+\)).*?\]\(([^)\s]+\.(?:jpe?g|png|gif|webp))\)',
@@ -3523,7 +3546,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     )
     gemini_context = abstract_m.group(1).strip() if abstract_m else ' '.join(content.split()[:800])
 
-    title   = meta.get('title', '')
+    title   = clean_heading_text(meta.get('title', ''))
     authors = meta.get('authors', [])
     ai_desc, _, ai_tags, _ = ai_enrich(title, ', '.join(authors[:3]), gemini_context)
 
@@ -3586,7 +3609,7 @@ def title_from_content(content):
 
 
 def build_article(d, url, project, created, method=None):
-    title     = strip_title_suffix(d.get('title', '') or title_from_content(d.get('content', '')))
+    title     = clean_heading_text(strip_title_suffix(d.get('title', '') or title_from_content(d.get('content', ''))))
     author    = d.get('author', '')
     published = (d.get('published') or '')[:10]
     site      = d.get('site', '')
@@ -3701,6 +3724,7 @@ def build_pdf(url, project, created, skip_doi=False):
         content = content[title_match.end():].lstrip('\n')
     else:
         title = pdf_title or re.sub(r'[-_]+', ' ', os.path.splitext(pdf_name)[0]).strip()
+    title = clean_heading_text(title)
 
     words = len(content.split())
     ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, '', content)
