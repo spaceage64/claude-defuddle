@@ -8,7 +8,7 @@ Usage:
         --url "<url>" --project "<project>" --created "YYYY-MM-DD"
 """
 
-import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64
+import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64, difflib
 from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -836,20 +836,25 @@ def build_index(content, min_level=2):
     """Build a nested index from markdown headings: each heading sits one step (2 spaces) below the
     nearest heading above it with a lower level. Steps of one keep it a nested list; a bigger jump
     (e.g. ## straight to ####) would render as a code block in CommonMark/Obsidian."""
-    headings = re.findall(r'^(#{' + str(min_level) + r',6})\s+(.+)$', content, re.MULTILINE)
+    # Outside code blocks: '# comment' lines in code are not headings
+    prose = re.sub(r'^(```|~~~).*?^\1[^\n]*$', '', content, flags=re.MULTILINE | re.DOTALL)
+    headings = re.findall(r'^(#{' + str(min_level) + r',6})\s+(.+)$', prose, re.MULTILINE)
     if not headings:
         return None
-    lines, parents = [], []   # levels of the headings the current one is nested in
+    repeated = {t for t in (t for _, t in headings) if sum(1 for _, x in headings if x == t) > 1}
+    lines, parents = [], []   # (level, title) of the headings the current one is nested in
     for hashes, title in headings:
-        while parents and parents[-1] >= len(hashes):
+        while parents and parents[-1][0] >= len(hashes):
             parents.pop()
         indent = '  ' * len(parents)
-        parents.append(len(hashes))
+        # A repeated title ('Exercises' in every chapter) links through its parent: [[#2 Data#Exercises]]
+        path = f'{parents[-1][1]}#{title}' if title in repeated and parents else title
+        parents.append((len(hashes), title))
         display = _heading_display(title)
-        if display != title:
-            lines.append(f'{indent}- [[#{title}|{display}]]')
+        if display != path:
+            lines.append(f'{indent}- [[#{path}|{display}]]')
         else:
-            lines.append(f'{indent}- [[#{title}]]')
+            lines.append(f'{indent}- [[#{path}]]')
     return '\n'.join(lines)
 
 
@@ -2432,11 +2437,19 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
 def pdf_to_markdown(pdf_path):
     """Convert a PDF to markdown + images dict via PDF_PROCESSOR setting.
     A copy fixed by _prepare_pdf() is converted when the PDF needs it; checks use the original.
+    With --pages (PAGE_RANGE) only those pages are converted and checked.
 
     Returns (markdown_str, images_dict, method_name).
     """
     with tempfile.TemporaryDirectory() as tmp:
-        return _pdf_to_markdown(pdf_path, _prepare_pdf(pdf_path, os.path.join(tmp, 'prepared.pdf')))
+        prepared = _prepare_pdf(pdf_path, os.path.join(tmp, 'prepared.pdf'), PAGE_RANGE)
+        if PAGE_RANGE:
+            if prepared == pdf_path:
+                print(f'Could not select pages {PAGE_RANGE} (uv missing?) — converting the whole PDF', file=sys.stderr)
+            else:
+                print(f'Converting pages {PAGE_RANGE} only', file=sys.stderr)
+                return _pdf_to_markdown(prepared, prepared)      # checks against those pages, too
+        return _pdf_to_markdown(pdf_path, prepared)
 
 
 def _pdf_to_markdown(pdf_path, convert_path):
@@ -2561,6 +2574,25 @@ def _pdf_to_markdown(pdf_path, convert_path):
     if missing:
         print(f'WARNING: equation{"s" if len(missing) > 1 else ""} {_number_ranges(missing)} from the PDF '
               'missing in the note (part of the text may be lost there); check it against the PDF.', file=sys.stderr)
+    markdown, corrected = correct_code_from_pdf(markdown, pdf_path)
+    if corrected:
+        print(f'Corrected {corrected} code line{"s" if corrected > 1 else ""} OCR misread (l/1, O/0, quotes), '
+              'from the PDF text', file=sys.stderr)
+    markdown, repaired = repair_split_code(markdown, pdf_path)
+    markdown, restored = restore_listings(markdown, pdf_path)
+    if restored:                                  # restored listings can leave a split next to them
+        markdown, more = repair_split_code(markdown, pdf_path)
+        repaired += more
+    if restored:
+        print(f'Restored {restored} code listing{"s" if restored > 1 else ""} the conversion lost or broke, from the PDF',
+              file=sys.stderr)
+    if repaired:
+        print(f'Rebuilt {repaired} code listing{"s" if repaired > 1 else ""} split at a docstring, from the PDF', file=sys.stderr)
+    offset = int(PAGE_RANGE.split('-')[0]) - 1 if PAGE_RANGE else 0      # pages of the whole PDF
+    for first, last in missing_pages(pdf_path, markdown):
+        print(f'WARNING: PDF pages {first + offset}–{last + offset} seem to be missing from the note (the '
+              f'conversion may have stopped or skipped them); convert just those with --pages '
+              f'{first + offset}-{last + offset} and merge them in.', file=sys.stderr)
     missing = _missing_appendices(pdf_path, markdown)
     if missing:
         print(f'WARNING: {", ".join(missing)} from the PDF missing in the note (no heading for '
@@ -2635,6 +2667,9 @@ def _run_marker(cmd, timeout=4 * 3600):
 
 # A converted PDF normally has 85–125% of the words in the PDF's own text layer; much less
 # means part of it was lost (e.g. a conversion that stopped partway through)
+PAGE_RANGE = None   # --pages, e.g. '305-393': convert only these pages of a PDF
+AS_TYPE = None      # --as doc/paper/book: the type a PDF is saved as, instead of detecting it
+
 INCOMPLETE_RATIO = 0.7
 EMPTY_RATIO      = 0.05   # less than this is a failed conversion: no note is saved
 
@@ -2733,6 +2768,20 @@ def _thumbnail_pixels(data):
     return bmp[int.from_bytes(bmp[10:14], 'little'):]
 
 
+def _is_blank_image(path):
+    """True for an image of one flat colour (a blank page a converter saved as a figure)."""
+    try:
+        with open(path, 'rb') as f:
+            pixels = _thumbnail_pixels(f.read())
+    except OSError:
+        return False
+    if not pixels or len(pixels) < 64 * 64 * 3:
+        return False
+    step = len(pixels) // (64 * 64)              # 3 (BGR) or 4 (BGRA) bytes per pixel
+    colour = [v for i in range(0, 64 * 64 * step, step) for v in pixels[i:i + 3]]
+    return max(colour) - min(colour) < 8
+
+
 def _drop_duplicate_images(md, images):
     """Remove an image that directly follows a nearly identical one: PDF converters sometimes detect
     one figure twice, with slightly different crops. A figure repeated later on is left alone."""
@@ -2752,11 +2801,439 @@ def _drop_duplicate_images(md, images):
     return ''.join(out) + md[pos:]
 
 
+def missing_pages(pdf_path, md, min_run=5):
+    """Runs of at least min_run consecutive PDF pages whose text is nowhere in the note (e.g. a conversion
+    that stopped partway): a page counts as missing when under 10% of its 4-word runs are in the note.
+    Returns [(first, last)] (1-based); pages without a text layer don't count as missing."""
+    # Both sides as their words of 4+ letters: formulas and short words differ most between PDF and note
+    words_of = lambda t: [w for w in re.sub(r'[^a-z]+', ' ', unicodedata.normalize('NFKD', t).lower()).split()
+                          if len(w) > 3]
+    note = ' ' + ' '.join(words_of(md)) + ' '
+    pages = subprocess.run(['pdftotext', pdf_path, '-'], capture_output=True, text=True, timeout=300).stdout.split('\f')
+    runs, start = [], None
+    for i, text in enumerate(pages, 1):
+        words = words_of(text)
+        if len(words) < 40:                     # blank, scanned, formula or nearly empty page: no evidence
+            missing = start is not None
+        else:                                   # a page that made it in has many of its 4-word runs in the
+            chunks = [' '.join(words[j:j + 4]) for j in range(0, len(words) - 4, 4)]   # note, a lost one ~none
+            missing = sum(f' {c} ' in note for c in chunks) < 0.1 * len(chunks)
+        if missing and start is None:
+            start = i
+        elif not missing and start is not None:
+            if i - start >= min_run:
+                runs.append((start, i - 1))
+            start = None
+    if start is not None and len(pages) - start + 1 >= min_run:
+        runs.append((start, len(pages)))
+    return runs
+
+
+_QUOTE_DEBRIS = re.compile(r"^\s*['’‘\"]{1,3}(?:\s+['’‘\"]{1,3})?\s*,?\s*$")
+
+
+_CONFUSABLE = str.maketrans({'l': '1', 'I': '1', '|': '1', 'O': '0', 'o': '0', '’': "'", '‘': "'", '“': '"', '”': '"'})
+
+
+def correct_code_from_pdf(md, pdf_path):
+    """Code lines that OCR misread (applyPtS1OnT1 for applyPtSlOnT1: l/1/I, O/0, curly quotes) replaced by
+    the PDF text layer's characters, when the two differ only in such look-alike characters; other code
+    is left alone. Spacing and indentation stay the note's. Returns (md, number of lines corrected)."""
+    if '```' not in md:
+        return md, 0
+    layout = subprocess.run(['pdftotext', '-layout', pdf_path, '-'], capture_output=True, text=True,
+                            timeout=300).stdout
+    squash = lambda l: re.sub(r'\s+', '', l)
+    exact = {squash(l) for l in layout.split('\n')}
+    lookalike = {}
+    for l in layout.split('\n'):
+        if len(l.strip()) >= 8:
+            lookalike.setdefault(squash(l).translate(_CONFUSABLE), l.strip())
+    out, fence, fixed = [], False, 0
+    for line in md.split('\n'):
+        if line.lstrip().startswith(('```', '~~~')):
+            fence = not fence
+        elif fence and len(line.strip()) >= 8 and squash(line) not in exact:
+            pdf_line = lookalike.get(squash(line).translate(_CONFUSABLE))
+            if pdf_line and squash(pdf_line) != squash(line):
+                # Swap only the look-alike characters; the note's spacing stays (the PDF's can be off)
+                chars, good = list(line), iter(squash(pdf_line))
+                for n, ch in enumerate(chars):
+                    if not ch.isspace():
+                        chars[n] = next(good)
+                line = ''.join(chars)
+                fixed += 1
+        out.append(line)
+    return '\n'.join(out), fixed
+
+
+def _rebuild_listing(lines, page_of, i, j):
+    """Lines i..j of the PDF's layout text as one code listing (see repair_split_code), or None when a
+    section heading or prose (outside docstrings) lies in between."""
+    in_doc = False
+    for k in range(i, j + 1):
+        if re.match(r'^\s*\d+(?:\.\d+)+\.?\s+[A-Z]', lines[k]):
+            return None
+        if not in_doc and len(lines[k].split()) >= 9 and not re.search(r'[=()\[\]#:\'"]', lines[k]):
+            return None
+        in_doc ^= len(re.findall(r"\'\'\'|’’’|\"\"\"", lines[k])) % 2 == 1
+    # Each page of the listing keeps its own relative indentation; a continuation page starts at the
+    # indentation the code had before the break: one deeper after ':', one shallower after return,
+    # level with its if/try for else/elif/except/finally, at 0 for def/class/a #--- separator
+    # Not code: page headers ('306   MULTIPROCESSING AND VECTORIZATION') and figure/table captions on a
+    # page the listing runs across
+    junk = lambda l: re.match(r'^\s*(\d+\s{3,}[A-Z][A-Z ,:&-]+|[A-Z][A-Z ,:&-]+\s{3,}\d+)\s*$', l) or \
+        re.match(r'^\s*(?:FIGURE|TABLE|EXHIBIT|CHART)\s+[\dA-Z]+(?:\.\d+)*\s{2,}\S', l)
+    code, page, offset = [], None, 0
+    for k in range(i, j + 1):
+        l = lines[k].replace('’', "'").replace('‘', "'").replace('–', '-').replace('−', '-').rstrip()  # typographic minus
+        if junk(l):
+            continue
+        if page_of[k] != page:
+            page = page_of[k]
+            seg = [lines[n] for n in range(k, j + 1) if page_of[n] == page and lines[n].strip() and not junk(lines[n])]
+            head = seg[0].strip() if seg else ''
+            filled = [c for c in code if c.strip()]
+            # the statement the code before the break belongs to: back past continuation lines (after a
+            # trailing backslash or an unclosed bracket)
+            n = len(filled) - 1
+            while n > 0 and (filled[n - 1].rstrip().endswith('\\') or
+                             sum(filled[n - 1].count(o) - filled[n - 1].count(c) for o, c in ('()', '[]', '{}')) > 0):
+                n -= 1
+            last = filled[n] if filled else None
+            ind = lambda c: len(c) - len(c.lstrip())
+            if last is None or re.match(r'(def|class)\b|#\s*[-—–]{3,}', head):
+                target = 0
+            elif re.match(r'(else|elif|except|finally)\b', head):
+                opener = next((c for c in reversed(code) if c.strip() and ind(c) < ind(last)
+                               and re.match(r'(if|elif|try|for|while|with)\b', c.strip())), None)
+                target = ind(opener) if opener else max(ind(last) - 4, 0)
+            else:
+                target = ind(last) + (4 if last.rstrip().endswith(':') else 0)
+                if re.match(r'(return|raise|break|continue|pass)\b', last.strip()):
+                    target = max(target - 4, 0)
+            offset = target - (len(seg[0]) - len(seg[0].lstrip()) if seg else 0)   # its first line continues
+        code.append(' ' * max(len(l) - len(l.lstrip()) + offset, 0) + l.lstrip() if l.strip() else '')
+    # A listing indented in steps other than 4 (the PDF's own spacing): steps of 4
+    steps = sorted({len(c) - len(c.lstrip()) for c in code if c.strip()} - {0})
+    if steps and steps[0] != 4 and all(x % steps[0] == 0 for x in steps):
+        code = [' ' * ((len(c) - len(c.lstrip())) // steps[0] * 4) + c.lstrip() if c.strip() else '' for c in code]
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(code)).strip('\n').split('\n')
+
+
+_LISTING_CAPTION = re.compile(r'^\s*(?:snippet|listing|code(?: listing)?|program|algorithm)\s+(\d+(?:\.\d+)*)\b', re.I)
+
+
+def _valid_python(code):
+    """True when code parses as Python 3, or as Python 2 (print statements, xrange; older books use it)."""
+    import ast
+    py2 = re.sub(r'^(\s*(?:[^#\n]*:\s*)?)print\b\s*(?!\()(.*)$', r'\1print(\2)', code, flags=re.M)
+    for src in (code, py2):
+        try:
+            ast.parse(src.replace('–', '-'))
+            return True
+        except (SyntaxError, ValueError):
+            pass
+    return False
+
+
+def _valid_code(code):
+    """Whether a listing is whole code: Python is parsed (Python 2 too), R by R's own parser when R is
+    installed; otherwise, and for other languages, brackets and quotes must balance and no line may be
+    prose. Catches listings cut off halfway or with text glued on."""
+    if re.search(r'^\s*(?:def |class |import |from \S+ import |elif |print\b)|:\s*(?:#.*)?$', code, re.M) and \
+            not re.search(r'<-|%>%|\bfunction\s*\(', code):
+        return _valid_python(code)
+    if re.search(r'<-|%>%|\bfunction\s*\(|\blibrary\(', code) and shutil.which('Rscript'):
+        r = subprocess.run(['Rscript', '-e', 'invisible(parse(file("stdin")))'], input=code, capture_output=True,
+                           text=True, timeout=60)
+        return r.returncode == 0
+    text = re.sub(r'#.*|//.*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', '', code)   # no comments or strings
+    if any(text.count(a) != text.count(b) for a, b in ('()', '[]', '{}')) or text.count('"') % 2 or text.count("'") % 2:
+        return False
+    return not any(len(l.split()) >= 9 and not re.search(r'[=()\[\]{}<>;:#$%&|]', l) for l in code.split('\n'))
+
+
+def restore_listings(md, pdf_path):
+    """Put back numbered code listings ('SNIPPET 16.4', 'Listing 3.1') that the converter lost or broke: the
+    listing is read from the PDF's text layer under its caption, up to where the prose resumes, and replaces
+    the code under the same caption in the note when that misses half its lines or isn't valid code while
+    the PDF's listing is (_valid_code: Python, R, others); fragments of the listing right after it (a
+    split-off docstring) go too.
+    Returns (md, number restored)."""
+    if not re.search(r'(?im)^\W*(?:snippet|listing|code|program|algorithm)\s+\d', md):
+        return md, 0
+    layout = subprocess.run(['pdftotext', '-layout', pdf_path, '-'], capture_output=True, text=True,
+                            timeout=300).stdout
+    lines, page_of = [], []
+    for n, page in enumerate(layout.split('\f')):
+        page_lines = page.split('\n')
+        lines += page_lines
+        page_of += [n] * len(page_lines)
+    key = lambda l: re.sub(r'\s+', '', l.replace('’', "'").replace('‘', "'"))
+    header = re.compile(r'^\s*(\d+\s{3,}[A-Z][A-Z ,:&-]+|[A-Z][A-Z ,:&-]+\s{3,}\d+)\s*$')
+    keyword = re.compile(r'\s*(?:import|from|def|class|return|yield|for|if|elif|else|while|try|except|finally|with|'
+                         r'print|raise|pass|break|continue|global|lambda|#|@)\b')
+    prose = lambda l: not keyword.match(l) and (len(l.split()) >= 5 and not re.search(r'[=()\[\]#:\'"{}]', l)) or \
+        re.match(r'^\s*\d+(?:\.\d+)+\.?\s+[A-Z]', l) or re.match(r'^\s*(?:FIGURE|TABLE|EXHIBIT)\s+\d', l) or \
+        re.fullmatch(r'\s*[A-Z][A-Z ,:&-]{3,}', l) or re.match(r'^\s*\d+\s+https?://', l) or \
+        (len(l.split()) >= 8 and l.rstrip().endswith('.') and not re.search(r'[=()\[\]#\'"]', l))
+    restored = 0
+    for c, cap in enumerate(lines):
+        m = _LISTING_CAPTION.match(cap)
+        if not m:
+            continue
+        i = c + 1
+        while i < len(lines) and lines[i].strip() and lines[i].strip().isupper() and not re.search(r'[=(]', lines[i]):
+            i += 1                                # caption continues in capitals
+        j, k, in_doc = None, i, False
+        while k < len(lines) and k < i + 400:
+            l = lines[k]
+            if not in_doc and (_LISTING_CAPTION.match(l) or (l.strip() and prose(l) and not header.match(l))):
+                break                             # (a docstring's sentences are part of the listing)
+            if l.strip() and not header.match(l):
+                j = k
+            in_doc ^= len(re.findall(r"'''|’’’|\"\"\"|”””", l)) % 2 == 1
+            k += 1
+        if j is None:
+            continue
+        code = _rebuild_listing(lines, page_of, i, j)
+        if not code or len([x for x in code if x.strip()]) < 2:
+            continue
+        # The note's code under the same caption: its code blocks up to the next text
+        # (the caption line itself, followed by code, not a sentence mentioning the listing)
+        cm = next((x for x in re.finditer(rf'(?im)^\W*(?:snippet|listing|code(?: listing)?|program|algorithm)\s+'
+                                          rf'{re.escape(m.group(1))}\b.*$', md)
+                   if len(x.group(0).split()) <= 20 and re.match(r'\s*```', md[x.end():])), None)
+        if not cm:
+            continue
+        blocks = re.compile(r'\s*(?:```[^\n]*\n.*?\n```[ \t]*\n?|---\s*\n)*', re.S).match(md, cm.end())
+        span = md[cm.end():blocks.end()]
+        have = {key(x) for x in re.findall(r'^.*$', span, re.M)}
+        want = [key(x) for x in code if len(x.strip()) > 3]
+        note_code = '\n'.join(re.findall(r'```[^\n]*\n(.*?)\n```', span, re.S))
+        mostly_there = want and sum(w in have for w in want) >= 0.5 * len(want)
+        if not want or (mostly_there and _valid_code(note_code)):
+            continue                              # the note's listing is fine
+        if not _valid_code('\n'.join(code)):    # only a listing that is whole, valid code replaces the note's
+            continue
+        # Fragments of the same listing after it (a docstring split off as text or a further code block):
+        # paragraphs whose every line is in the PDF's listing
+        # (compared on words: the note may write the docstring with LaTeX); figures in between are kept
+        words = lambda t: re.findall(r'[a-z0-9]+', re.sub(r'\\[a-zA-Z]+', ' ', t.lower()))
+        listing_words = ' ' + ' '.join(words('\n'.join(code))) + ' '
+        start = end = blocks.end()
+        kept = []
+        for para in re.finditer(r'(?s)\n*(.+?)(?:\n\s*\n|\Z)', md[start:]):
+            text = para.group(1).strip()
+            if re.match(r'!\[|\*\*(?:FIGURE|TABLE|EXHIBIT)\b', text):
+                kept.append(text)
+            elif text.strip('-` \n'):
+                # a fragment's words run on, in order, in the listing (prose sharing its words doesn't)
+                w = words(re.sub(r'```[^\n]*', '', text))
+                if len(w) < 3 or f' {" ".join(w)} ' not in listing_words:
+                    break
+            end = start + para.end()                  # (positions count from the listing's end)
+        md = (md[:cm.end()] + '\n\n```\n' + '\n'.join(code) + '\n```\n\n' + ''.join(k + '\n\n' for k in kept)
+              + md[end:].lstrip('\n'))
+        restored += 1
+    return md, restored
+
+
+def repair_split_code(md, pdf_path):
+    """Rebuild code listings a converter split apart: at a page break (two code blocks with only blank lines
+    or --- between them; the second often unindented), or at a docstring in typographic quotes (’’’):
+    code block ending in quote debris, the docstring as paragraphs, then the rest of the code.
+    The listing is taken from the PDF's text layer, from its first to its last code line, with its
+    indentation; straight quotes, page headers left out. Returns (md, number repaired)."""
+    blocks = list(re.finditer(r'^```[^\n]*\n(.*?)\n```[ \t]*$', md, re.S | re.M))
+    broken = []
+    for x, y in zip(blocks, blocks[1:]):
+        a, b, gap = x.group(1).split('\n'), y.group(1).split('\n'), md[x.end():y.start()]
+        page_break = all(l.strip() in ('', '---') for l in gap.split('\n'))   # nothing but page-break glue
+        if gap.count('\n') <= 30 and not re.search(r'^#{1,6} ', gap, re.M) and (page_break or
+                _QUOTE_DEBRIS.match(a[-1]) or any(_QUOTE_DEBRIS.match(l) for l in b[:3])):
+            broken.append((x, y))
+    if not broken:
+        return md, 0
+    layout = subprocess.run(['pdftotext', '-layout', pdf_path, '-'], capture_output=True, text=True,
+                            timeout=300).stdout
+    # pdftotext puts each page's leftmost text at column 0, so a listing's indentation shifts at a page
+    # break; the body text's margin on each page is the fixed reference
+    lines, page_of, prose = [], [], []
+    for n, page in enumerate(layout.split('\f')):
+        page_lines = page.split('\n')
+        lines += page_lines
+        page_of += [n] * len(page_lines)
+        indents = [len(l) - len(l.lstrip()) for l in page_lines if len(l.split()) >= 8 and len(l.strip()) > 60]
+        prose.append(max(set(indents), key=indents.count) if indents else None)
+    key = lambda l: re.sub(r'_{3,}$', '', re.sub(r'\s+', '', l.replace('’', "'").replace('‘', "'")))  # no '_____' junk
+    keys = [key(l) for l in lines]
+
+    def where(k):
+        """PDF lines matching k: exactly, else nearly (the converter can alter code, e.g. getYX → getXY)."""
+        found = [n for n, x in enumerate(keys) if x == k]
+        return found or [n for n, x in enumerate(keys) if x and abs(len(x) - len(k)) <= len(k) // 5
+                         and difflib.SequenceMatcher(None, x, k).ratio() >= 0.85]
+    out, pos, repaired = [], 0, 0
+    for x, y in broken:
+        if x.start() < pos:                     # part of a listing rebuilt already
+            continue
+        a, b = x.group(1).split('\n'), y.group(1).split('\n')
+        first = next((key(l) for l in a if l.strip() and not _QUOTE_DEBRIS.match(l)), '')
+        last = next((key(l) for l in reversed(b) if l.strip() and not _QUOTE_DEBRIS.match(l)), '')
+        old = [key(l) for l in a + b if l.strip() and not _QUOTE_DEBRIS.match(l)]
+        code = None
+        # The same first line can open several listings (a function shown again, extended): use the
+        # occurrence whose listing holds everything the two blocks held
+        ends = set(where(last))
+        for i in where(first):
+            j = next((k for k in range(i + 1, min(i + 200, len(keys))) if k in ends), -1)
+            if j < 0 or j - i + 1 > 1.5 * (len(a) + len(b) + md[x.end():y.start()].count('\n')) + 10:
+                continue
+            candidate = _rebuild_listing(lines, page_of, i, j)
+            if candidate is None:
+                continue
+            have = {key(l) for l in candidate}
+            if sum(k in have for k in old) >= 0.9 * len(old):
+                code = candidate
+                break
+        if code is None:
+            continue
+        out += [md[pos:x.start()], '```\n' + '\n'.join(code) + '\n```']
+        pos, repaired = y.end(), repaired + 1
+    return ''.join(out) + md[pos:], repaired
+
+
+_CONTINUED = re.compile(r'(?i)^\W*(?:(?:table|exhibit)\s+[\w.]+\W*)?(?:continued|continues|cont(?:\'?d|’d)?\.?)\W*$')
+
+
+def merge_split_tables(md):
+    """Join a table split over pages: the next table follows with only blank lines, a --- divider and at
+    most one '(continued)' line in between, has as many columns, and repeats the header, starts with a
+    data row as its 'header' (mostly numbers, or shaped like the rows), or follows a '(continued)' line.
+    Repeats for tables split over more than two pages. Returns (md, number merged)."""
+    total = 0
+    while True:
+        md, merged = _merge_split_tables_once(md)
+        total += merged
+        if not merged:
+            return md, total
+
+
+def _trim_empty_columns(rows):
+    """Table rows without the trailing columns that are empty in every row (converters add some)."""
+    cells = [[c.strip() for c in r.strip().strip('|').split('|')] for r in rows]
+    is_sep = lambda cs: all(re.fullmatch(r':?-+:?', c) for c in cs if c)
+    width = max((max((n + 1 for n, c in enumerate(cs) if c), default=0) for cs in cells if not is_sep(cs)), default=0)
+    if not width or all(len(cs) <= width for cs in cells):
+        return rows
+    return ['| ' + ' | '.join((cs + [''] * width)[:width]) + ' |' for cs in cells]
+
+
+def _merge_split_tables_once(md):
+    lines, out, merged, i = md.split('\n'), [], 0, 0
+    cells = lambda l: [c.strip() for c in l.strip().strip('|').split('|')]
+    is_row = lambda l: l.lstrip().startswith('|') and l.rstrip().endswith('|')
+    is_sep = lambda l: is_row(l) and all(re.fullmatch(r':?-+:?', c) for c in cells(l) if c)
+    numeric = lambda row: sum(bool(re.fullmatch(r'[-−+]?[\d.,]+%?|[-−+]?\.\d+', c.replace(' ', ''))) for c in row
+                              if c) >= max(1, len([c for c in row if c]) / 2)
+    while i < len(lines):
+        out.append(lines[i])
+        # end of a table: this row, with no row after it
+        if is_row(lines[i]) and not (i + 1 < len(lines) and is_row(lines[i + 1])):
+            start = len(out) - 1
+            while start > 0 and is_row(out[start - 1]):
+                start -= 1
+            table = out[start:]
+            j, glue, continued = i + 1, [], False
+            while j < len(lines) and len(glue) <= 6 and not is_row(lines[j]):
+                if lines[j].strip() in ('', '---'):
+                    glue.append(lines[j])
+                elif _CONTINUED.match(lines[j].strip()) and not continued:
+                    continued = True
+                    glue.append(lines[j])
+                else:
+                    break
+                j += 1
+            nxt = []
+            k = j
+            while k < len(lines) and is_row(lines[k]):
+                nxt.append(lines[k])
+                k += 1
+            # (compared without trailing columns that are empty throughout: converters add some)
+            if len(table) >= 3 and len(nxt) >= 2:
+                table, nxt = _trim_empty_columns(table), _trim_empty_columns(nxt)
+                out[start:] = table
+                lines[j:k] = nxt
+            # After '(continued)' with the same header (its filled cells), a part of another width is padded
+            if (continued and len(table) >= 3 and len(nxt) >= 2 and is_sep(table[1]) and is_sep(nxt[1])
+                    and [c.lower() for c in cells(nxt[0]) if c] == [c.lower() for c in cells(table[0]) if c]
+                    and len(cells(nxt[0])) != len(cells(table[0]))):
+                width = max(len(cells(table[0])), len(cells(nxt[0])))
+                pad = lambda r: '| ' + ' | '.join((cells(r) + [''] * width)[:width]) + ' |'
+                table = [pad(r) if not is_sep(r) else '|' + '|'.join(['---'] * width) + '|' for r in table]
+                nxt = [pad(r) if not is_sep(r) else '|' + '|'.join(['---'] * width) + '|' for r in nxt]
+                out[start:] = table
+                lines[j:k] = nxt
+            if (len(table) >= 3 and is_sep(table[1]) and j + 1 < len(lines) and is_row(lines[j]) and is_sep(lines[j + 1])
+                    and len(cells(lines[j])) == len(cells(table[0])) and len(glue) <= 6):
+                head2, head1 = cells(lines[j]), cells(table[0])
+                same = [c.lower() for c in head2] == [c.lower() for c in head1]
+                # Its 'header' is shaped like the first table's rows (e.g. a name, then numbers), not its header
+                shape = lambda row: ['' if not c else 'n' if numeric([c]) else 't' for c in row]
+                like_rows = shape(head2) == shape(cells(table[-1])) != shape(head1)
+                if same or like_rows or numeric(head2) and not numeric(head1) or continued:
+                    rows = [] if same else [lines[j]]            # its 'header' is a data row
+                    k = j + 2
+                    while k < len(lines) and is_row(lines[k]):
+                        rows.append(lines[k])
+                        k += 1
+                    out += rows
+                    merged += 1
+                    i = k
+                    continue
+        i += 1
+    return '\n'.join(out), merged
+
+
+def fix_list_markers(md):
+    """List items that repeat the document's own marker (converters add a Markdown marker in front):
+    '1. **4. Re-allocation:**' → '4. **Re-allocation:**' (the document's number; a list may start at any
+    number, so 1, 2, 3 / 4, 5 split by a page break stays 4, 5), '- • Problem' → '- Problem', and items
+    numbered '1.1' or '(a)', which Markdown can't number, as bullets that keep their label.
+    Code blocks are left alone."""
+    out, fence = [], False
+    for line in md.split('\n'):
+        if line.lstrip().startswith(('```', '~~~')):
+            fence = not fence
+        if not fence:
+            line = re.sub(r'^(\s*)[-*+]\s+[•◦▪‣·●○■□]\s*', r'\1- ', line)
+            line = re.sub(r'^(\s*)\d{1,3}[.)]\s+([*_]{0,2})(\d{1,3})[.)]\s+', r'\1\3. \2', line)
+            line = re.sub(r'^(\s*)\d{1,3}[.)]\s+([*_]{0,2})(\d{1,3}(?:\.\d{1,3})+)\.?([*_]{0,2})\s+',
+                          lambda m: f'{m.group(1)}- **{m.group(3)}** ' if not m.group(2) else
+                          f'{m.group(1)}- {m.group(2)}{m.group(3)}{m.group(4)} ', line)
+            line = re.sub(r'^(\s*)\d{1,3}[.)]\s+(?=\(?(?:[a-z]|[ivx]{1,4})\)\s)', r'\1- ', line)
+        out.append(line)
+    return '\n'.join(out)
+
+
+def restore_tex_escapes(md):
+    """LaTeX commands read as escapes somewhere upstream (JSON from an LLM step): \\frac as form feed + 'rac',
+    \\beta as backspace + 'eta', \\rho as carriage return + 'ho', \\theta as tab + 'heta' inside a formula."""
+    md = md.replace('\x0c', '\\f').replace('\x08', '\\b')
+    md = re.sub(r'\r(?=[a-z])', r'\\r', md)          # not a Windows line ending
+    return re.sub(r'\$[^$\n]*\$', lambda m: m.group(0).replace('\t', '\\t'), md)
+
+
 def _clean_pdf_markdown(md, images):
     """Tidy marker/Datalab output for Obsidian: remove page anchors and links, descriptions without
     an image, and figures detected twice; split image descriptions that wrap other images; warn
     about display equations that won't render."""
     md = sup_symbols(md)
+    md = restore_tex_escapes(md)
+    md = fix_list_markers(md)
+    md, _ = merge_split_tables(md)
     # The AI step sometimes wraps one panel's image inside another's description:
     # ![Description 1: ![](a.jpeg) | Description 2: caption](b.jpeg) -> both images
     md = re.sub(r'!\[Description \d+: (!\[[^\]]*\]\([^)\s]+\)).*?\]\(([^)\s]+\.(?:jpe?g|png|gif|webp))\)',
@@ -3664,6 +4141,7 @@ def build_article(d, url, project, created, method=None):
 
 def build_pdf(url, project, created, skip_doi=False):
     """Download (or copy) a plain PDF and build an Obsidian note."""
+    skip_doi = skip_doi or bool(PAGE_RANGE) or AS_TYPE == 'doc'   # an excerpt, or --as doc: no paper lookup
     local_path = url if os.path.isabs(url) else None
     with tempfile.TemporaryDirectory() as tmp_dir:
         pdf_name = os.path.basename(url) or 'document.pdf'
@@ -3702,6 +4180,8 @@ def build_pdf(url, project, created, skip_doi=False):
                 return None, None, {'redirect_doi': doi, 'pdf_bytes': f.read()}
 
         content, images_dict, method = pdf_to_markdown(pdf_path)
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes = f.read()             # for --keep-pdf and book detection; tmp_dir goes with this block
         pdf_authors, pdf_published = _pdf_meta_people_date(pdf_path, content or '')
         if content and not doi and not skip_doi:
             # Scans without a text layer only become readable now: search Crossref with the converted text
@@ -3717,8 +4197,11 @@ def build_pdf(url, project, created, skip_doi=False):
         print('PDF conversion produced no usable content.', file=sys.stderr)
         return '', {}, {}
 
-    # Extract title from first heading, fall back to filename
+    # Title from the first heading when it opens the document (at most a running header before it; with
+    # --pages it is whatever heading comes first, so not the title), else the PDF's title or file name
     title_match = re.search(r'^#{1,2}\s+(.+)$', content, re.MULTILINE)
+    if title_match and (PAGE_RANGE or len(content[:title_match.start()].split()) > 30):
+        title_match = None
     if title_match:
         title = title_match.group(1).strip()
         content = content[title_match.end():].lstrip('\n')
@@ -3768,7 +4251,7 @@ def build_pdf(url, project, created, skip_doi=False):
 {index_section}
 {content}
 """
-    return note, images_dict, {'title': title}
+    return note, images_dict, {'title': title, 'pdf': pdf_bytes}
 
 
 def get_vault_path():
@@ -4187,6 +4670,9 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
                     final = None
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)   # failed download, or not an image
+        if final and _is_blank_image(final):
+            os.unlink(final)
+            return 'blank'
         return final
 
     with ThreadPoolExecutor(max(1, IMAGE_JOBS)) as ex:
@@ -4194,12 +4680,15 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
 
     # Number the saved images in page order; failed ones keep their link and leave no gap
     seen = {}   # original src → local_name
+    blank = {src for src, final in zip(srcs, finals) if final == 'blank'}
     for src, final in zip(srcs, finals):
-        if final:
+        if final and final != 'blank':
             seen[src] = f'{filename_base}-{len(seen) + 1:03d}{os.path.splitext(final)[1]}'
             os.replace(final, os.path.join(img_dir, seen[src]))
-    content = pattern.sub(lambda m: f'![{m.group(1)}](img/{seen[_src(m)]})' if _src(m) in seen else m.group(0),
-                          content)
+    content = pattern.sub(lambda m: '' if _src(m) in blank else
+                          f'![{m.group(1)}](img/{seen[_src(m)]})' if _src(m) in seen else m.group(0), content)
+    if blank:
+        print(f'Left out {len(blank)} blank image{"s" if len(blank) > 1 else ""}', file=sys.stderr)
     saved = [os.path.join(img_dir, n) for n in seen.values()]
     if saved and ENABLE_IMAGE_COMPRESSION and GRAYSCALE_FIGURES:
         for old, new in optimize_grayscale_figures(saved).items():
@@ -4666,6 +5155,10 @@ doc = pymupdf.open(src)                          # opening repairs a damaged cro
 if doc.needs_pass:
     doc.authenticate('')                         # "encrypted" with an empty password
 changed = doc.is_repaired or doc.is_encrypted
+if len(sys.argv) > 3:                            # --pages: only these pages (1-based, inclusive)
+    first, last = map(int, sys.argv[3].split('-'))
+    doc.select(list(range(max(first, 1) - 1, min(last, doc.page_count))))
+    changed = True
 flattened = []
 for page in doc:
     r = page.rect
@@ -4698,7 +5191,7 @@ print(json.dumps({'repaired': bool(doc.is_repaired), 'flattened': sorted(flatten
 '''
 
 
-def _prepare_pdf(path, out):
+def _prepare_pdf(path, out, pages=None):
     """Write a copy of the PDF that converts reliably to out, and return its path; the original is
     returned when nothing needs fixing (or uv is missing). Repairs damaged files, opens PDFs locked with
     an empty password, and trims graphics far outside the page to their visible part (text untouched)."""
@@ -4706,7 +5199,8 @@ def _prepare_pdf(path, out):
         return path
     try:
         r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pymupdf', 'python', '-c',
-                            _PDF_PREPARE, path, out], capture_output=True, text=True, timeout=600)
+                            _PDF_PREPARE, path, out] + ([pages] if pages else []),
+                           capture_output=True, text=True, timeout=600)
         info = json.loads(r.stdout.strip().splitlines()[-1])
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return path
@@ -4786,9 +5280,8 @@ def _compress_pdf(path):
             print(f'Compressed the PDF: {before / 1e6:.1f} → {after / 1e6:.1f} MB')
 
 
-def save_original_pdf(save_dir, filename, source=None, meta=None):
-    """--keep-pdf: save the original PDF next to the note as {filename}.pdf.
-    source is the PDF's URL or local path; without one, the PDF build_paper found (meta) is used."""
+def original_pdf_bytes(source=None, meta=None):
+    """The original PDF's bytes: from source (URL or local path), else the PDF build_paper found (meta)."""
     meta = meta or {}
     data = None if source else meta.get('pdf')
     source = source or meta.get('pdf_url')
@@ -4804,7 +5297,14 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
                     data = f.read()
             except Exception:
                 data = None
-    if not data or b'%PDF' not in data[:1024]:
+    return data if data and b'%PDF' in data[:1024] else None
+
+
+def save_original_pdf(save_dir, filename, source=None, meta=None):
+    """--keep-pdf: save the original PDF next to the note as {filename}.pdf.
+    source is the PDF's URL or local path; without one, the PDF build_paper found (meta) is used."""
+    data = original_pdf_bytes(source, meta)
+    if not data:
         print('WARNING: the original PDF could not be saved — the note was saved without it.', file=sys.stderr)
         return
     pdf_path = os.path.join(save_dir, f'{filename}.pdf')
@@ -4849,6 +5349,489 @@ def run_batch(urls, argv):
             print(f'\n=== [{n}] {url}{"" if code == 0 else f" (failed, exit {code})"} ===')
             print(out.strip())
     return 0 if all(c == 0 for c in codes) else 1
+
+
+# ── Books ─────────────────────────────────────────────────────────────────────
+# A book converts like a long paper, but its structure needs more: parts and chapters (from the PDF's
+# bookmarks), sections with their pages (from the printed table of contents), code listings and
+# exercises that marker turns into headings, and the printed contents itself, which becomes tables.
+
+_BOOK_OUTLINE = '''
+import sys, json, pymupdf
+pymupdf.TOOLS.mupdf_display_errors(False)
+doc = pymupdf.open(sys.argv[1])
+print(json.dumps({'pages': doc.page_count, 'outline': [[l, t, p] for l, t, p in doc.get_toc()]}))
+'''
+
+
+def _book_norm(text):
+    """Comparable form of a heading or contents title: no markup, case or punctuation."""
+    text = re.sub(r'\$[^$]*\$|<[^>]+>|[*_`]', ' ', text)
+    return re.sub(r'[^a-z0-9]+', ' ', unicodedata.normalize('NFKD', text).lower()).strip()
+
+
+def book_structure(pdf_path):
+    """The book's structure: {'pages', 'outline': [(level, title, pdf page)], 'contents': [entries]}, each
+    entry {'kind': part/chapter/section/item, 'num', 'title', 'page'} from the printed table of contents.
+    None when the PDF can't be read."""
+    if not shutil.which('uv'):
+        return None
+    try:
+        r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pymupdf', 'python', '-c',
+                            _BOOK_OUTLINE, pdf_path], capture_output=True, text=True, timeout=300)
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+    outline = [tuple(e) for e in info['outline']]
+    # The printed contents: the pages of its bookmark, else the first pages that read like one
+    first = next((i for i, (_, t, _) in enumerate(outline) if _book_norm(t) in ('contents', 'table of contents')), None)
+    if first is not None:
+        start = outline[first][2]
+        end = next((p for _, _, p in outline[first + 1:] if p > start), start + 1) - 1
+    else:
+        # No bookmark: the page headed (Table of) Contents and the pages after it that are mostly entries
+        start = end = None
+        for n in range(1, min(40, info['pages']) + 1):
+            page = subprocess.run(['pdftotext', '-f', str(n), '-l', str(n), '-layout', pdf_path, '-'],
+                                  capture_output=True, text=True, timeout=60).stdout
+            entries = len(re.findall(r'\S\s*\d+\s*$', page, re.M))
+            if start is None and re.search(r'(?im)^\s*(?:table of )?contents\s*$', page) and entries >= 5:
+                start = end = n
+            elif start is not None:
+                if entries < 15:
+                    break
+                end = n
+        if start is None:
+            start, end = 1, min(30, info['pages'])
+    text = subprocess.run(['pdftotext', '-f', str(start), '-l', str(end), '-layout', pdf_path, '-'],
+                          capture_output=True, text=True, timeout=60).stdout
+    text = re.split(r'(?im)^\s*list of (?:charts|tables|figures|exhibits|illustrations)\s*$', text)[0]
+    contents = _parse_printed_contents(text)
+    full = subprocess.run(['pdftotext', '-f', str(end + 1), pdf_path, '-'], capture_output=True, text=True,
+                          timeout=300).stdout
+    # With the layout kept, a heading whose number sits in a margin column is still one line
+    full_layout = subprocess.run(['pdftotext', '-f', str(end + 1), '-layout', pdf_path, '-'],
+                                 capture_output=True, text=True, timeout=300).stdout
+    for e in contents:                       # the words after the title, to place a lost heading
+        if e['kind'] in ('section', 'chapter') and e['num']:
+            words = r'\W+'.join(re.findall(r'[^\W_]+', e['title']))        # any hyphen or quote variant
+            m = re.search(rf'(?im)^\s*{re.escape(e["num"])}\.?\s+{words}\W*$', full) or \
+                re.search(rf'(?im)^\s*{re.escape(e["num"])}\.?\s*\n(?:\s*\d*\s*\n){{0,6}}\s*{words}\W*$', full)
+            # (the number can stand on its own line, with the page number before the title)
+            if m:
+                e['opening'] = ' '.join(full[m.end():m.end() + 600].split()[:30])
+            else:
+                m = re.search(rf'(?im)^\s*{re.escape(e["num"])}\.?\s+{words}\W*$', full_layout)
+                if m:
+                    e['opening'] = ' '.join(full_layout[m.end():m.end() + 900].split()[:30])
+    first_pages = subprocess.run(['pdftotext', '-l', '12', pdf_path, '-'], capture_output=True, text=True,
+                                 timeout=60).stdout
+    isbn = re.search(r'ISBN(?:-1[03])?:?\s*(?:97[89][-\s]?)?(?:\d[-\s]?){9}[\dX]\b', first_pages)
+    return {'pages': info['pages'], 'outline': outline, 'contents': contents, 'isbn': bool(isbn)}
+
+
+def _parse_printed_contents(text):
+    """Entries of a printed table of contents ('2.3 Bars, 25', '3 Labeling   43', 'PART 1  DATA ANALYSIS  21')."""
+    entries, pending = [], ''
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or re.fullmatch(r'[ivxlc]+|\d+|.*\bCONTENTS\b.*|Contents', line, re.I):
+            continue
+        line = (pending + ' ' + line).strip() if pending else line
+        part = re.match(r'^PART\s+([IVX\d]+)\s*:?\s+(\D+?)\s*$', line, re.I)
+        if part:                                 # a part without a page number
+            entries.append({'kind': 'part', 'num': part.group(1), 'title': part.group(2).strip().title()
+                            if part.group(2).isupper() else part.group(2).strip(), 'page': ''})
+            pending = ''
+            continue
+        m = re.match(r'^(.*?)(?:,\s*|\s{2,}|\s+)([ivxlc]+|\d+)$', line, re.I)
+        if not m:
+            pending = '' if len(line.split()) <= 3 and not pending else line   # a label ('Reference') or a
+            continue                                                          # title that continues
+        pending = ''
+        body, page = m.group(1).strip(), m.group(2)
+        part = re.match(r'^PART\s+([IVX\d]+)\s*:?\s+(.+)$', body, re.I)
+        num = re.match(r'^((?:\d+|[A-Z])(?:\.(?:\d+|[A-Z]))+)\.?\s+(.+)$', body)
+        chapter = re.match(r'^(?:Chapter\s+)?(\d+)\.?\s+(.+)$', body, re.I)
+        appendix = re.match(r'^Appendix\s+([A-Z])\.?:?\s+(.+)$', body)
+        if appendix:
+            entries.append({'kind': 'chapter', 'num': appendix.group(1), 'title': appendix.group(2).strip(),
+                            'page': page, 'appendix': True})
+        elif part:
+            entries.append({'kind': 'part', 'num': part.group(1), 'title': part.group(2).strip().title(), 'page': page})
+        elif num:
+            entries.append({'kind': 'section', 'num': num.group(1), 'title': num.group(2).strip(), 'page': page})
+        elif chapter:
+            entries.append({'kind': 'chapter', 'num': chapter.group(1), 'title': chapter.group(2).strip(), 'page': page})
+        else:
+            entries.append({'kind': 'item', 'num': '', 'title': body.title() if body.isupper() else body, 'page': page})
+    return entries
+
+
+def is_book(structure):
+    """A book: 50+ pages with an ISBN on its first pages (a single chapter or proceedings paper carries
+    its book's ISBN too, hence the length), or 100+ pages with at least three chapters."""
+    if not structure:
+        return False
+    if structure['pages'] >= 50 and structure.get('isbn'):
+        return True
+    if structure['pages'] < 100:
+        return False
+    chapters = [e for e in structure['contents'] if e['kind'] == 'chapter']
+    numbered = [t for _, t, _ in structure['outline'] if re.match(r'^(?:Chapter\s+)?\d+\b', t, re.I)]
+    return len(chapters) >= 3 or len(numbered) >= 3
+
+
+_BOOK_CAPTION = re.compile(r'^(?:snippet|listing|code|example|exhibit|algorithm|box|figure|table)\s+[\dA-Z]+(?:\.\d+)*\b', re.I)
+_BOOK_ITEMS = ('exercises', 'references', 'bibliography', 'notes', 'further reading', 'summary', 'problems')
+
+
+def fix_book_markdown(md, structure, title=''):
+    """Give a converted book consistent structure: Part #, chapter ##, section ### and deeper by numbering,
+    titles as printed in the contents; code listings, examples and exercises as text instead of headings;
+    empty headings removed; the printed contents replaced by a linked table (see book_contents_table)."""
+    contents = structure['contents']
+    sections = {e['num']: e for e in contents if e['kind'] == 'section'}
+    chapters = {_book_norm(e['title']): e for e in contents if e['kind'] == 'chapter'}
+    parts = {_book_norm(e['title']): e for e in contents if e['kind'] == 'part'}
+    items = {_book_norm(e['title']) for e in contents if e['kind'] == 'item'}
+    out, fence, chapter, level, in_exercises, skipping = [], False, None, 1, False, False
+    seen_chapter, passed, skipped = False, set(), []
+    entry_key = lambda t: _book_norm(re.sub(r'^(?:part\s+[ivx\d]+\s*:?|chapter\s+\d+\s*[.:]?|appendix\s+[A-Z]\s*[.:]?|'
+                                            r'\d+\.?)\s+', '', t, flags=re.I))
+    after_contents = entry_key(contents[0]['title']) if contents else ''   # first entry after the contents
+    # Before the printed contents (title pages, preface) nothing is a part, chapter or section yet
+    body_started = not re.search(r'(?im)^#{1,6}\s*[*_]*(?:table of )?contents[*_]*\s*$', md)
+    for line in md.split('\n'):
+        if line.lstrip().startswith(('```', '~~~')):
+            fence = not fence
+        h = None if fence else re.match(r'^(#{1,6})\s*(.*)$', line)
+        if not fence and not h and not skipping:     # a section title marker kept as plain or bold text
+            lost = re.fullmatch(r'\**\s*(\d+(?:\.(?:\d+|[A-Z]))+)\.?\s+(.+?)\s*\**', line.strip())
+            if lost and lost.group(1) in sections and lost.group(1) not in passed \
+                    and _book_norm(lost.group(2)) == _book_norm(sections[lost.group(1)]['title']):
+                h = re.match(r'^(#)\s*(.*)$', '# ' + lost.group(1) + ' ' + lost.group(2))
+        if skipping:                              # the printed contents: up to its first entry's own heading
+            if not h or entry_key(clean_heading_text(re.sub(r'[*_]+', '', h.group(2)))) != after_contents:
+                skipped.append(line)
+                continue
+            skipping, skipped, body_started = False, [], True
+        if not h:
+            out.append(line)
+            continue
+        # Without emphasis markers (outside formulas): '### ***Why ...?***', '1.3.2.5 *Meta-Strategies*'
+        text = clean_heading_text(re.sub(r'(\$[^$]*\$)|[*_]+(?=\S)|(?<=\S)[*_]+', lambda x: x.group(1) or '',
+                                         h.group(2).strip()))
+        key = _book_norm(re.sub(r'^(?:part\s+[ivx\d]+\s*:?|chapter\s+\d+\s*[.:]?|appendix\s+[A-Z]\s*[.:]?|\d+\.?)\s+',
+                                '', text, flags=re.I))
+        if not _book_norm(text):
+            continue                              # empty or '_____'
+        if _book_norm(text) in ('contents', 'table of contents') and not seen_chapter:
+            out += ['# Contents', '', '<!-- book contents -->']
+            skipping = True
+            continue
+        if not body_started:                      # title pages and preface: headings as they are
+            out.append(f'# {text}')
+            continue
+        if title and _book_norm(text) == _book_norm(title) and not seen_chapter:
+            continue                              # the title page repeats the note's title
+        if key in parts:
+            e = parts[key]
+            out.append(f'# Part {e["num"]}: {e["title"]}')
+            level, in_exercises = 1, False
+        elif key in chapters and not re.match(r'^\d+\.\d', text):
+            e = chapters[key]
+            chapter, seen_chapter = e['num'], True
+            out.append(f'## Appendix {e["num"]}: {e["title"]}' if e.get('appendix') else f'## {e["num"]} {e["title"]}')
+            level, in_exercises = 2, False
+        elif re.match(r'^(\d+(?:\.(?:\d+|[A-Z]))+)\.?\s', text):
+            num = re.match(r'^(\d+(?:\.(?:\d+|[A-Z]))+)', text).group(1)
+            if in_exercises and (num not in sections or num in passed):   # exercise 2.1, not section 2.1
+                out.append(f'**{num}** {text[len(num):].strip()}')
+                continue
+            passed.add(num)
+            e = sections.get(num)
+            depth = min(num.count('.') + 2, 6)
+            out.append(f'{"#" * depth} {num} {e["title"] if e else text[len(num):].strip()}')
+            level, in_exercises = depth, False
+        elif _BOOK_CAPTION.match(text):
+            out.append(f'**{text}**')
+        elif _book_norm(text) in _BOOK_ITEMS:
+            depth = 3 if chapter else 1
+            out.append(f'{"#" * depth} {text.title() if text.isupper() else text}')
+            level, in_exercises = depth, _book_norm(text) in ('exercises', 'problems')
+        elif key in items or not seen_chapter:
+            out.append(f'# {text.title() if text.isupper() else text}')   # front and back matter
+            level, in_exercises = 1, False
+        else:
+            out.append(f'{"#" * min(level + 1, 6)} {text}')   # e.g. FAQ questions under their section
+    if skipping:                                  # the contents' end was never found: keep everything
+        out += skipped
+    md, restored = restore_book_headings('\n'.join(out), structure)
+    if restored:
+        print(f'Restored {restored} section heading{"s" if restored > 1 else ""} the conversion lost', file=sys.stderr)
+    return md.replace('<!-- book contents -->', book_contents_table(structure, md))
+
+
+def restore_book_headings(md, structure):
+    """Put back section headings the converter lost: before the paragraph that opens the section in the
+    PDF, searched in order after the previous section's heading. Returns (md, number restored)."""
+    lines, restored, pos = md.split('\n'), 0, 0
+    heads = {_book_norm(t) for t in re.findall(r'^#{1,6} (.+)$', md, re.M)}
+    for e in structure['contents']:
+        if e['kind'] not in ('section', 'chapter') or not e['num']:
+            continue
+        head = f'{e["num"]} {e["title"]}'
+        found = next((i for i in range(pos, len(lines)) if re.match(r'#{1,6} ', lines[i])
+                      and _book_norm(lines[i].lstrip('#')) == _book_norm(head)), None)
+        if found is not None:
+            pos = found + 1
+            continue
+        if _book_norm(head) in heads or not e.get('opening'):
+            continue
+        # The opening's run of longer words: formulas, short words and punctuation differ in the note
+        long = lambda t: ' '.join(w for w in _book_norm(t).split() if len(w) > 3)
+        key = ' '.join(long(e['opening']).split()[:5])
+        at = next((i for i in range(pos, len(lines)) if len(key.split()) >= 4 and not lines[i].startswith('#')
+                   and key in long(lines[i])), None)
+        if at is None:
+            continue
+        depth = 2 if e['kind'] == 'chapter' else min(e['num'].count('.') + 2, 6)
+        lines[at:at] = [f'{"#" * depth} {head}', '']
+        pos, restored = at + 2, restored + 1
+    return '\n'.join(lines), restored
+
+
+def book_contents_table(structure, md):
+    """The printed contents as one table, each entry linked to its heading when the note has it."""
+    prose = re.sub(r'^(```|~~~).*?^\1[^\n]*$', '', md, flags=re.M | re.S)     # headings outside code
+    order = [(len(h), t) for h, t in re.findall(r'^(#{1,6}) (.+)$', prose, re.M)]
+    heads = {}
+    for _, t in order:
+        heads.setdefault(_book_norm(t), t)
+
+    def in_chapter(chapter, title):
+        """The chapter's own heading for title (e.g. its Exercises), or None."""
+        start = next((i for i, (_, t) in enumerate(order) if t == chapter), None)
+        if start is None:
+            return None
+        for lvl, t in order[start + 1:]:
+            if lvl <= order[start][0]:
+                return None                       # next chapter or part
+            if _book_norm(t) == _book_norm(title):
+                return t
+        return None
+
+    rows, chapter_head = ['| Section | Title | Page |', '|---|---|---|'], ''
+    for e in structure['contents']:
+        label = {'part': f'Part {e["num"]}', 'chapter': f'Appendix {e["num"]}' if e.get('appendix') else e['num'],
+                 'section': e['num']}.get(e['kind'], '')
+        full = f'{label}: {e["title"]}' if e['kind'] == 'part' or e.get('appendix') else \
+            (f'{label} {e["title"]}' if label else e['title'])
+        target = heads.get(_book_norm(full))
+        if e['kind'] == 'chapter':
+            chapter_head = target or ''           # a missing chapter heading: no links into the previous one
+        own = in_chapter(chapter_head, e['title']) if e['kind'] == 'item' and chapter_head else None
+        if own:
+            link = f'[[#{chapter_head}#{own}\\|{e["title"]}]]'          # the chapter's own Exercises
+        else:
+            link = f'[[#{target}\\|{label or e["title"]}]]' if target else (label or e['title'])
+        title_cell = e['title'] if label else ''
+        rows.append(f'| {link if label else ""} | {title_cell or link} | {e["page"]} |')
+    return '\n'.join(rows)
+
+
+_ISBN13 = '''
+import sys, json, isbnlib
+out = []
+for raw in sys.argv[1:]:
+    c = isbnlib.canonical(raw)
+    c = isbnlib.to_isbn13(c) if isbnlib.is_isbn10(c) else c
+    if isbnlib.is_isbn13(c) and c not in [x[0] for x in out]:
+        out.append([c, isbnlib.mask(c) or c])
+print(json.dumps(out))
+'''
+
+
+def isbn13s(candidates):
+    """Valid ISBNs among candidates as [(digits, hyphenated)], ISBN-10s converted to ISBN-13 (the standard
+    since 2007). Hyphens follow the International ISBN Agency's ranges (isbnlib via uv); without uv the
+    plain digits of the 13-digit candidates."""
+    if not candidates:
+        return []
+    if shutil.which('uv'):
+        try:
+            r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'isbnlib', 'python', '-c', _ISBN13,
+                                *candidates], capture_output=True, text=True, timeout=120)
+            return [tuple(x) for x in json.loads(r.stdout.strip().splitlines()[-1])]
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
+    digits = [re.sub(r'[^\dX]', '', c.upper()) for c in candidates]
+    return [(d, d) for d in dict.fromkeys(digits) if len(d) == 13]
+
+
+def book_metadata(pdf_path):
+    """Author, publisher and year from the ISBN on the first pages, via Open Library; {} when not found."""
+    text = subprocess.run(['pdftotext', '-l', '12', pdf_path, '-'], capture_output=True, text=True,
+                          timeout=60).stdout
+    candidates = re.findall(r'97[89][-\s]?(?:\d[-\s]?){9}\d', text) + \
+        re.findall(r'ISBN(?:-10)?:?\s*((?:\d[-\s]?){9}[\dX])\b', text)
+    for isbn, hyphenated in isbn13s(candidates):
+        try:
+            data = json.loads(curl(f'https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data',
+                                   max_time=15).stdout or b'{}').get(f'ISBN:{isbn}')
+        except ValueError:
+            data = None
+        if data:
+            year = re.search(r'\d{4}', data.get('publish_date', ''))
+            return {'title': data.get('title', ''), 'authors': [a['name'] for a in data.get('authors', [])],
+                    'publisher': (data.get('publishers') or [{}])[0].get('name', ''),
+                    'published': year.group(0) if year else '', 'isbn': hyphenated}
+    return {}
+
+
+def book_index(pdf_path, structure):
+    """The book's back-of-book index as a nested Markdown list, read from the PDF's text layer: each page
+    split into its columns, main entries at the column edge, sub-entries indented, wrapped lines indented
+    further, '(Continued)' column heads joined to their entry. None when there is no recognisable index."""
+    pages = structure['pages']
+    start = next((p for _, t, p in structure['outline'] if _book_norm(t) in ('index', 'subject index')), None)
+    texts = {}
+    if start is None:                            # no bookmark: a page near the end headed 'Index'
+        for n in range(max(1, pages - 40), pages + 1):
+            texts[n] = subprocess.run(['pdftotext', '-f', str(n), '-l', str(n), '-layout', pdf_path, '-'],
+                                      capture_output=True, text=True, timeout=60).stdout
+            if re.match(r'\s*(?:subject\s+)?index\s*$', next((l for l in texts[n].split('\n') if l.strip()), ''), re.I):
+                start = n
+                break
+    if start is None:
+        return None
+    entries = []                                  # [level, text]
+    for n in range(start, pages + 1):
+        text = texts.get(n) or subprocess.run(['pdftotext', '-f', str(n), '-l', str(n), '-layout', pdf_path, '-'],
+                                              capture_output=True, text=True, timeout=60).stdout
+        lines = [l.rstrip() for l in text.split('\n')]
+        lines = [l for l in lines if l.strip() and not re.fullmatch(r'\s*(?:\d+\s+)?(?:subject\s+)?index(?:\s+\d+)?\s*', l, re.I)
+                 and not re.match(r'\s*page numbers (?:followed|in)', l, re.I)]
+        # where the second column starts: the leftmost position, past the middle, at which text follows a gap
+        starts = [m.end() for l in lines for m in re.finditer(r'\S {2,}(?=\S)', l) if m.end() > 25]
+        split = min((p for p in set(starts) if starts.count(p) >= 3), default=None)
+        columns = [[l[:split].rstrip() for l in lines], [l[split:].rstrip() for l in lines]] if split else [lines]
+        for col in columns:
+            col = [l for l in col if l.strip()]
+            if not col:
+                continue
+            base = min(len(l) - len(l.lstrip()) for l in col)
+            for l in col:
+                rel, t = len(l) - len(l.lstrip()) - base, l.strip()
+                cont = re.match(r'(.+?)\s*\((?:continued|cont\.?)\)$', t, re.I)
+                if cont:                          # 'Backtesting (Continued)': its sub-entries follow
+                    if not entries or _book_norm(entries[-1][1]) != _book_norm(cont.group(1)):
+                        mains = [e for e in entries if e[0] == 0]
+                        if not mains or not _book_norm(mains[-1][1]).startswith(_book_norm(cont.group(1))):
+                            entries.append([0, cont.group(1)])
+                    continue
+                if rel >= 4 and entries:          # a wrapped line
+                    prev = entries[-1][1]
+                    entries[-1][1] = prev[:-1] + t if prev.endswith('-') and t[:1].islower() else f'{prev} {t}'
+                elif rel >= 1 and entries:
+                    entries.append([1, t])
+                else:
+                    entries.append([0, t])
+    # A '(Continued)' that wrapped onto the next line: drop the repeated entry, its sub-entries then
+    # follow the original one
+    kept, last_main = [], ''
+    for lvl, t in entries:
+        cont = re.match(r'(.+?)\s*\((?:continued|cont\.?)\)$', t, re.I)
+        if cont and lvl == 0 and _book_norm(cont.group(1)) == _book_norm(last_main):
+            continue
+        if cont:
+            t = cont.group(1)
+        if lvl == 0:
+            last_main = t
+        kept.append((lvl, t))
+    if len(kept) < 30:
+        return None
+    return '\n'.join(('  - ' if lvl else '- ') + re.sub(r'\s{2,}', ' ', t) for lvl, t in kept)
+
+
+def bookify_note(note, pdf_path, structure=None):
+    """Turn a note built from a book PDF into a book note: structure fixed by fix_book_markdown, the
+    Index callout rebuilt from it, and author/publisher/year from the ISBN. Returns (note, structure)."""
+    structure = structure or book_structure(pdf_path)
+    if not structure:
+        return note, None
+    # frontmatter | title, summary (and the old Index callout) | divider | body
+    fm_end = note.find('\n---\n', 4) + 5
+    summary = re.search(r'^## Summary\n', note[fm_end:], re.M)
+    if fm_end < 5 or not summary:
+        return note, structure
+    div = note.find('\n---\n', fm_end + summary.end())
+    if div < 0:
+        return note, structure
+    fm, top, sep, body = note[:fm_end], note[fm_end:div], '\n---\n', note[div + 5:]
+    top = re.sub(r'\n> \[!note\]-? (?:Index|Contents)\n(?:>.*\n?)*', '\n', top)
+    title = re.search(r'^title: "(.*)"$', fm, re.M)
+    body = fix_book_markdown(body, structure, title.group(1) if title else '')
+    # The back-of-book index, rebuilt from the PDF: converters lose its columns and indentation
+    index_list = book_index(pdf_path, structure)
+    heads = list(re.finditer(r'^(#{1,6}) (?:subject )?index\s*$', body, re.M | re.I))
+    if index_list and heads:
+        h = heads[-1]
+        end = re.search(rf'^#{{1,{len(h.group(1))}}} ', body[h.end():], re.M)
+        end = h.end() + end.start() if end else len(body)
+        note_line = re.search(r'^\*?page numbers (?:followed|in).*$', body[h.end():end], re.M | re.I)
+        body = (body[:h.end()] + '\n\n' + (note_line.group(0) + '\n\n' if note_line else '') + index_list + '\n'
+                + ('\n' + body[end:] if end < len(body) else ''))
+    index = build_index(body, min_level=1)
+    callout = ('\n' + _toc_section(index, 'Index').rsplit('\n\n---', 1)[0] + '\n') if index else ''
+    meta = book_metadata(pdf_path)
+    if meta:
+        extra = ['author:\n' + '\n'.join(f'  - {yaml_str(a)}' for a in meta['authors'])] if meta['authors'] and 'author:' not in fm else []
+        extra += [frontmatter_field('published', meta['published'])] if meta['published'] and 'published:' not in fm else []
+        extra += [frontmatter_field('publication', meta['publisher'])] if meta['publisher'] and 'publication:' not in fm else []
+        extra += [f'isbn: "{meta["isbn"]}"'] if 'isbn:' not in fm else []
+        if extra:
+            fm = re.sub(r'(\ndescription: .*\n)', lambda x: x.group(1) + '\n'.join(e for e in extra if e) + '\n', fm, count=1)
+    return fm + top.rstrip('\n') + '\n' + callout + sep + body, structure
+
+
+def as_book(note, args, source=None, meta=None):
+    """(note, True) as a book note (bookify_note) with --as book, or when the PDF is a book (is_book);
+    (note, False) otherwise and with --as doc/paper. source/meta: where the PDF is, as for save_original_pdf."""
+    if args.as_type in ('doc', 'paper'):
+        return note, False
+    if not args.book and source is None and not (meta or {}).get('pdf'):
+        return note, False                     # e.g. an arXiv paper converted from its LaTeX source
+    data = original_pdf_bytes(source, meta)
+    if not data:
+        return note, False
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'book.pdf')
+        with open(path, 'wb') as f:
+            f.write(data)
+        if not args.book:
+            pages = re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', path], capture_output=True,
+                                                               text=True).stdout, re.M)
+            if not pages or int(pages.group(1)) < 50:
+                return note, False
+        structure = book_structure(path)
+        if not (args.book or is_book(structure)):
+            return note, False
+        print('Book: fixing its structure from the bookmarks and printed contents...', file=sys.stderr)
+        return bookify_note(note, path, structure)[0], True
+
+
+def book_filename(args, note):
+    """{first author's last name}-{AI filename from the title} for a book (or a paper without a DOI),
+    unless --filename is given."""
+    if args.filename:
+        return args.filename
+    title = re.search(r'^title: "(.*)"$', note, re.M)
+    author = re.search(r'^author:\n  - "(.*)"$', note, re.M)
+    ai_name = generate_filename(title.group(1) if title else '')
+    last = _slug(author.group(1).split()[-1]) if author else ''
+    return f'{last}-{ai_name}' if last else ai_name
 
 
 def in_background(fn, *args, **kwargs):
@@ -4917,6 +5900,12 @@ def parse_args(argv):
     parser.add_argument('--doi', default=None,
                         help='PDFs: the paper\'s DOI when it is known (e.g. a PDF saved from a shadow library); '
                              'saves it as a paper without searching')
+    parser.add_argument('--pages', default=None, metavar='FIRST-LAST',
+                        help='PDFs: convert only these pages, e.g. 305-393 (1-based, as in a PDF viewer); '
+                             'for debugging or filling in part of a book')
+    parser.add_argument('--as', dest='as_type', choices=['doc', 'paper', 'book'], default=None,
+                        help='PDFs: save as this type instead of detecting it: doc (docs/, no DOI or book '
+                             'detection), paper (papers/, also without a DOI) or book (books/, book structure)')
     parser.add_argument('--keep-pdf', action=argparse.BooleanOptionalAction, default=None,
                         help='papers and PDFs: also save the original PDF next to the note, with the same name '
                              '(default: KEEP_PDF)')
@@ -4926,6 +5915,15 @@ def parse_args(argv):
     # 0 is a valid value (skip that track), so test for None rather than truthiness
     if args.video_quality is not None or args.audio_quality is not None:
         args.download = True
+    args.book = args.as_type == 'book'
+    global AS_TYPE
+    AS_TYPE = args.as_type
+    if args.pages:
+        m = re.fullmatch(r'\s*(\d+)\s*-\s*(\d+)\s*', args.pages)
+        if not m or int(m.group(1)) > int(m.group(2)):
+            parser.error('--pages needs a range like 305-393')
+        global PAGE_RANGE
+        PAGE_RANGE = f'{m.group(1)}-{m.group(2)}'
     if args.keep_pdf is None:
         args.keep_pdf = KEEP_PDF
     if not args.created:
@@ -5026,8 +6024,9 @@ def save_paper(url, args, academia_doi=None, pdf_file=None, converted=None, pdf_
         if academia_doi:
             print(f'Paper not found in shadow library either. Download the PDF manually and pass the local file location to defuddle. DOI: {academia_doi}', file=sys.stderr)
         return
-    filename = paper_filename(args, meta)
-    save_dir = save_note(note, args, 'papers', filename, images_dict, source_url=pdf_source or url)
+    note, book = as_book(note, args, None if pdf_file is None else pdf_file, meta)
+    filename = book_filename(args, note) if book else paper_filename(args, meta)
+    save_dir = save_note(note, args, 'books' if book else 'papers', filename, images_dict, source_url=pdf_source or url)
     if args.keep_pdf:
         if pdf_source and not meta.get('pdf'):
             save_original_pdf(save_dir, filename, source=pdf_source)
@@ -5066,8 +6065,11 @@ def save_pdf(url, args):
     if read_only(args):
         print_note(note)
         return
-    filename = args.filename or generate_filename(meta.get('title', ''))
-    save_dir = save_note(note, args, 'docs', filename, images_dict, source_url=url)
+    note, book = as_book(note, args, None if meta.get('pdf') else url, meta)
+    paper = args.as_type == 'paper'               # --as paper without a DOI: a paper all the same
+    filename = book_filename(args, note) if book or paper else (args.filename or generate_filename(meta.get('title', '')))
+    subdir = 'books' if book else 'papers' if paper else 'docs'
+    save_dir = save_note(note, args, subdir, filename, images_dict, source_url=url)
     if args.keep_pdf:
         if meta and meta.get('pdf'):
             save_original_pdf(save_dir, filename, meta=meta)

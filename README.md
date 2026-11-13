@@ -9,6 +9,7 @@ Works with:
 - **Apple Podcasts** episodes (macOS)
 - **Academic papers**: DOI, arXiv, SSRN and Academia.edu links, article links from publishers like ScienceDirect, Wiley and Springer, PubMed, NBER and university repositories
 - **PDFs**: any `.pdf` link or a file on your computer
+- **Books**: PDFs with an ISBN and 50+ pages, or 100+ pages with chapters, are saved as books: headings from the PDF's bookmarks and printed table of contents, a linked Contents table with page numbers, the back-of-book index as a nested list, code listings repaired from the PDF, blank pages left out, and author, publisher, year and ISBN-13 from the ISBN. To override the detection, pass `--as doc`, `--as paper` or `--as book`
 
 Every note gets an AI summary, tags and an index, and images can be saved locally.
 
