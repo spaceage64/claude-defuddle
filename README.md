@@ -4,7 +4,7 @@ A token-saving replacement for Claude Code's `WebFetch`. Paste a link and [Defud
 
 Works with:
 
-- **Web pages and docs**, with Wayback Machine / archive.is fallbacks for paywalled or JS-heavy pages
+- **Web pages and docs**, with Wayback Machine, archive.is, Arquivo.pt and Common Crawl fallbacks for paywalled or JS-heavy pages
 - **YouTube videos**: full transcript with timestamps and chapters
 - **Apple Podcasts** episodes (macOS)
 - **Academic papers**: DOI, arXiv, SSRN and Academia.edu links, article links from publishers like ScienceDirect, Wiley and Springer, PubMed, NBER and university repositories
@@ -137,7 +137,7 @@ A concise AI-generated summary of the article's key points...
 [full article content]
 ```
 
-`method` says where the content came from: `defuddle-web`, `defuddle-archive` (Wayback Machine or archive.is; the archived copy is added as a second `url`), `defuddle-youtube`, `defuddle-podcast`, `defuddle-arxiv`, `defuddle-marker` or `defuddle-datalab`.
+`method` says where the content came from: `defuddle-web`, `defuddle-archive` (Wayback Machine, archive.is, Arquivo.pt or Common Crawl; the archived copy is added as a second `url`), `defuddle-youtube`, `defuddle-podcast`, `defuddle-arxiv`, `defuddle-marker` or `defuddle-datalab`.
 
 </details>
 
@@ -222,7 +222,7 @@ AI_MODEL = 'llama3.2'
 
 <br>
 
-- **Web pages** — ads and clutter are stripped, and the note gets an AI summary, a heading index and frontmatter. JS-rendered or paywalled pages, and pages that show an error page, fall back to the Wayback Machine or archive.is. Tracking parameters (utm_*, fbclid, ...) are removed from links; other query parameters are kept.
+- **Web pages** — ads and clutter are stripped, and the note gets an AI summary, a heading index and frontmatter. JS-rendered or paywalled pages, and pages that show an error or block page, fall back to a copy fetched as Googlebot, then to archived copies: the Wayback Machine, a fresh Wayback snapshot (Save Page Now), archive.is, Arquivo.pt and Common Crawl. Each copy is parsed like the live page, so only the article is kept. Save Page Now needs free Internet Archive keys ([get them here](https://archive.org/account/s3.php)) in `~/.claude/CLAUDE.md` as `` - **Internet Archive**: `ACCESS_KEY:SECRET_KEY` ``, and is skipped without them. Tracking parameters (utm_*, fbclid, ...) are removed from links; other query parameters are kept.
 - **YouTube transcripts** — manual captions first (better quality), then auto-generated ones. Duplicated lines from rolling captions are removed automatically.
 - **YouTube chapters** — the video's own chapter markers are used; without them, the AI adds logical chapter breaks.
 - **Videos without subtitles** — the note still gets the title, channel and full description, with "No subtitles available for this video." in place of the transcript. YouTube links never go through the archive fallbacks.

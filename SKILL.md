@@ -16,7 +16,7 @@ python3 ~/.claude/skills/defuddle/defuddle.py "<url>" ["<url2>" ...]
 > [!important] Several links → one command
 > Pass all links to **one** `defuddle.py` call. The script runs them in parallel (`PARALLEL_JOBS` at a time, default 4) and prints each link's output under `=== [n] url ===`. Never loop over links in the shell or start them one after another; for papers, run that one command in the background.
 
-Use the output to answer the user's question or complete the task. The script automatically detects the source type (article, YouTube, podcast, paper) and handles fetching accordingly. For articles, it falls back to archive.org / archive.is if the page is JS-rendered, paywalled or shows an error page ("Page Not Found", "Page Not Available", ...).
+Use the output to answer the user's question or complete the task. The script automatically detects the source type (article, YouTube, podcast, paper) and handles fetching accordingly. For articles, it falls back to a Googlebot fetch and archived copies (Wayback Machine, archive.is, Arquivo.pt, Common Crawl) if the page is JS-rendered, paywalled or shows an error page ("Page Not Found", "Page Not Available", ...).
 
 > [!warning] User Action Required — STOP
 > If stderr contains "captcha" or "archive it" (from `--method archive-is` or `--method wayback`), **STOP immediately. Do not try other URLs or workarounds.** Show the user the URL printed in the message and ask them to visit it and let you know when done — then retry with the same command. Alternatively, ask the user if WebFetch should be used instead.
@@ -33,7 +33,7 @@ Use the output to answer the user's question or complete the task. The script au
 ```bash
 python3 ~/.claude/skills/defuddle/defuddle.py \
   "<url>" ["<url2>" ...] --project "{folder}" --created "{YYYY-MM-DD}" \
-  [--filename "kebab-case-name"] [--method native|native-md|native-page|google|wayback|archive-is] \
+  [--filename "kebab-case-name"] [--method native|native-md|native-page|google|wayback|archive-is|arquivo|common-crawl] \
   [--download] [--video-quality 720p] [--audio-quality 64k] [--keep-pdf | --no-keep-pdf] [--doi "<doi>"]
 ```
 

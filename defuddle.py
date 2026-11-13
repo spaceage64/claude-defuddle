@@ -8,7 +8,7 @@ Usage:
         --url "<url>" --project "<project>" --created "YYYY-MM-DD"
 """
 
-import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64, difflib
+import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64, difflib, gzip
 from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -132,6 +132,19 @@ AI_BASE_URL = ''
 # ║    sonnet — higher quality, slower and more expensive                        ║
 AI_FALLBACK_MODEL = 'haiku'
 # ║                                                                              ║
+# ║  Archives — copies of pages that can't be read directly, tried in order:     ║
+# ║  Wayback Machine, Wayback "Save Page Now", archive.is, Arquivo.pt,           ║
+# ║  Common Crawl.                                                               ║
+# ║  Save Page Now makes a fresh Wayback snapshot when there is no usable one.   ║
+# ║  It needs Internet Archive keys (https://archive.org/account/s3.php) and     ║
+# ║  is skipped without them. Add to ~/.claude/CLAUDE.md:                        ║
+# ║  **Internet Archive**: `access-key:secret-key`                               ║
+WAYBACK_KEYS      = _apikey('Internet Archive')
+WAYBACK_SAVE_WAIT = 120   # seconds to wait for the new snapshot
+# ║  Common Crawl: how many of the newest monthly crawls to search (0 = off).    ║
+# ║  Each takes about 5 s; it mostly has popular pages.                          ║
+COMMON_CRAWL_INDEXES = 2
+# ║                                                                              ║
 # ║  Minimum word count to consider a fetch attempt successful. Few words        ║
 # ║  indicate and error and may trigger alternative processing methods.          ║
 MIN_WORDS = 25
@@ -174,7 +187,7 @@ def frontmatter_url(*urls):
 
 # Frontmatter 'method' says where the content came from, not which internal fetch route was used
 _METHOD_LABELS = {'native': 'web', 'native-md': 'web', 'native-page': 'web', 'google': 'web',
-                  'wayback': 'archive', 'archive-is': 'archive'}
+                  'wayback': 'archive', 'archive-is': 'archive', 'common-crawl': 'archive', 'arquivo': 'archive'}
 
 
 def method_field(method):
@@ -4363,11 +4376,17 @@ def generate_filename(title, max_words=None):
     return '-'.join(w.lower() for w in words[:3]) if words else 'untitled'
 
 
-def fetch_defuddle(url, user_agent=None):
-    """Fetch a URL via defuddle CLI and return parsed JSON dict, or {} on failure."""
+def fetch_defuddle(url, user_agent=None, page=None):
+    """Fetch a URL via defuddle CLI and return parsed JSON dict, or {} on failure.
+    page: parse this HTML (fetched elsewhere) instead; a <base> tag makes its links resolve against url."""
+    if page is not None:
+        base = f'<base href="{html.escape(url)}">'
+        page = re.sub(r'<head\b[^>]*>', lambda m: m.group(0) + base, page, count=1, flags=re.I) \
+               if re.search(r'<head\b', page, re.I) else base + page
     result = subprocess.run(
-        ['defuddle', 'parse', url, '--json', '--md', *(['--user-agent', user_agent] if user_agent else [])],
-        capture_output=True, text=True, timeout=60
+        ['defuddle', 'parse', url if page is None else '-', '--json', '--md',
+         *(['--user-agent', user_agent] if user_agent else [])],
+        input=page, capture_output=True, text=True, timeout=60
     )
     try:
         return json.loads(result.stdout)
@@ -4830,18 +4849,19 @@ def resolve_wikilink_images(content, url):
         return content
 
 
-def parse_fallback(fetch_url, url, user_agent=None):
+def parse_fallback(fetch_url, url, user_agent=None, page=None):
     """A fallback copy of url (fetched as Googlebot, or an archive snapshot) parsed like a normal
     web page, so only the real content is kept; the script-strip conversion only when the parser
-    finds nothing usable. Links into the Wayback Machine point to the live page again; archived
-    images keep their snapshot URL (the original may be gone)."""
-    d = fetch_defuddle(fetch_url, user_agent)
-    if not usable(d):
+    finds nothing usable. page: HTML fetched elsewhere (Common Crawl), parsed as fetch_url.
+    Links into an archive point to the live page again; archived images keep their snapshot URL
+    (the original may be gone)."""
+    d = fetch_defuddle(fetch_url, user_agent, page)
+    if not usable(d) and page is None:
         d = fetch_html_as_markdown(fetch_url, original_url=url, user_agent=user_agent) or {}
     if not d:
         return {}
     d = dict(d)
-    content = re.sub(r'(!\[[^\]]*\]\()?' + _WAYBACK_PREFIX.pattern,
+    content = re.sub(r'(!\[[^\]]*\]\()?' + _ARCHIVE_PREFIX.pattern,
                      lambda m: m.group(0) if m.group(1) else '', d.get('content') or '')
     d['content'], d['wordCount'] = content, len(content.split())
     if not d.get('site') or 'archive' in d['site'].lower():
@@ -4858,10 +4878,11 @@ def fetch_google(url):
     return d
 
 
-def fetch_wayback(url, archive_url):
-    """A Wayback snapshot parsed like the live page. The id_ form serves the page's original HTML
-    without the Wayback toolbar (date picker etc.), so nothing of the archive is left to strip."""
-    return parse_fallback(re.sub(r'(/web/\d+)[a-z_]*/', r'\1id_/', archive_url, count=1), url)
+def fetch_snapshot(url, archive_url):
+    """A Wayback or Arquivo.pt snapshot parsed like the live page. The id_ form serves the page's
+    original HTML without the archive's toolbar (date picker etc.), so nothing of the archive is left
+    to strip."""
+    return parse_fallback(re.sub(r'(/\d{14})[a-z_]*/', r'\1id_/', archive_url, count=1), url)
 
 
 def fetch_archive_is(url, archive_url):
@@ -5035,6 +5056,91 @@ def archive_is_save(url):
     return None
 
 
+def wayback_save(url):
+    """Ask the Wayback Machine for a fresh snapshot (Save Page Now) and return its URL, or None.
+    Needs WAYBACK_KEYS. A snapshot from the last day is returned instead of a new capture."""
+    if not WAYBACK_KEYS:
+        return None
+    # --location-trusted: curl drops the Authorization header on redirects otherwise
+    auth = ('-H', f'Authorization: LOW {WAYBACK_KEYS}', '-H', 'Accept: application/json', '--location-trusted')
+    print('Saving a fresh Wayback Machine snapshot...', file=sys.stderr, flush=True)
+    try:
+        r = json.loads(curl('https://web.archive.org/save', *auth, '--data-urlencode', f'url={url}',
+                            '-d', 'if_not_archived_within=1d', max_time=60, text=True).stdout)
+        job, deadline = r.get('job_id'), time.time() + WAYBACK_SAVE_WAIT
+        while job and time.time() < deadline:
+            time.sleep(3)
+            r = json.loads(curl(f'https://web.archive.org/save/status/{job}', *auth, max_time=20, text=True).stdout)
+            if r.get('status') == 'success':
+                return f"https://web.archive.org/web/{r['timestamp']}/{r['original_url']}"
+            if r.get('status') != 'pending':
+                break
+        print(f"Save Page Now failed: {r.get('message') or r.get('status_ext') or 'no snapshot in time'}",
+              file=sys.stderr)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        pass
+    return None
+
+
+def common_crawl_page(url):
+    """The newest copy of url in the last COMMON_CRAWL_INDEXES Common Crawl crawls, as HTML, or None.
+    The index lists where the page sits in a crawl file; only that record is downloaded."""
+    if COMMON_CRAWL_INDEXES <= 0:
+        return None
+    try:
+        crawls = json.loads(curl('https://index.commoncrawl.org/collinfo.json', max_time=15, text=True).stdout)
+        for crawl in crawls[:COMMON_CRAWL_INDEXES]:
+            r = curl(crawl['cdx-api'], '-G', '--data-urlencode', f'url={url}', '-d', 'output=json',
+                     '-d', 'filter==status:200', max_time=20, text=True)
+            hits = [h for h in (json.loads(x) for x in r.stdout.splitlines() if x.startswith('{')) if 'offset' in h]
+            if not hits:
+                continue                                  # not in this crawl (or the index is busy)
+            hit = hits[-1]
+            start = int(hit['offset'])
+            raw = curl('https://data.commoncrawl.org/' + hit['filename'], '-r',
+                       f"{start}-{start + int(hit['length']) - 1}", max_time=30).stdout
+            _, head, body = gzip.decompress(raw).split(b'\r\n\r\n', 2)   # WARC header, HTTP header, page
+            charset = re.search(rb'charset=["\']?([\w-]+)', head + body[:2000], re.I)
+            try:
+                return body.decode(charset.group(1).decode() if charset else 'utf-8', errors='replace')
+            except LookupError:
+                return body.decode('utf-8', errors='replace')
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, EOFError):
+        pass
+    return None
+
+
+def arquivo_snapshot(url):
+    """The newest Arquivo.pt snapshot URL of url, or None."""
+    try:
+        r = curl('https://arquivo.pt/textsearch', '-G', '--data-urlencode', f'versionHistory={url}',
+                 '-d', 'maxItems=1', max_time=20, text=True)
+        items = json.loads(r.stdout).get('response_items') or []
+        if items:
+            return f"https://arquivo.pt/wayback/{items[0]['tstamp']}/{items[0].get('originalURL') or url}"
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        pass
+    return None
+
+
+def _from_snapshot(find, fetch):
+    """An archive route: find(url) gives the snapshot URL, fetch(url, snapshot) parses it."""
+    def route(url):
+        archive_url = find(url)
+        return (fetch(url, archive_url), archive_url) if archive_url else ({}, None)
+    return route
+
+
+# Archive fallbacks in the order tried: (method, route); a route returns (parsed page, snapshot URL)
+ARCHIVE_ROUTES = [
+    ('wayback',      _from_snapshot(wayback_snapshot, fetch_snapshot)),
+    ('wayback',      _from_snapshot(wayback_save, fetch_snapshot)),
+    ('archive-is',   _from_snapshot(archive_is_snapshot, fetch_archive_is)),
+    ('archive-is',   _from_snapshot(archive_is_save, fetch_archive_is)),
+    ('arquivo',      _from_snapshot(arquivo_snapshot, fetch_snapshot)),
+    ('common-crawl', lambda url: (parse_fallback(url, url, page=page) if (page := common_crawl_page(url)) else {}, None)),
+]
+
 def fetch_for_method(url, method):
     """Fetch using a specific method. Returns (d, used_method)."""
     if method == 'native':
@@ -5049,30 +5155,23 @@ def fetch_for_method(url, method):
         return fetch_defuddle(url), 'native-page'
     elif method == 'google':
         return fetch_google(url), 'google'
-    elif method == 'wayback':
-        archive_url = wayback_snapshot(url)
-        if not archive_url:
-            print(
-                'No Wayback Machine snapshot found for this URL.\n'
-                'Note: Wayback Machine does not support JS-rendered pages, so this method '
-                'may not work even if a snapshot exists.',
-                file=sys.stderr
-            )
-            return {}, 'wayback'
-        return _with_archive(fetch_wayback(url, archive_url), archive_url), 'wayback'
-    elif method == 'archive-is':
-        archive_url = archive_is_snapshot(url)
-        if not archive_url:
-            archive_url = archive_is_save(url)
-        if archive_url:
-            return _with_archive(fetch_archive_is(url, archive_url), archive_url), 'archive-is'
-        print(
-            f'archive.is requires a captcha for this URL.\n'
-            f'Please visit this URL, save the page, and solve the captcha:\n'
-            f'https://archive.is/?url={quote(url, safe=":/?")}',
-            file=sys.stderr
-        )
-        return {}, 'archive-is'
+    elif any(method == name for name, _ in ARCHIVE_ROUTES):
+        found = {}
+        for name, route in ARCHIVE_ROUTES:
+            if name == method:
+                d, archive_url = route(url)
+                found = found or d
+                if usable(d):
+                    return _with_archive(d, archive_url), method
+        if not found:
+            print({'wayback': 'No Wayback Machine snapshot found for this URL'
+                              + ('' if WAYBACK_KEYS else ' (Save Page Now needs Internet Archive keys)') + '.',
+                   'common-crawl': 'Not in the newest Common Crawl crawls.',
+                   'archive-is': 'archive.is requires a captcha for this URL.\n'
+                                 'Please visit this URL, save the page, and solve the captcha:\n'
+                                 f'https://archive.is/?url={quote(url, safe=":/?")}',
+                   'arquivo': 'No Arquivo.pt snapshot found for this URL.'}[method], file=sys.stderr)
+        return found, method
     else:
         return {}, method
 
@@ -5920,7 +6019,8 @@ def parse_args(argv):
     parser.add_argument('--category', default=None, help=argparse.SUPPRESS)   # optional parent folder above --project
     parser.add_argument('--created',  default=None)
     parser.add_argument('--filename', default=None)
-    parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'google', 'wayback', 'archive-is'])
+    parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'google', 'wayback', 'common-crawl',
+                                                             'archive-is', 'arquivo'])
     _num = lambda unit: (lambda s: int(re.sub(rf'(?i){unit}$', '', s.strip())))
     parser.add_argument('--download', action='store_true',
                         help='YouTube: also save the video to vid/ and embed the local file')
@@ -6145,7 +6245,8 @@ def save_podcast(url, args):
 
 
 GOOGLEBOT_UA = 'Googlebot/2.1 (+http://www.google.com/bot.html)'
-_WAYBACK_PREFIX = re.compile(r'https?://web\.archive\.org/web/\d+(?:[a-z]{2}_)?/')
+# Snapshot URL prefix before the original URL (Wayback Machine, Arquivo.pt)
+_ARCHIVE_PREFIX = re.compile(r'https?://(?:web\.archive\.org/web|arquivo\.pt/(?:wayback|noFrame/replay))/\d+(?:[a-z]{2}_)?/')
 
 _ERROR_TITLE = re.compile(
     r"^\s*(?:error\s*)?404\b|\b404\s*(?:error|not found)|\berror\s*404\b|^\s*not found\b|\bno longer available\b|"
@@ -6204,7 +6305,8 @@ def usable(d):
 
 
 def fetch_article(url):
-    """Auto-cascade: native-md → native-page → google → wayback → archive-is.
+    """Auto-cascade: native-md → native-page → google → wayback (snapshot, then Save Page Now) →
+    archive-is → arquivo → common-crawl.
     Returns (d, used_method, target): target is the paper or PDF to continue with when the page
     is a scholarly landing page, else None."""
     # 1. native-md: the page's own .md source (docs platforms, Obsidian Publish)
@@ -6227,16 +6329,10 @@ def fetch_article(url):
         return candidate, 'google', None
 
     # 4. Archive fallbacks: the archived page, parsed like a normal page
-    for get_archive_url, fetch, method_name in [
-        (wayback_snapshot,    fetch_wayback,    'wayback'),
-        (archive_is_snapshot, fetch_archive_is, 'archive-is'),
-        (archive_is_save,     fetch_archive_is, 'archive-is'),
-    ]:
-        archive_url = get_archive_url(url)
-        if archive_url:
-            candidate = fetch(url, archive_url)
-            if usable(candidate):
-                return _with_archive(candidate, archive_url), method_name, None
+    for method_name, route in ARCHIVE_ROUTES:
+        candidate, archive_url = route(url)
+        if usable(candidate):
+            return _with_archive(candidate, archive_url), method_name, None
 
     print(
         f'No usable copy found: the page appears JS-rendered or shows an error or block page, and no archive\n'
