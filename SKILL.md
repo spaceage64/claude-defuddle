@@ -33,7 +33,7 @@ Use the output to answer the user's question or complete the task. The script au
 ```bash
 python3 ~/.claude/skills/defuddle/defuddle.py \
   "<url>" ["<url2>" ...] --project "{folder}" --created "{YYYY-MM-DD}" \
-  [--filename "kebab-case-name"] [--method native|native-md|native-page|googlebot|wayback|archive-is] \
+  [--filename "kebab-case-name"] [--method native|native-md|native-page|google|wayback|archive-is] \
   [--download] [--video-quality 720p] [--audio-quality 64k] [--keep-pdf | --no-keep-pdf] [--doi "<doi>"]
 ```
 

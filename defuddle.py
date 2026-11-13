@@ -173,7 +173,7 @@ def frontmatter_url(*urls):
 
 
 # Frontmatter 'method' says where the content came from, not which internal fetch route was used
-_METHOD_LABELS = {'native': 'web', 'native-md': 'web', 'native-page': 'web', 'googlebot': 'web',
+_METHOD_LABELS = {'native': 'web', 'native-md': 'web', 'native-page': 'web', 'google': 'web',
                   'wayback': 'archive', 'archive-is': 'archive'}
 
 
@@ -639,11 +639,15 @@ def older_gemini_models(alias):
     return [name for _, name in sorted(versions, reverse=True)[1:]]
 
 
+_ai_last_model = None   # the model that last answered ai_request, for available_ai_model()
+
+
 def ai_request(prompt, timeout=60, json_reply=False):
     """Send a prompt to the provider configured by AI_LLM / AI_MODEL and return the reply text.
     With a list of models, an overloaded or rate-limited one (HTTP 429/5xx, timeout) passes to the
     next, and then to AI_OLDER_MODELS older versions of a Gemini '-latest' alias. json_reply asks the
     provider for valid JSON only. Raises when all fail; callers then fall back to the Claude CLI."""
+    global _ai_last_model
     import urllib.request as _urlreq, urllib.error as _urlerr
     models = [AI_MODEL] if isinstance(AI_MODEL, str) else list(AI_MODEL)
     older = AI_LLM == 'gemini' and AI_OLDER_MODELS > 0   # older versions not added yet
@@ -673,7 +677,7 @@ def ai_request(prompt, timeout=60, json_reply=False):
             # An overloaded model can hang instead of answering 503: don't wait long when another follows
             with _urlreq.urlopen(req, timeout=timeout if last else min(timeout, 20)) as r:
                 reply = pick(json.loads(r.read()))
-            ai_request.model = model   # the model that answered, for available_ai_model()
+            _ai_last_model = model
             return reply
         except (_urlerr.HTTPError, TimeoutError, _urlerr.URLError) as e:
             busy = isinstance(e, TimeoutError) or getattr(e, 'code', 0) in (429, 500, 502, 503, 504) \
@@ -692,7 +696,7 @@ def available_ai_model():
     model name (marker); the first configured model when none answers."""
     try:
         ai_request('Reply with OK.', timeout=30)
-        return ai_request.model
+        return _ai_last_model
     except Exception:
         return AI_MODEL if isinstance(AI_MODEL, str) else AI_MODEL[0]
 
@@ -1453,7 +1457,7 @@ def _pdf_meta_people_date(path, text):
         out = subprocess.run(['pdfinfo', '-isodates', path], capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return [], ''
-    field = lambda k: (re.search(rf'^{k}:\s*(.+)$', out, re.M) or [None, ''])[1].strip()
+    field = lambda k: m.group(1).strip() if (m := re.search(rf'^{k}:\s*(.+)$', out, re.M)) else ''
     seen = (text[:6000] + '\n' + text[-3000:]).lower()   # title page and signature
     raw = field('Author')
     parts = re.split(r'\s*;\s*|\s+(?:and|&)\s+', raw)
@@ -3008,6 +3012,7 @@ def restore_listings(md, pdf_path):
         if not cm:
             continue
         blocks = re.compile(r'\s*(?:```[^\n]*\n.*?\n```[ \t]*\n?|---\s*\n)*', re.S).match(md, cm.end())
+        assert blocks   # (...)* also matches nothing
         span = md[cm.end():blocks.end()]
         have = {key(x) for x in re.findall(r'^.*$', span, re.M)}
         want = [key(x) for x in code if len(x.strip()) > 3]
@@ -3475,6 +3480,14 @@ def _metadata_from_latex(tex_path):
     except Exception:
         return {}
 
+def _simple_table_cols(s, col_starts):
+    """The cells of one simple-table line, cut at the separator line's column starts."""
+    cols = []
+    for j, start in enumerate(col_starts):
+        end = col_starts[j + 1] if j + 1 < len(col_starts) else len(s)
+        cols.append(s[start:end].strip() if start < len(s) else '')
+    return cols
+
 def _convert_simple_tables(md):
     """Convert pandoc simple tables (space-aligned) to pipe tables for Obsidian."""
     lines = md.split('\n')
@@ -3486,19 +3499,13 @@ def _convert_simple_tables(md):
         if re.match(r'^\s*-{2,}(?:\s+-{2,})+\s*$', line) and i > 0:
             col_starts = [m.start() for m in re.finditer(r'-+', line)]
             if len(col_starts) >= 2:
-                def get_cols(s, col_starts=col_starts):
-                    cols = []
-                    for j, start in enumerate(col_starts):
-                        end = col_starts[j + 1] if j + 1 < len(col_starts) else len(s)
-                        cols.append(s[start:end].strip() if start < len(s) else '')
-                    return cols
                 header_line = out.pop()
-                header_cols = get_cols(header_line)
+                header_cols = _simple_table_cols(header_line, col_starts)
                 out.append('| ' + ' | '.join(c or ' ' for c in header_cols) + ' |')
                 out.append('| ' + ' | '.join('---' for _ in col_starts) + ' |')
                 i += 1
                 while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith(':'):
-                    out.append('| ' + ' | '.join(c or ' ' for c in get_cols(lines[i])) + ' |')
+                    out.append('| ' + ' | '.join(c or ' ' for c in _simple_table_cols(lines[i], col_starts)) + ' |')
                     i += 1
                 # Skip blank lines before caption
                 while i < len(lines) and not lines[i].strip():
@@ -3864,8 +3871,8 @@ def _strip_html_preserve_math(text):
             result.append(text[i:end + 1])
             i = end + 1
         # Strip HTML tags (a real tag only: "<90% error ... >1000" is text)
-        elif text[i] == '<' and _HTML_TAG.match(text, i):
-            i = _HTML_TAG.match(text, i).end()
+        elif text[i] == '<' and (tag := _HTML_TAG.match(text, i)):
+            i = tag.end()
         else:
             result.append(text[i])
             i += 1
@@ -4823,8 +4830,8 @@ def resolve_wikilink_images(content, url):
         return content
 
 
-def fetch_googlebot(url):
-    """Fetch page as Googlebot, strip scripts, convert to markdown."""
+def fetch_google(url):
+    """Fetch page as Google UA, strip scripts, convert to markdown."""
     d = fetch_html_as_markdown(url, user_agent='Googlebot/2.1 (+http://www.google.com/bot.html)')
     if d:
         d = dict(d)
@@ -5009,12 +5016,12 @@ def fetch_for_method(url, method):
         return fetch_direct_md(url) or {}, 'native-md'
     elif method == 'native-page':
         return fetch_defuddle(url), 'native-page'
-    elif method == 'googlebot':
-        candidate = fetch_googlebot(url)
+    elif method == 'google':
+        candidate = fetch_google(url)
         if candidate:
             candidate = dict(candidate)
             candidate['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
-        return candidate or {}, 'googlebot'
+        return candidate or {}, 'google'
     elif method == 'wayback':
         archive_url = wayback_snapshot(url)
         if not archive_url:
@@ -5218,8 +5225,9 @@ def _ocr_pdf(path):
     The scan images are left untouched, so the file only grows by the text (a few KB per page)."""
     words = _pdf_text_words(path) or 0
     try:
-        pages = int(re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', path], capture_output=True,
-                                                                text=True).stdout, re.M).group(1))
+        m = re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', path], capture_output=True,
+                                                         text=True).stdout, re.M)
+        pages = int(m.group(1)) if m else 0
     except Exception:
         pages = 0
     if pages and words / pages >= 50:
@@ -5334,6 +5342,7 @@ def run_batch(urls, argv):
         with tempfile.TemporaryFile('w+', encoding='utf-8') as out:
             p = subprocess.Popen([sys.executable, os.path.abspath(__file__), url] + rest,
                                  stdout=out, stderr=subprocess.PIPE, text=True)
+            assert p.stderr   # set by stderr=PIPE
             for line in p.stderr:
                 print(f'[{n}] {line}', end='', file=sys.stderr, flush=True)
             p.wait()
@@ -5401,7 +5410,7 @@ def book_structure(pdf_path):
                 if entries < 15:
                     break
                 end = n
-        if start is None:
+        if start is None or end is None:   # (set together)
             start, end = 1, min(30, info['pages'])
     text = subprocess.run(['pdftotext', '-f', str(start), '-l', str(end), '-layout', pdf_path, '-'],
                           capture_output=True, text=True, timeout=60).stdout
@@ -5544,8 +5553,8 @@ def fix_book_markdown(md, structure, title=''):
             chapter, seen_chapter = e['num'], True
             out.append(f'## Appendix {e["num"]}: {e["title"]}' if e.get('appendix') else f'## {e["num"]} {e["title"]}')
             level, in_exercises = 2, False
-        elif re.match(r'^(\d+(?:\.(?:\d+|[A-Z]))+)\.?\s', text):
-            num = re.match(r'^(\d+(?:\.(?:\d+|[A-Z]))+)', text).group(1)
+        elif m := re.match(r'^(\d+(?:\.(?:\d+|[A-Z]))+)\.?\s', text):
+            num = m.group(1)
             if in_exercises and (num not in sections or num in passed):   # exercise 2.1, not section 2.1
                 out.append(f'**{num}** {text[len(num):].strip()}')
                 continue
@@ -5887,7 +5896,7 @@ def parse_args(argv):
     parser.add_argument('--category', default=None, help=argparse.SUPPRESS)   # optional parent folder above --project
     parser.add_argument('--created',  default=None)
     parser.add_argument('--filename', default=None)
-    parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'googlebot', 'wayback', 'archive-is'])
+    parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'google', 'wayback', 'archive-is'])
     _num = lambda unit: (lambda s: int(re.sub(rf'(?i){unit}$', '', s.strip())))
     parser.add_argument('--download', action='store_true',
                         help='YouTube: also save the video to vid/ and embed the local file')
@@ -6037,6 +6046,7 @@ def save_paper(url, args, academia_doi=None, pdf_file=None, converted=None, pdf_
 def save_pdf(url, args):
     """Plain PDFs (links and local files): scan the first pages for a DOI and continue as a paper
     when there is one, else save the PDF's text to docs/."""
+    meta: dict
     if args.doi:   # DOI given: no need to search for it
         doi = re.sub(r'^(https?://(dx\.)?doi\.org/|doi:)', '', args.doi.strip(), flags=re.I)
         note, images_dict, meta = None, None, {'redirect_doi': doi}
@@ -6102,11 +6112,11 @@ def save_podcast(url, args):
     # Strip words containing digits (e.g. "S10E5", "256") from episode title
     cleaned_title = ' '.join(w for w in title.split() if not re.search(r'\d', w)).strip()
     show_slug = in_background(generate_filename, show, max_words=2) if show and not args.filename else None
-    ep_slug   = in_background(generate_filename, cleaned_title or title) if not args.filename else None
+    ep_slug   = None if args.filename else in_background(generate_filename, cleaned_title or title)
     # Canonical URL: keep only ?i= param
     clean_pod_url = re.sub(r'[?&]i=(\d+).*', r'?i=\1', url)
     note = build_apple_podcast(clean_pod_url, args.project, args.created, ttml_path, meta=meta)
-    filename = args.filename or (f'{show_slug.result()}-{ep_slug.result()}' if show_slug else ep_slug.result())
+    filename = '-'.join(f.result() for f in (show_slug, ep_slug) if f) or args.filename
     save_note(note, args, 'transcripts', filename, source_url=url)
 
 
@@ -6123,7 +6133,7 @@ def usable(d):
 
 
 def fetch_article(url):
-    """Auto-cascade: native-md → native-page → googlebot → wayback → archive-is.
+    """Auto-cascade: native-md → native-page → google → wayback → archive-is.
     Returns (d, used_method, target): target is the paper or PDF to continue with when the page
     is a scholarly landing page, else None."""
     # 1. native-md: the page's own .md source (docs platforms, Obsidian Publish)
@@ -6140,12 +6150,12 @@ def fetch_article(url):
     if usable(candidate):
         return candidate, 'native-page', None
 
-    # 3. googlebot: Googlebot UA + script-strip
-    candidate = fetch_googlebot(url)
+    # 3. google: Google UA + script-strip
+    candidate = fetch_google(url)
     if usable(candidate):
         candidate = dict(candidate)
         candidate['site'] = re.sub(r'^www\.', '', urlparse(url).netloc)
-        return candidate, 'googlebot', None
+        return candidate, 'google', None
 
     # 4. Archive fallbacks
     for get_archive_url, method_name in [
@@ -6192,12 +6202,12 @@ def save_web(url, args, d, used_method):
         return
 
     title = d.get('title', '') or title_from_content(d.get('content', ''))
-    filename = None if args.filename else in_background(generate_filename, title)
+    slug = None if args.filename else in_background(generate_filename, title)
     if youtube:
         note = build_youtube(d, url, args.project, args.created)
     else:
         note = build_article(d, url, args.project, args.created, method=used_method)
-    filename = args.filename or filename.result()
+    filename = slug.result() if slug else args.filename
 
     def finish(note, save_dir):
         if not (args.download and youtube):
