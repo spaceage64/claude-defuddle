@@ -672,7 +672,9 @@ def ai_request(prompt, timeout=60, json_reply=False):
         try:
             # An overloaded model can hang instead of answering 503: don't wait long when another follows
             with _urlreq.urlopen(req, timeout=timeout if last else min(timeout, 20)) as r:
-                return pick(json.loads(r.read()))
+                reply = pick(json.loads(r.read()))
+            ai_request.model = model   # the model that answered, for available_ai_model()
+            return reply
         except (_urlerr.HTTPError, TimeoutError, _urlerr.URLError) as e:
             busy = isinstance(e, TimeoutError) or getattr(e, 'code', 0) in (429, 500, 502, 503, 504) \
                    or isinstance(getattr(e, 'reason', None), TimeoutError)
@@ -683,6 +685,16 @@ def ai_request(prompt, timeout=60, json_reply=False):
                 raise
             print(f'{model} unavailable ({e}) — trying {models[i + 1]}...', file=sys.stderr)
         i += 1
+
+
+def available_ai_model():
+    """The first model in the AI_MODEL fallback chain that answers right now, for tools that take one
+    model name (marker); the first configured model when none answers."""
+    try:
+        ai_request('Reply with OK.', timeout=30)
+        return ai_request.model
+    except Exception:
+        return AI_MODEL if isinstance(AI_MODEL, str) else AI_MODEL[0]
 
 
 def ai_enrich(title, author, content, needs_chapters=False):
@@ -2369,14 +2381,20 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
 
 def pdf_to_markdown(pdf_path):
     """Convert a PDF to markdown + images dict via PDF_PROCESSOR setting.
+    A copy fixed by _prepare_pdf() is converted when the PDF needs it; checks use the original.
 
     Returns (markdown_str, images_dict, method_name).
     """
+    with tempfile.TemporaryDirectory() as tmp:
+        return _pdf_to_markdown(pdf_path, _prepare_pdf(pdf_path, os.path.join(tmp, 'prepared.pdf')))
+
+
+def _pdf_to_markdown(pdf_path, convert_path):
     def _try_datalab():
         if not DATALAB_API_KEY:
             return None
         print('Converting PDF via Datalab Marker API...', file=sys.stderr)
-        result = curl('https://www.datalab.to/api/v1/marker', '-X', 'POST', '-H', f'X-Api-Key: {DATALAB_API_KEY}', '-F', f'file=@{pdf_path}', '-F', 'output_format=markdown', '-F', 'mode=balanced', max_time=55)
+        result = curl('https://www.datalab.to/api/v1/marker', '-X', 'POST', '-H', f'X-Api-Key: {DATALAB_API_KEY}', '-F', f'file=@{convert_path}', '-F', 'output_format=markdown', '-F', 'mode=balanced', max_time=55)
         try:
             data = json.loads(result.stdout.decode('utf-8', errors='replace'))
             check_url = data.get('request_check_url')
@@ -2398,28 +2416,32 @@ def pdf_to_markdown(pdf_path):
             print(f'Datalab error: {e}', file=sys.stderr)
         return None
 
-    def _try_local():
+    def _try_local(precise=MARKER_PRECISE):
         if not shutil.which('marker_single'):
             return None
-        _MARKER_LLM = {
-            'gemini': ('marker.services.gemini.GoogleGeminiService', '--gemini_api_key'),
-            'openai': ('marker.services.openai.OpenAIService',       '--openai_api_key'),
-            'claude': ('marker.services.claude.ClaudeService',       '--claude_api_key'),
-            'ollama': ('marker.services.ollama.OllamaService',       None),
+        _MARKER_LLM = {   # service, API key flag, model flag
+            'gemini': ('marker.services.gemini.GoogleGeminiService', '--gemini_api_key', '--gemini_model_name'),
+            'openai': ('marker.services.openai.OpenAIService',       '--openai_api_key', '--openai_model'),
+            'claude': ('marker.services.claude.ClaudeService',       '--claude_api_key', '--claude_model_name'),
+            'ollama': ('marker.services.ollama.OllamaService',       None,               '--ollama_model'),
         }
-        marker_service, key_flag = _MARKER_LLM.get(AI_LLM, (None, None))
+        marker_service, key_flag, model_flag = _MARKER_LLM.get(AI_LLM, (None, None, None))
         use_llm = bool(marker_service and (AI_API_KEY or AI_LLM == 'ollama'))
         with tempfile.TemporaryDirectory() as out_dir:
-            cmd = ['marker_single', pdf_path, '--output_dir', out_dir, '--output_format', 'markdown']
-            if MARKER_PRECISE:
+            cmd = ['marker_single', convert_path, '--output_dir', out_dir, '--output_format', 'markdown']
+            if precise:
                 cmd += ['--force_ocr']   # without it inline math can stay broken text (*Xt* instead of $X_t$)
             if use_llm:
                 cmd += ['--use_llm', '--llm_service', marker_service]
-                if MARKER_PRECISE:
+                if precise:
                     cmd += ['--redo_inline_math']
                 if key_flag and AI_API_KEY:
                     cmd += [key_flag, AI_API_KEY]
-                print(f'Running local marker (with {AI_LLM} LLM)...', file=sys.stderr)
+                # The same models as the summaries and tags: the first one that answers now, since
+                # marker takes one model and can't step down to another while converting
+                model = available_ai_model()
+                cmd += [model_flag, model]
+                print(f'Running local marker (with {AI_LLM} LLM, {model})...', file=sys.stderr)
             else:
                 print('Running local marker...', file=sys.stderr)
             r = _run_marker(cmd)
@@ -2451,10 +2473,26 @@ def pdf_to_markdown(pdf_path):
         expected = _pdf_text_words(pdf_path)
         got = len(result[0].split())
         if expected and expected > 500 and got < expected * INCOMPLETE_RATIO:
-            print(f'Conversion looks incomplete ({got} of about {expected} words) — retrying once...', file=sys.stderr)
-            retry = _convert()
-            if retry is not None and len(retry[0].split()) > got:
-                result, got = retry, len(retry[0].split())
+            # Try another route instead of the same one again: what trips up one usually converts with
+            # another (e.g. full-page OCR losing every page after a merged-in cover page)
+            others = []
+            if result[2] == 'marker' and MARKER_PRECISE:
+                others.append(('local marker without full-page OCR', lambda: _try_local(precise=False)))
+            if result[2] == 'marker' and PDF_PROCESSOR != 'local':
+                others.append(('Datalab', _try_datalab))
+            if result[2] == 'datalab' and PDF_PROCESSOR != 'datalab':
+                others.append(('local marker', _try_local))
+            for name, attempt in others:
+                print(f'Conversion looks incomplete ({got} of about {expected} words) — trying {name}...', file=sys.stderr)
+                retry = attempt()
+                if retry is not None and len(retry[0].split()) > got:
+                    result, got = retry, len(retry[0].split())
+                if got >= expected * INCOMPLETE_RATIO:
+                    break
+            if got < expected * EMPTY_RATIO:
+                print(f'PDF conversion failed: only {got} of about {expected} words came through, so nothing '
+                      'is saved. Try again later or convert the PDF another way.', file=sys.stderr)
+                return '', {}, ''
             if got < expected * INCOMPLETE_RATIO:
                 print(f'WARNING: conversion looks incomplete ({got} of about {expected} words in the PDF\'s '
                       'text layer); check the note against the PDF.', file=sys.stderr)
@@ -2548,6 +2586,7 @@ def _run_marker(cmd, timeout=4 * 3600):
 # A converted PDF normally has 85–125% of the words in the PDF's own text layer; much less
 # means part of it was lost (e.g. a conversion that stopped partway through)
 INCOMPLETE_RATIO = 0.7
+EMPTY_RATIO      = 0.05   # less than this is a failed conversion: no note is saved
 
 def _missing_equations(path, md):
     """Equation numbers printed in the PDF (a '(12)' on its own line of the text layer) that no
@@ -4556,6 +4595,67 @@ def _tessdata_dir():
         return m.group(1) if m else None
     except (OSError, subprocess.SubprocessError):
         return None
+
+_PDF_PREPARE = '''
+import sys, json, pymupdf
+pymupdf.TOOLS.mupdf_display_errors(False)
+src, out = sys.argv[1:3]
+doc = pymupdf.open(src)                          # opening repairs a damaged cross-reference table
+if doc.needs_pass:
+    doc.authenticate('')                         # "encrypted" with an empty password
+changed = doc.is_repaired or doc.is_encrypted
+flattened = []
+for page in doc:
+    r = page.rect
+    mx, my = r.width / 2, r.height / 2         # sticking out by more than half the page: not a normal crop
+    boxes = [i['bbox'] for i in page.get_image_info()] + [d['rect'] for d in page.get_drawings()]
+    if any(b[2] - b[0] > 1 and b[3] - b[1] > 1
+           and (b[0] < r.x0 - mx or b[1] < r.y0 - my or b[2] > r.x1 + mx or b[3] > r.y1 + my) for b in boxes):
+        # Graphics far outside the page (e.g. a cover cut from a two-page spread) can make marker lose
+        # every following page. Keep the text as it is and replace the graphics by an image of their
+        # visible part: render them from a copy without text, then remove them from the page.
+        # Unrotated while doing so, so the image goes back the way it was rendered
+        rotation = page.rotation
+        page.set_rotation(0)
+        r = page.rect
+        tmp = pymupdf.open()
+        tmp.insert_pdf(doc, from_page=page.number, to_page=page.number)
+        tmp[0].add_redact_annot(tmp[0].rect)
+        tmp[0].apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                                text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+        pix = tmp[0].get_pixmap(dpi=200)
+        page.add_redact_annot(r)
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED, text=pymupdf.PDF_REDACT_TEXT_NONE)
+        page.insert_image(r, pixmap=pix, overlay=False)
+        page.set_rotation(rotation)
+        flattened.append(page.number + 1)
+if changed or flattened:
+    doc.save(out, garbage=3, deflate=True)
+print(json.dumps({'repaired': bool(doc.is_repaired), 'flattened': sorted(flattened), 'saved': bool(changed or flattened)}))
+'''
+
+
+def _prepare_pdf(path, out):
+    """Write a copy of the PDF that converts reliably to out, and return its path; the original is
+    returned when nothing needs fixing (or uv is missing). Repairs damaged files, opens PDFs locked with
+    an empty password, and trims graphics far outside the page to their visible part (text untouched)."""
+    if not shutil.which('uv'):
+        return path
+    try:
+        r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pymupdf', 'python', '-c',
+                            _PDF_PREPARE, path, out], capture_output=True, text=True, timeout=600)
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return path
+    if info.get('repaired'):
+        print('Repaired the PDF\'s file structure before converting', file=sys.stderr)
+    if info.get('flattened'):
+        pages = info['flattened']
+        print(f'Page{"s" if len(pages) > 1 else ""} {", ".join(map(str, pages))} {"have" if len(pages) > 1 else "has"} '
+              'graphics far outside the page: trimmed them to the visible part', file=sys.stderr)
+    return out if info.get('saved') and os.path.exists(out) else path
+
 
 def _ocr_pdf(path):
     """Add an invisible OCR text layer to the pages of a PDF that have no text (scans), in place.
