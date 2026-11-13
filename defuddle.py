@@ -758,6 +758,19 @@ Content:
         return '', '', [], []
 
 
+_TEX_SYMBOLS = {
+    'geq': '≥', 'ge': '≥', 'leq': '≤', 'le': '≤', 'neq': '≠', 'ne': '≠', 'approx': '≈', 'sim': '~',
+    'times': '×', 'cdot': '·', 'pm': '±', 'infty': '∞', 'to': '→', 'rightarrow': '→', 'leftarrow': '←',
+    'in': '∈', 'notin': '∉', 'subset': '⊂', 'subseteq': '⊆', 'cup': '∪', 'cap': '∩', 'partial': '∂',
+    'nabla': '∇', 'sum': 'Σ', 'prod': 'Π', 'int': '∫', 'sqrt': '√', 'ell': 'ℓ',
+    'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ', 'epsilon': 'ε', 'varepsilon': 'ε', 'zeta': 'ζ',
+    'eta': 'η', 'theta': 'θ', 'vartheta': 'ϑ', 'iota': 'ι', 'kappa': 'κ', 'lambda': 'λ', 'mu': 'μ', 'nu': 'ν',
+    'xi': 'ξ', 'pi': 'π', 'rho': 'ρ', 'sigma': 'σ', 'tau': 'τ', 'upsilon': 'υ', 'phi': 'φ', 'varphi': 'φ',
+    'chi': 'χ', 'psi': 'ψ', 'omega': 'ω', 'Gamma': 'Γ', 'Delta': 'Δ', 'Theta': 'Θ', 'Lambda': 'Λ', 'Xi': 'Ξ',
+    'Pi': 'Π', 'Sigma': 'Σ', 'Phi': 'Φ', 'Psi': 'Ψ', 'Omega': 'Ω',
+}
+
+
 def _heading_display(title):
     """Return a plain-text display string for a heading that may contain LaTeX or markdown.
 
@@ -778,6 +791,12 @@ def _heading_display(title):
     s = re.sub(r'\\math\w+\s+([A-Za-z])', r'\1', s)
     # Strip $...$ wrappers (keep inner content)
     s = re.sub(r'\$([^$]+)\$', r'\1', s)
+    # Accents keep their letter (\widehat{SR} → SR), escaped braces become braces
+    s = re.sub(r'\\(?:widehat|hat|widetilde|tilde|bar|overline|underline|vec|dot|ddot|boldsymbol|bm)\{([^{}]*)\}',
+               r'\1', s)
+    s = s.replace(r'\{', '{').replace(r'\}', '}')
+    # Symbols as their Unicode character ($k \geq 1$ → k ≥ 1), Greek letters too
+    s = re.sub(r'\\([a-zA-Z]+)\b', lambda m: _TEX_SYMBOLS.get(m.group(1), m.group(0)), s)
     # Strip remaining \commands (leave their arguments in place)
     s = re.sub(r'\\[a-zA-Z]+', '', s)
     # Collapse multiple spaces
@@ -785,18 +804,25 @@ def _heading_display(title):
     return s
 
 
+def link_safe_headings(content):
+    """Headings that links can point to: '|' breaks a link ([[#A | B]] means target 'A ', shown as 'B'),
+    so it becomes ' / ', and trailing spaces (never intended) are removed."""
+    return re.sub(r'^(#{1,6} .*)$', lambda m: re.sub(r'\s*\|\s*', ' / ', m.group(1)).rstrip(), content, flags=re.M)
+
+
 def build_index(content, min_level=2):
-    """Build a nested index from markdown headings, indented relative to the shallowest level."""
+    """Build a nested index from markdown headings: each heading sits one step (2 spaces) below the
+    nearest heading above it with a lower level. Steps of one keep it a nested list; a bigger jump
+    (e.g. ## straight to ####) would render as a code block in CommonMark/Obsidian."""
     headings = re.findall(r'^(#{' + str(min_level) + r',6})\s+(.+)$', content, re.MULTILINE)
     if not headings:
         return None
-    # Map distinct heading levels to 0, 2, 4... spaces, but cap at 2 to avoid
-    # the 4-space indented code block rendering bug in CommonMark/Obsidian.
-    distinct_levels = sorted(set(len(h) for h, _ in headings))
-    level_to_indent = {lvl: min(i * 2, 2) for i, lvl in enumerate(distinct_levels)}
-    lines = []
+    lines, parents = [], []   # levels of the headings the current one is nested in
     for hashes, title in headings:
-        indent = ' ' * level_to_indent[len(hashes)]
+        while parents and parents[-1] >= len(hashes):
+            parents.pop()
+        indent = '  ' * len(parents)
+        parents.append(len(hashes))
         display = _heading_display(title)
         if display != title:
             lines.append(f'{indent}- [[#{title}|{display}]]')
@@ -879,6 +905,7 @@ def build_youtube(d, url, project, created):
     desc = '\n'.join(line for line in desc.splitlines() if line.strip())
 
     # Build Contents from chapter headings (none without a transcript)
+    transcript_body = link_safe_headings(transcript_body)
     contents = build_index(transcript_body) or '[Chapters to be added]'
     contents_section = _toc_section(contents) + '\n\n' if transcript_body else ''
 
@@ -1219,6 +1246,7 @@ def build_apple_podcast(url, project, created, ttml_path, meta=None):
         transcript_body = insert_chapters(transcript_body, ai_chapters)
         has_chapters = True
 
+    transcript_body = link_safe_headings(transcript_body)
     contents = build_index(transcript_body) or '[Chapters to be added]'
     contents_section = _toc_section(contents)
 
@@ -2725,6 +2753,9 @@ def _clean_pdf_markdown(md, images):
 # style, so '1.' sections and '1)' items can be different levels. First match wins.
 _P = r'(?:[.):]|\s*[-–—])'   # punctuation after a marker
 _HEADING_STYLES = [
+    ('upper3',  re.compile(r'^(?:Appendix\s+)?[A-Z]\.\d{1,2}\.\d{1,2}[.):]?\s')),   # appendix sections: A.1.1
+    ('upper2',  re.compile(r'^(?:Appendix\s+)?[A-Z]\.\d{1,2}[.):]?\s')),              # A.1, Appendix B.1.
+    ('appendix', re.compile(r'^(?:[A-Z][.):]?\s+)?Appendix\b()')),        # "Appendix B", "A Appendix: Details"
     ('arabic3', re.compile(r'^\d{1,2}\.\d{1,2}\.\d{1,2}[.):]?\s')),
     ('arabic2', re.compile(r'^\d{1,2}\.\d{1,2}[.):]?\s')),
     ('arabic',  re.compile(rf'^\d{{1,2}}({_P}?)\s+\S')),
@@ -2785,8 +2816,9 @@ def _normalize_heading_levels(md):
     Numbering can be 1 / I / i / A / a followed by '.', ')', ':', a dash or nothing, or (1) / (i) / (a).
     The style that comes first is the main level and each style that appears later one level deeper;
     '2.1' always sits right below '2.' and '2.1.1' below that. Main sections become ##, right below
-    the note's title. Only for documents with at least two headings in the main style."""
-    matches = list(re.finditer(r'^(#{2,6}) +(.+)$', md, re.M))
+    the note's title. Appendices ('Appendix B', 'A Appendix: ...') are main sections and A.1 / A.1.1 sit
+    like 2.1 / 2.1.1. Only for documents with at least two headings in the main style."""
+    matches = list(re.finditer(r'^(#{1,6}) +(.+)$', md, re.M))
     titles = [re.sub(r'[*_]', '', m.group(2)).strip() for m in matches]
     bare = _bare_numbering(titles)
     found, prev_letter = [], {}
@@ -2808,7 +2840,7 @@ def _normalize_heading_levels(md):
         return md
     order = []
     for *_, kind, style in found:
-        if kind not in ('arabic2', 'arabic3') and style not in order:
+        if kind not in ('arabic2', 'arabic3', 'upper2', 'upper3', 'appendix') and style not in order:
             order.append(style)
     deeper = [s for s in ('arabic2', 'arabic3') if any(f[3] == s for f in found)]
     first_arabic = next((i for i, s in enumerate(order) if s.startswith('arabic')), None)
@@ -2816,10 +2848,13 @@ def _normalize_heading_levels(md):
         order[first_arabic + 1:first_arabic + 1] = deeper
     else:
         order += deeper
-    if sum(1 for f in found if f[3] == order[0]) < 2:
+    if not order or sum(1 for f in found if f[3] == order[0]) < 2:
         return md
-    for a, b, _, style in reversed(found):
-        md = md[:a] + '#' * min(2 + order.index(style), 6) + md[b:]
+    # Appendix numbering follows the main numbering: Appendix = main level, A.1 = 2.1, A.1.1 = 2.1.1
+    level = {'appendix': 0, 'upper2': 1, 'upper3': 2}
+    for a, b, kind, style in reversed(found):
+        depth = level[kind] if kind in level else order.index(style)
+        md = md[:a] + '#' * min(2 + depth, 6) + md[b:]
     return md
 
 def _bold_titles_to_headings(md):
@@ -3502,6 +3537,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
         content = re.sub(r'\[(' + _keys_pat + r')([\s,][^\]]+)?\]', _replace_cite, content)
 
     # Build TOC from headings after abstract only, insert before first post-abstract section
+    content = link_safe_headings(content)
     abstract_end_m = re.search(r'#{1,4}\s+\*{0,3}Abstract\*{0,3}[^\n]*\n', content, re.IGNORECASE)
     toc_source = content[abstract_end_m.end():] if abstract_end_m else content
     toc = build_index(toc_source, min_level=1)
@@ -3571,6 +3607,7 @@ def build_article(d, url, project, created, method=None):
     ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
 
     # Build index from article headings
+    content = link_safe_headings(content)
     index = build_index(content)
 
     fm_description = ai_desc if ai_desc else '[Description to be added]'
@@ -3691,6 +3728,7 @@ def build_pdf(url, project, created, skip_doi=False):
         method_field(method),
     ])
     summary = ai_summary or '[Summary to be added]'
+    content = link_safe_headings(content)
     index = build_index(content)
     index_section = ('\n' + _toc_section(index, 'Index') + '\n') if index else '\n---\n'
 
