@@ -20,16 +20,39 @@ import io
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding='utf-8')
 
-# Keys are read from ~/.claude/CLAUDE.md — add a line like: **ServiceName**: `your-key`
-try:
-    _claude_md = open(os.path.expanduser('~/.claude/CLAUDE.md')).read()
-    _apikey = lambda s: (m.group(1) if (m := re.search(rf'\*\*{s}\*\*:\s*`([^`]+)`', _claude_md, re.IGNORECASE)) else '')
-except Exception:
-    _apikey = lambda s: ''
+def _apikey(service, value=''):
+    """API key for a service name such as 'Gemini' or 'Internet Archive': value when it is set in
+    the settings, else the environment variable (GEMINI_API_KEY), else KEYS_FILE (lines like
+    GEMINI_API_KEY=your-key), else ~/.claude/CLAUDE.md (**Gemini**: `your-key`), else ''."""
+    if value or not service:
+        return value
+    var = re.sub(r'\W+', '_', service).upper() + '_API_KEY'
+    if os.environ.get(var):
+        return os.environ[var]
+    for path, pattern in [(os.path.expanduser(KEYS_FILE) if KEYS_FILE else '', rf'^\s*{var}\s*=\s*["\']?([^"\'\s#]+)'),
+                          (os.path.expanduser('~/.claude/CLAUDE.md'), rf'\*\*{re.escape(service)}\*\*:\s*`([^`]+)`')]:
+        try:
+            with open(path, encoding='utf-8') as f:
+                m = re.search(pattern, f.read(), re.IGNORECASE | re.MULTILINE)
+            if m:
+                return m.group(1)
+        except OSError:
+            pass
+    return ''
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                            USER SETTINGS                                     ║
 # ╠══════════════════════════════════════════════════════════════════════════════╣
+# ║  API keys — fill them in here, or leave them '' and keep them in a keys      ║
+# ║  file instead: set KEYS_FILE to a file with lines like GEMINI_API_KEY=key    ║
+# ║  (chmod 600, so only you can read it). An environment variable with the      ║
+# ║  same name also works.                                                       ║
+KEYS_FILE                = ''   # e.g. '~/.config/claude/keys.env'
+GEMINI_API_KEY           = ''   # summaries, tags, filenames (free key: https://aistudio.google.com/apikey)
+OPENAI_API_KEY           = ''   # only with AI_LLM = 'openai'
+DATALAB_API_KEY          = ''   # PDF conversion via Datalab (https://datalab.to)
+INTERNET_ARCHIVE_API_KEY = ''   # 'access:secret' for Save Page Now (https://archive.org/account/s3.php)
+# ║                                                                              ║
 # ║  Vault path — where notes are saved. Leave '' to read from projects.yaml.    ║
 # ║  Example: '/Users/you/Documents/Obsidian'                                    ║
 VAULT_PATH = ''
@@ -82,8 +105,7 @@ IMAGE_JOBS    = 6
 # ║  Datalab — converts paper PDFs to markdown via cloud API.                    ║
 # ║  Get key at https://datalab.to — free accounts get $10 in credits.           ║
 # ║  Costs are about 10-15 cents per paper.                                      ║
-# ║  Add to ~/.claude/CLAUDE.md:  **Datalab**: `your-api-key`                    ║
-DATALAB_API_KEY = _apikey('Datalab')
+# ║  Key: DATALAB_API_KEY (API keys, top).                                       ║
 # ║                                                                              ║
 # ║  PDF processor — which method(s) to use when converting PDFs to markdown.    ║
 # ║  Local uses marker-pdf (install with: pipx install marker-pdf).              ║
@@ -100,14 +122,12 @@ MARKER_PRECISE = False
 # ║  Always falls back to Claude CLI if the provider fails or has no key.        ║
 # ║                                                                              ║
 # ║  AI_LLM options:                                                             ║
-# ║    'gemini' — Google Gemini API. Add to ~/.claude/CLAUDE.md:                 ║
-# ║               **Gemini**: `your-api-key`                                     ║
+# ║    'gemini' — Google Gemini API. Key: GEMINI_API_KEY (API keys, top).        ║
 # ║               Free key: https://aistudio.google.com/apikey                   ║
 # ║               '-latest' aliases always point at Google's newest model:       ║
 # ║               gemini-flash-lite-latest | gemini-flash-latest |               ║
 # ║               gemini-pro-latest                                              ║
-# ║    'openai' — Any OpenAI-compatible API. Add to ~/.claude/CLAUDE.md:         ║
-# ║               **OpenAI**: `your-api-key`                                     ║
+# ║    'openai' — Any OpenAI-compatible API. Key: OPENAI_API_KEY (API keys).     ║
 # ║               Set AI_BASE_URL for non-OpenAI endpoints, e.g.:                ║
 # ║                 OpenCode Zen (free): https://zen.opencode.ai/v1              ║
 # ║                 Groq:               https://api.groq.com/openai/v1           ║
@@ -137,9 +157,7 @@ AI_FALLBACK_MODEL = 'haiku'
 # ║  Common Crawl.                                                               ║
 # ║  Save Page Now makes a fresh Wayback snapshot when there is no usable one.   ║
 # ║  It needs Internet Archive keys (https://archive.org/account/s3.php) and     ║
-# ║  is skipped without them. Add to ~/.claude/CLAUDE.md:                        ║
-# ║  **Internet Archive**: `access-key:secret-key`                               ║
-WAYBACK_KEYS      = _apikey('Internet Archive')
+# ║  is skipped without them. Key: INTERNET_ARCHIVE_API_KEY (API keys, top).     ║
 WAYBACK_SAVE_WAIT = 120   # seconds to wait for the new snapshot
 # ║  Common Crawl: how many of the newest monthly crawls to search (0 = off).    ║
 # ║  Each takes about 5 s; it mostly has popular pages.                          ║
@@ -158,7 +176,12 @@ FILENAME_WORDS = 3
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 # Derived from AI_LLM — not user-configured.
-AI_API_KEY = _apikey({'gemini': 'Gemini', 'openai': 'OpenAI'}.get(AI_LLM, ''))
+# Keys left '' above come from the environment, KEYS_FILE or ~/.claude/CLAUDE.md
+GEMINI_API_KEY           = _apikey('Gemini', GEMINI_API_KEY)
+OPENAI_API_KEY           = _apikey('OpenAI', OPENAI_API_KEY)
+DATALAB_API_KEY          = _apikey('Datalab', DATALAB_API_KEY)
+INTERNET_ARCHIVE_API_KEY = _apikey('Internet Archive', INTERNET_ARCHIVE_API_KEY)
+AI_API_KEY = {'gemini': GEMINI_API_KEY, 'openai': OPENAI_API_KEY}.get(AI_LLM, '')
 
 
 def curl(url, *options, max_time=15, text=False, follow=True, capture=True):
@@ -2580,7 +2603,7 @@ def _pdf_to_markdown(pdf_path, convert_path):
     if result is None:
         print(
             'PDF conversion failed. Install local marker with: pipx install marker-pdf\n'
-            'Or set a Datalab API key in ~/.claude/CLAUDE.md.',
+            'Or set DATALAB_API_KEY (defuddle.py settings or your keys file).',
             file=sys.stderr
         )
         return '', {}, ''
@@ -5058,11 +5081,11 @@ def archive_is_save(url):
 
 def wayback_save(url):
     """Ask the Wayback Machine for a fresh snapshot (Save Page Now) and return its URL, or None.
-    Needs WAYBACK_KEYS. A snapshot from the last day is returned instead of a new capture."""
-    if not WAYBACK_KEYS:
+    Needs INTERNET_ARCHIVE_API_KEY. A snapshot from the last day is returned instead of a new capture."""
+    if not INTERNET_ARCHIVE_API_KEY:
         return None
     # --location-trusted: curl drops the Authorization header on redirects otherwise
-    auth = ('-H', f'Authorization: LOW {WAYBACK_KEYS}', '-H', 'Accept: application/json', '--location-trusted')
+    auth = ('-H', f'Authorization: LOW {INTERNET_ARCHIVE_API_KEY}', '-H', 'Accept: application/json', '--location-trusted')
     print('Saving a fresh Wayback Machine snapshot...', file=sys.stderr, flush=True)
     try:
         r = json.loads(curl('https://web.archive.org/save', *auth, '--data-urlencode', f'url={url}',
@@ -5165,7 +5188,7 @@ def fetch_for_method(url, method):
                     return _with_archive(d, archive_url), method
         if not found:
             print({'wayback': 'No Wayback Machine snapshot found for this URL'
-                              + ('' if WAYBACK_KEYS else ' (Save Page Now needs Internet Archive keys)') + '.',
+                              + ('' if INTERNET_ARCHIVE_API_KEY else ' (Save Page Now needs Internet Archive keys)') + '.',
                    'common-crawl': 'Not in the newest Common Crawl crawls.',
                    'archive-is': 'archive.is requires a captcha for this URL.\n'
                                  'Please visit this URL, save the page, and solve the captcha:\n'

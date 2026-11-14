@@ -53,13 +53,19 @@ VAULT_PATH = '/your/path/to/obsidian/vault'
 
 (`defuddle **` uses a double wildcard because URLs contain `/`, which a single `*` won't match.)
 
-**5. Recommended: add a free Gemini key** for summaries ([get one here](https://aistudio.google.com/apikey)), in `~/.claude/CLAUDE.md`:
+**5. Recommended: add a free Gemini key** for summaries ([get one here](https://aistudio.google.com/apikey)). Either put it in the **API keys** section at the top of the settings in `defuddle.py`:
 
-```markdown
-## API Keys
-
-- **Gemini**: `YOUR_GEMINI_API_KEY_HERE`
+```python
+GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY_HERE'
 ```
+
+or keep your keys in a separate file and point `KEYS_FILE` at it (e.g. `KEYS_FILE = '~/.config/claude/keys.env'`, made private with `chmod 600`), one per line:
+
+```bash
+GEMINI_API_KEY=YOUR_GEMINI_API_KEY_HERE
+```
+
+A key left `''` in the script is taken from an environment variable with the same name (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `DATALAB_API_KEY`, `INTERNET_ARCHIVE_API_KEY`), then from `KEYS_FILE`. Keys in `~/.claude/CLAUDE.md` (`- **Gemini**: \`your-key\``) still work too, but CLAUDE.md is loaded into every Claude conversation, so the script or a keys file is safer.
 
 Without a key, summaries fall back to a separate Claude Haiku process, which uses your Claude usage.
 
@@ -190,13 +196,9 @@ A concise AI-generated summary of the article's key points...
 
 Choose a provider with `AI_LLM` in `defuddle.py`.
 
-**Gemini (default).** Add your key to `~/.claude/CLAUDE.md` as shown in Quick install. The default is `AI_MODEL = 'gemini-flash-lite-latest'`: Google's `-latest` alias always points at its newest model, so there is nothing to update. When it is overloaded or rate-limited, defuddle looks up the older versions in Gemini's model list and tries `AI_OLDER_MODELS` (default 2) of them, newest first, before falling back to Claude; older models are usually less busy. Both are on the free tier. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for free tier eligibility. To go back to the free tier later, just remove your billing info.
+**Gemini (default).** Set `GEMINI_API_KEY` as shown in Quick install. The default is `AI_MODEL = 'gemini-flash-lite-latest'`: Google's `-latest` alias always points at its newest model, so there is nothing to update. When it is overloaded or rate-limited, defuddle looks up the older versions in Gemini's model list and tries `AI_OLDER_MODELS` (default 2) of them, newest first, before falling back to Claude; older models are usually less busy. Both are on the free tier. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for free tier eligibility. To go back to the free tier later, just remove your billing info.
 
-**OpenAI or compatible APIs.** Set `AI_LLM = 'openai'` and add your key to `~/.claude/CLAUDE.md`:
-
-```markdown
-- **OpenAI**: `YOUR_API_KEY_HERE`
-```
+**OpenAI or compatible APIs.** Set `AI_LLM = 'openai'` and `OPENAI_API_KEY` (in the script or your keys file).
 
 Set `AI_BASE_URL` to use any OpenAI-compatible endpoint:
 
@@ -222,7 +224,7 @@ AI_MODEL = 'llama3.2'
 
 <br>
 
-- **Web pages** — ads and clutter are stripped, and the note gets an AI summary, a heading index and frontmatter. JS-rendered or paywalled pages, and pages that show an error or block page, fall back to a copy fetched as Googlebot, then to archived copies: the Wayback Machine, a fresh Wayback snapshot (Save Page Now), archive.is, Arquivo.pt and Common Crawl. Each copy is parsed like the live page, so only the article is kept. Save Page Now needs free Internet Archive keys ([get them here](https://archive.org/account/s3.php)) in `~/.claude/CLAUDE.md` as `` - **Internet Archive**: `ACCESS_KEY:SECRET_KEY` ``, and is skipped without them. Tracking parameters (utm_*, fbclid, ...) are removed from links; other query parameters are kept.
+- **Web pages** — ads and clutter are stripped, and the note gets an AI summary, a heading index and frontmatter. JS-rendered or paywalled pages, and pages that show an error or block page, fall back to a copy fetched as Googlebot, then to archived copies: the Wayback Machine, a fresh Wayback snapshot (Save Page Now), archive.is, Arquivo.pt and Common Crawl. Each copy is parsed like the live page, so only the article is kept. Save Page Now needs free Internet Archive keys ([get them here](https://archive.org/account/s3.php)) as `INTERNET_ARCHIVE_API_KEY = 'ACCESS_KEY:SECRET_KEY'` (in the script or your keys file), and is skipped without them. Tracking parameters (utm_*, fbclid, ...) are removed from links; other query parameters are kept.
 - **YouTube transcripts** — manual captions first (better quality), then auto-generated ones. Duplicated lines from rolling captions are removed automatically.
 - **YouTube chapters** — the video's own chapter markers are used; without them, the AI adds logical chapter breaks.
 - **Videos without subtitles** — the note still gets the title, channel and full description, with "No subtitles available for this video." in place of the transcript. YouTube links never go through the archive fallbacks.
@@ -257,11 +259,7 @@ Papers get a note with the abstract, keywords as tags and the bibliography. For 
 4. Looks for a free copy in [OpenAlex](https://openalex.org) (publisher, repository or author version): downloads it, or opens its page in your browser when that site blocks scripts
 5. Optionally opens a shadow library in your browser for paywalled papers (see below)
 
-The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To use Datalab, add your key to `~/.claude/CLAUDE.md`:
-
-```markdown
-- **Datalab**: `YOUR_DATALAB_API_KEY_HERE`
-```
+The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To use Datalab, set `DATALAB_API_KEY` (in the script or your keys file).
 
 **Marker quality.** Local `marker` has two settings, chosen with `MARKER_PRECISE`:
 
