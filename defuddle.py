@@ -3330,7 +3330,7 @@ def _clean_pdf_markdown(md, images):
     """Tidy marker/Datalab output for Obsidian: remove page anchors and links, descriptions without
     an image, and figures detected twice; split image descriptions that wrap other images; warn
     about display equations that won't render."""
-    md = sup_symbols(md)
+    md = unescape_in_html(sup_symbols(md))
     md = restore_tex_escapes(md)
     md = fix_list_markers(md)
     md, _ = merge_split_tables(md)
@@ -3342,7 +3342,7 @@ def _clean_pdf_markdown(md, images):
     md = _tags_out_of_environments(md)
     md = _bold_titles_to_headings(md)
     md = _normalize_heading_levels(md)
-    _warn_broken_equations(md)
+    md = repair_equations(md)
     md = re.sub(r'!\[[^\]]*\]\(\s*\)[ \t]*\n*', '', md)
     md = re.sub(r'<span id="[^"]*">\s*</span>', '', md)
     md = re.sub(r'\[((?:\\.|[^\]\\])*)\]\(#page-[\d-]+\)',
@@ -3494,17 +3494,95 @@ def _display_equations(md):
     return (re.findall(r'^[ \t]*\$\$[ \t]*\n(.*?)\n[ \t]*\$\$[ \t]*$', md, re.S | re.M) +
             re.findall(r'^[ \t]*\$\$(?!\s*$)(.+?)\$\$[ \t]*$', md, re.M))
 
-def _warn_broken_equations(md):
-    """WARNING for display equations with unbalanced braces or \\left/\\right, which Obsidian can't render."""
-    bad = []
-    for eq in _display_equations(md):
-        if (len(re.findall(r'(?<!\\)\{', eq)) != len(re.findall(r'(?<!\\)\}', eq)) or
-                len(re.findall(r'\\left\b', eq)) != len(re.findall(r'\\right\b', eq))):
-            num = re.search(r'\((\d+[a-z]?)\)\s*$', eq.strip())
-            bad.append(f'({num.group(1)})' if num else repr(eq.strip()[:40] + '…'))
-    if bad:
-        print(f'WARNING: {len(bad)} display equation(s) have unbalanced brackets and won\'t render in '
-              f'Obsidian: {", ".join(bad[:10])}; check them against the PDF.', file=sys.stderr)
+_EQ_LEFT, _EQ_RIGHT = re.compile(r'\\left(?![a-zA-Z])'), re.compile(r'\\right(?![a-zA-Z])')
+# Formula tokens: environments, row breaks, \left/\right with their delimiter, escaped braces, commands, text
+_EQ_TOKEN = re.compile(r'\\begin\{[^{}]*\}|\\end\{[^{}]*\}|\\\\(?:\[[^\]]*\])?'
+                       r'|\\(?:left|right)\s*(?:\\[{}|]|\\[a-zA-Z]+|[^a-zA-Z\s\\])'
+                       r'|\\[{}]|\\[a-zA-Z]+|\\.|[{}&]|[^\\{}&]+', re.S)
+
+
+def _eq_unbalanced(eq):
+    """True when a formula's braces or \\left/\\right don't pair up (Obsidian can't render it)."""
+    return (len(re.findall(r'(?<!\\)\{', eq)) != len(re.findall(r'(?<!\\)\}', eq)) or
+            len(_EQ_LEFT.findall(eq)) != len(_EQ_RIGHT.findall(eq)))
+
+
+def balance_equation(eq):
+    """A formula with its braces and \\left/\\right paired, so it renders: a missing } or \\right.
+    goes where its group ends (end of the formula before closing punctuation, a row break or &, or an
+    environment's end), a stray } is dropped, and a \\right without \\left gets \\left. at the start
+    of its group. The brackets may not land exactly where the author had them, but it renders."""
+    cut = len(eq.rstrip(' \t\n.,;'))           # closing punctuation stays last
+    body, tail = eq[:cut], eq[cut:]
+    out, stack = [], []                       # stack: [kind, position in out], kind '{', 'left' or 'env'
+    def close_lefts():                        # \left…\right can't cross a row, a column or an environment
+        while stack and stack[-1][0] == 'left':
+            stack.pop()
+            out.append(r'\right.')
+    for tok in _EQ_TOKEN.findall(body):
+        if tok.startswith('\\begin{'):
+            stack.append(['env', len(out)])
+        elif tok.startswith('\\end{'):
+            while stack and stack[-1][0] != 'env':
+                out.append(r'\right.' if stack.pop()[0] == 'left' else '}')
+            if stack:
+                stack.pop()
+        elif tok.startswith('\\\\') or tok == '&':
+            close_lefts()
+        elif tok == '{':
+            stack.append(['{', len(out)])
+        elif tok == '}':
+            close_lefts()
+            if not (stack and stack[-1][0] == '{'):
+                continue                      # a } without its {
+            stack.pop()
+        elif _EQ_LEFT.match(tok):
+            stack.append(['left', len(out)])
+        elif _EQ_RIGHT.match(tok):
+            if stack and stack[-1][0] == 'left':
+                stack.pop()
+            else:                             # no \left in this group: open one at its start
+                out.insert(stack[-1][1] + 1 if stack else 0, r'\left.')
+        out.append(tok)
+    while stack:
+        kind = stack.pop()[0]
+        out.append({'left': r'\right.', '{': '}', 'env': ''}[kind])
+    return ''.join(out) + tail
+
+
+def repair_equations(md):
+    """Display equations with unpaired braces or \\left/\\right made renderable (balance_equation),
+    with a WARNING naming them so they can be checked against the PDF; ones it can't repair are
+    named too."""
+    fixed, failed = [], []
+    def label(eq):
+        num = re.search(r'(?:\\tag\{|\()(\d+[a-z]?)[)}]\s*$', eq.strip())
+        return f'({num.group(1)})' if num else repr(eq.strip()[:40] + '…')
+    def fix(eq):
+        if not _eq_unbalanced(eq):
+            return eq
+        new = balance_equation(eq)
+        (failed if _eq_unbalanced(new) else fixed).append(label(eq))
+        return eq if _eq_unbalanced(new) else new
+    md = re.sub(r'^([ \t]*\$\$[ \t]*\n)(.*?)(\n[ \t]*\$\$[ \t]*)$',
+                lambda m: m.group(1) + fix(m.group(2)) + m.group(3), md, flags=re.S | re.M)
+    md = re.sub(r'^([ \t]*\$\$)((?!\s*$).+?)(\$\$[ \t]*)$',
+                lambda m: m.group(1) + fix(m.group(2)) + m.group(3), md, flags=re.M)
+    if fixed:
+        print(f'WARNING: closed unpaired brackets in {len(fixed)} display equation(s) so they render: '
+              f'{", ".join(fixed[:10])}; check them against the PDF.', file=sys.stderr)
+    if failed:
+        print(f'WARNING: {len(failed)} display equation(s) have unbalanced brackets and won\'t render in '
+              f'Obsidian: {", ".join(failed[:10])}; check them against the PDF.', file=sys.stderr)
+    return md
+
+
+def unescape_in_html(md):
+    """Markdown escapes inside inline HTML (marker writes <sup>\\*</sup>): Obsidian shows the backslash,
+    so it is dropped before punctuation (LaTeX commands are left alone)."""
+    return re.sub(r'<(sup|sub|span|small|mark|u|ins|del)\b([^>]*)>(.*?)</\1>',
+                  lambda m: f'<{m.group(1)}{m.group(2)}>' + re.sub(r'\\([`*_\[\]()#+\-.!|~])', r'\1', m.group(3))
+                            + f'</{m.group(1)}>', md, flags=re.S)
 
 def _latex_braced_arg(content, cmd):
     """Extract the content of \\cmd{...} with proper nested-brace handling."""
@@ -3841,15 +3919,18 @@ def _fix_paper_structure(content, title='', authors=None, ai_paragraphs=False):
     #    Preferred anchor: the Abstract heading — it's the cleanest entry point and naturally
     #    skips all the noise that appears between the title and the body of the paper.
     #    Fallback: search for the paper title, then first author name.
+    #    Only an anchor near the start counts: the title can recur at the end (a reference to the
+    #    author's thesis of the same name), and cutting there would drop the whole paper.
+    near_start = max(5000, len(content) * 0.15)
     anchor = None
     abs_m = re.search(r'^#{1,4}\s+\*{0,3}Abstract\*{0,3}\s*$', content, re.IGNORECASE | re.MULTILINE)
-    if abs_m:
+    if abs_m and abs_m.start() <= near_start:
         anchor = abs_m.start()
     else:
         needles = ([title] if title else []) + ([authors[0]] if authors else [])
         for needle in needles:
-            m = re.search(re.escape(needle), content, re.IGNORECASE)
-            if m:
+            m = re.search(r'\s+'.join(map(re.escape, needle.split())), content, re.IGNORECASE)
+            if m and m.start() <= near_start:
                 anchor = content.rfind('\n', 0, m.start()) + 1
                 break
     if anchor:
@@ -4381,7 +4462,12 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
 
     # Fix paper structure: strip pre-title content, remove duplicate titles, move abstract to top
     if method != 'web':   # the PDF repairs (text before the title, duplicate titles…) don't apply to a web page
-        content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []), ai_paragraphs=method == 'datalab')
+        fixed = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []), ai_paragraphs=method == 'datalab')
+        if len(fixed.split()) < 0.7 * len(content.split()):   # a clean-up never removes most of a paper
+            print(f'WARNING: the structure clean-up would drop {len(content.split()) - len(fixed.split())} of '
+                  f'{len(content.split())} words — kept the text as converted.', file=sys.stderr)
+        else:
+            content = fixed
     # Extract keywords from content (removed from body, added as tags below)
     content, paper_keywords = _extract_paper_keywords(content)
 
