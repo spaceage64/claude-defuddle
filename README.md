@@ -7,7 +7,7 @@ Works with:
 - **Web pages and docs**, with Wayback Machine, archive.is, Arquivo.pt and Common Crawl fallbacks for paywalled or JS-heavy pages
 - **YouTube videos**: full transcript with timestamps and chapters
 - **Apple Podcasts** episodes (macOS)
-- **Academic papers**: DOI, arXiv, SSRN and Academia.edu links, article links from publishers like ScienceDirect, Wiley and Springer, PubMed, NBER and university repositories
+- **Academic papers**: DOIs (as a link or plain, e.g. `10.17487/RFC6298` or `doi:10.17487/RFC6298`), arXiv, SSRN and Academia.edu links, article links from publishers like ScienceDirect, Wiley and Springer, PubMed, NBER, university repositories and RFCs
 - **PDFs**: any `.pdf` link or a file on your computer
 - **Books**: PDFs with an ISBN and 50+ pages, or 100+ pages with chapters, are saved as books: headings from the PDF's bookmarks and printed table of contents, a linked Contents table with page numbers, the back-of-book index as a nested list, code listings repaired from the PDF, blank pages left out, and author, publisher, year and ISBN-13 from the ISBN. To override the detection, pass `--as doc`, `--as paper` or `--as book`
 
@@ -246,6 +246,7 @@ Supported sources:
 - **SSRN** — `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=...`
 - **Publisher pages** — article links from ScienceDirect, Cell, Wiley, Springer, Nature, Taylor & Francis, SAGE, MDPI, Frontiers, PLOS, ACS, ACM, Science, PNAS, JSTOR and other large publishers (see `PAPER_SITES`). The DOI is taken from the link (or, for Elsevier, looked up in Crossref) and the paper goes through the normal pipeline. Sites that block scripts and have no DOI in the link (IEEE, OUP, Cambridge) need the DOI link instead
 - **Paper indexes and preprints** — NBER, PubMed, PMC, Europe PMC, bioRxiv, medRxiv, OpenAlex and Semantic Scholar links are turned into their DOI
+- **RFCs** — rfc-editor.org and IETF links (`/rfc/rfc6298.html`, `.txt`, `/info/rfc6298`, `datatracker.ietf.org/doc/html/rfc6298`) are turned into their DOI and saved as papers, with the RFC's own text
 - **University repositories and other scholarly pages** — any page with Google Scholar meta tags (DSpace, EPrints, Zenodo and most university repositories) goes through the paper pipeline when it names a DOI, or through the PDF pipeline with its PDF link when it doesn't (e.g. theses)
 - **Academia.edu** — `https://www.academia.edu/{id}/...` (public PDF if available, otherwise the shadow library via DOI)
 - **Any `.pdf` link** — the first page is scanned for a DOI and sent through the paper pipeline if one is found
@@ -256,8 +257,10 @@ Papers get a note with the abstract, keywords as tags and the bibliography. For 
 1. Tries the arXiv LaTeX source first (best quality)
 2. Falls back to local [Marker](https://github.com/VikParuchuri/marker) for PDF→Markdown
 3. Falls back to the Datalab API if Marker isn't installed
-4. Looks for a free copy in [OpenAlex](https://openalex.org) (publisher, repository or author version): downloads it, or opens its page in your browser when that site blocks scripts
-5. Optionally opens a shadow library in your browser for paywalled papers (see below)
+4. Looks for a free copy in [OpenAlex](https://openalex.org) (publisher, repository or author version) and downloads it
+5. Works published as a web page instead of a PDF (RFCs, reports, open-access HTML articles): reads the full text from the free page or the DOI's own landing page, through its HTML / Full text / Plain text link or the page itself. A journal article's landing page only counts through such a link, so an abstract page is never saved as the paper
+6. Opens the free copy's page in your browser when that site blocks scripts
+7. Optionally opens a shadow library in your browser for paywalled papers (see below)
 
 The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To use Datalab, set `DATALAB_API_KEY` (in the script or your keys file).
 

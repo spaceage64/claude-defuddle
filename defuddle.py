@@ -1416,6 +1416,7 @@ PAPER_SITES = (
     'thieme-connect.com', 'brill.com',
     'nber.org', 'ncbi.nlm.nih.gov', 'europepmc.org', 'biorxiv.org', 'medrxiv.org',  # indexes and preprints
     'openalex.org', 'semanticscholar.org',
+    'rfc-editor.org', 'ietf.org',                                                 # RFCs (Internet standards)
 )
 
 # Page-type suffixes publishers append after the DOI (/full, /abstract, .pdf, ...)
@@ -1463,8 +1464,15 @@ def academic_target(tags, page_url):
         return pdf
     return None
 
+# RFC links on the RFC Editor and IETF sites: /rfc/rfc6298(.html|.txt), /info/rfc6298, /doc/(html/)rfc6298
+_RFC_PATH = re.compile(r'/(?:rfc|info|doc(?:/html)?)/rfc(\d+)\b', re.IGNORECASE)
+
+
 def is_paper_site(url):
-    host = urlparse(url).netloc.lower().split(':')[0]
+    p    = urlparse(url)
+    host = p.netloc.lower().split(':')[0]
+    if host.endswith(('rfc-editor.org', 'ietf.org')):   # only RFCs there, not drafts or other pages
+        return bool(_RFC_PATH.search(unquote(p.path)))
     return any(host == d or host.endswith('.' + d) for d in PAPER_SITES)
 
 _MONTHS = [('january', 'jan'), ('february', 'feb'), ('march', 'mar'), ('april', 'apr'), ('may',),
@@ -1655,6 +1663,11 @@ def paper_site_doi(url):
         doi = _DOI_TAIL.sub('', m.group(1)).rstrip('/.')
         return re.sub(r'v\d+$', '', doi) if doi.startswith('10.1101/') else doi   # bioRxiv versions
     host = p.netloc.lower()
+    if host.endswith(('rfc-editor.org', 'ietf.org')):
+        # RFCs (see _RFC_PATH) -> 10.17487/RFC6298
+        m = _RFC_PATH.search(path)
+        if m:
+            return f'10.17487/RFC{int(m.group(1))}'
     if host.endswith('nber.org'):
         m = re.search(r'/(w\d{3,6})\b', path)
         if m:
@@ -1806,7 +1819,7 @@ def get_paper_metadata(doi):
         container = work.get('container-title', [])
         journal = container[0] if container else work.get('publisher', '')
         return {'title': title, 'authors': authors, 'published': pub_date,
-                'journal': journal, 'doi': doi}
+                'journal': journal, 'doi': doi, 'type': work.get('type', '')}
     except Exception:
         return {}
 
@@ -3914,6 +3927,51 @@ def _strip_html_preserve_math(text):
             i += 1
     return ''.join(result)
 
+FULLTEXT_MIN_WORDS = 1500   # a web page counts as a document's full text from this length on
+
+# Links to a document's own full text on its landing page: "HTML", "Full text", "Plain Text"…
+_FULLTEXT_LINK = re.compile(r'^(?:(?:compact |full |plain )?(?:html|text|txt)|full[ -]?text(?: \(?html\)?)?|'
+                            r'read (?:online|full text)|view (?:full )?(?:text|html|article))$', re.I)
+
+
+# Crossref types whose landing page, when it's not free, shows an abstract (often with the reference
+# list) rather than the work itself: there only explicit full-text links count, not the page
+_ARTICLE_TYPES = {'journal-article', 'proceedings-article', 'book-chapter', 'book', 'monograph',
+                  'edited-book', 'reference-entry', 'posted-content'}
+
+
+def fulltext_from_page(page_url, allow_self=True):
+    """Full text of a document that is published as a web page instead of a PDF (RFCs, reports,
+    open-access HTML articles): the page's citation_fulltext_html_url tag or a same-site link
+    labelled HTML / Full text / Plain text, else (allow_self) the page itself, parsed like a web
+    page. Only a result of FULLTEXT_MIN_WORDS words or more counts (an abstract page stays below)."""
+    page = curl(page_url, '-A', BROWSER_UA, '-w', '\n%{url_effective}', max_time=20, text=True).stdout or ''
+    page, _, final = page.rpartition('\n')
+    page_url = final.strip() or page_url   # after redirects (doi.org -> publisher), for relative links
+    links = re.findall(r'<meta[^>]+name=["\']citation_fulltext_html_url["\'][^>]+content=["\']([^"\']+)', page, re.I)
+    links += [href for href, label in re.findall(r'<a\b[^>]*href=["\']([^"\'#]+)["\'][^>]*>(.*?)</a>', page, re.I | re.S)
+              if _FULLTEXT_LINK.match(re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', html.unescape(label))).strip())]
+    site = lambda u: '.'.join(urlparse(u).netloc.split('.')[-2:])
+    links = [u for u in dict.fromkeys(urljoin(page_url, html.unescape(l)) for l in links) if site(u) == site(page_url)]
+    # HTML first (it keeps the links), plain text next, the free page itself last
+    for link in sorted(links, key=lambda u: u.lower().endswith('.txt')) + ([page_url] if allow_self else []):
+        d = fetch_defuddle(link)
+        if usable(d) and d.get('wordCount', 0) >= FULLTEXT_MIN_WORDS:
+            return dict(d, content=plain_text_document(d.get('content') or ''), url=link,
+                        source=link if link != page_url else '')
+    return None
+
+
+def plain_text_document(content):
+    """A page that is essentially preformatted text (an RFC, a .txt document) as one text block:
+    its code blocks (often one per printed page) are joined and the page chrome around them is
+    dropped. Other pages are returned unchanged."""
+    blocks = re.findall(r'^```[^\n]*\n(.*?)\n```[ \t]*$', content, re.S | re.M)
+    if blocks and sum(len(b.split()) for b in blocks) >= 0.8 * len(content.split()):
+        return '```text\n' + '\n'.join(b.rstrip() for b in blocks) + '\n```'
+    return content
+
+
 def build_paper(url, project, created, pdf_file=None, converted=None):
     """Fetch an academic paper and build an Obsidian note.
     pdf_file: a PDF of this paper already at hand (e.g. a local file whose first page
@@ -3939,6 +3997,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     images_dict = {}
     method      = ''
     bbl_key_map = {}
+    pdf_path    = None
     with tempfile.TemporaryDirectory() as tmp_dir:
         if arxiv_id:
             if not shutil.which('pandoc'):
@@ -4011,16 +4070,32 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                     pdf_path = _download_pdf(link, tmp_dir)
                     if pdf_path:
                         break
-                if not pdf_path and free_page:
+                # No PDF: the text may be published as a web page (RFCs, reports, open-access HTML).
+                # Checked on the free page and the DOI's own landing page before any browser step;
+                # a journal article's landing page only counts through an explicit full-text link.
+                landing = f'https://doi.org/{doi}'
+                pages = [(free_page, True)] if free_page else []
+                if not free_page or free_page.lower().rstrip('/') != landing.lower():
+                    pages.append((landing, meta.get('type') not in _ARTICLE_TYPES))
+                for page, allow_self in pages if not pdf_path else []:
+                    print(f'Looking for the full text on {urlparse(page).netloc}...', file=sys.stderr)
+                    web = fulltext_from_page(page, allow_self)
+                    if web:
+                        print(f'Full text found as a web page: {web["url"]}', file=sys.stderr)
+                        content, method, meta['fulltext_url'] = web['content'], 'web', web['source']
+                        meta['web_text'] = True
+                        break
+                if not pdf_path and free_page and not content:
                     pdf_path = wait_for_shadow_pdf(doi, meta.get('title', ''), url=free_page, label='the free version')
-            if not pdf_path and doi:
+            if not pdf_path and doi and not content:
                 if SHADOW_BASE_URL:
                     pdf_path = wait_for_shadow_pdf(doi, meta.get('title', ''))
                 else:
                     print('Paper is not publicly accessible and no shadow library is configured (set SHADOW_BASE_URL).', file=sys.stderr)
-            if not pdf_path:
+            if not pdf_path and not content:
                 print('Could not retrieve PDF.', file=sys.stderr)
                 return '', {}, {}
+        if not content and pdf_path:
             content, images_dict, method = converted or pdf_to_markdown(pdf_path)
             with open(pdf_path, 'rb') as f:
                 meta['pdf'] = f.read()   # for --keep-pdf; tmp_dir is gone once this returns
@@ -4055,7 +4130,8 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     content = re.sub(r'^- (\[\d+\] )', r'\1', content, flags=re.MULTILINE)
 
     # Fix paper structure: strip pre-title content, remove duplicate titles, move abstract to top
-    content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []), ai_paragraphs=method == 'datalab')
+    if method != 'web':   # the PDF repairs (text before the title, duplicate titles…) don't apply to a web page
+        content = _fix_paper_structure(content, meta.get('title', ''), meta.get('authors', []), ai_paragraphs=method == 'datalab')
     # Extract keywords from content (removed from body, added as tags below)
     content, paper_keywords = _extract_paper_keywords(content)
 
@@ -4105,7 +4181,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     fm = build_frontmatter(created, list(ai_tags) + kw_tags, [
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
-        frontmatter_url(url),
+        frontmatter_url(url, meta.get('fulltext_url')),   # the web page the text came from, if not a PDF
         f'doi: {doi_str}' if doi_str else None,
         *author_lines,
         frontmatter_field('published', published),
@@ -4307,6 +4383,21 @@ def get_vault_path():
         return m.group(1).strip() if m else os.path.expanduser('~/Documents/Obsidian')
     except Exception:
         return os.path.expanduser('~/Documents/Obsidian')
+
+
+def project_category(project):
+    """The category (parent folder) of a project in ~/.claude/projects.yaml, or '' (no file or not listed)."""
+    try:
+        with open(os.path.expanduser('~/.claude/projects.yaml'), encoding='utf-8') as f:
+            category = ''
+            for line in f:
+                if m := re.match(r'^  ([A-Za-z][\w-]*):\s*$', line):
+                    category = m.group(1)
+                elif re.match(rf'^      {re.escape(project)}:\s*$', line):
+                    return category
+    except OSError:
+        pass
+    return ''
 
 
 def get_save_dir(vault, category, project, subdir):
@@ -6008,20 +6099,47 @@ def print_note(note):
     print(re.sub(r'^---\n.*?\n---\n\n?', '', note, count=1, flags=re.DOTALL).strip())
 
 
+def _note_urls(text):
+    """The url: values in a note's frontmatter."""
+    m = re.search(r'^url:\n((?:  - [^\n]+\n)+)', text[:4000], re.M)
+    return {u.strip('"') for u in re.findall(r'  - (.+)', m.group(1))} if m else set()
+
+
+def free_filename(save_dir, filename, note, source_url=None):
+    """filename, or filename-2, -3… when a note of that name already holds another source, so a
+    note never overwrites a different one (a note from the same source is replaced: a re-fetch).
+    Without a title (untitled), the name comes from the URL instead (rfc6298, page name)."""
+    if filename == 'untitled' and source_url:
+        path = urlparse(source_url).path.rstrip('/')
+        filename = _slug(os.path.splitext(os.path.basename(path))[0] or urlparse(source_url).netloc) or filename
+    name, n, urls = filename, 1, _note_urls(note) | ({source_url} if source_url else set())
+    while os.path.exists(path := os.path.join(save_dir, f'{name}.md')):
+        with open(path, encoding='utf-8', errors='replace') as f:
+            if _note_urls(f.read(4000)) & urls:
+                break
+        n += 1
+        name = f'{filename}-{n}'
+    if name != filename:
+        print(f'{filename}.md already holds another page — saving as {name}.md', file=sys.stderr)
+    return name
+
+
 def save_note(note, args, subdir, filename, images_dict=None, source_url=None, finish=None):
     """Write a note to {vault}/[category/][project/]{subdir}/{filename}.md, with its images in img/.
-    finish(note, save_dir) can change the note just before it is written. Returns the folder."""
+    finish(note, save_dir, filename) can change the note just before it is written. Returns the
+    folder and the filename used (free_filename may add -2 so another note isn't overwritten)."""
     save_dir = get_save_dir(get_vault_path(), args.category, args.project, subdir)
     os.makedirs(save_dir, exist_ok=True)
+    filename = free_filename(save_dir, filename, note, source_url)
     if ENABLE_IMAGES:
         note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=source_url)
     if finish:
-        note = finish(note, save_dir)
+        note = finish(note, save_dir, filename)
     note = _dedup_note_tags(note)
     with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
         f.write(note)
     print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
-    return save_dir
+    return save_dir, filename
 
 
 def paper_filename(args, meta):
@@ -6032,6 +6150,13 @@ def paper_filename(args, meta):
     last_name = _slug(authors[0].split()[-1]) if authors else ''
     ai_name   = generate_filename(meta.get('title', ''))
     return f'{last_name}-{ai_name}' if last_name else ai_name
+
+
+def doi_link(text):
+    """A plain DOI ('10.17487/RFC6298', 'doi:10.17487/RFC6298') as its https://doi.org/ link;
+    anything else unchanged."""
+    m = re.fullmatch(r'\s*(?:doi:\s*)?(10\.\d{4,9}/\S+?)\s*', text, re.IGNORECASE)
+    return f'https://doi.org/{m.group(1)}' if m else text
 
 
 def parse_args(argv):
@@ -6084,7 +6209,7 @@ def parse_args(argv):
         args.keep_pdf = KEEP_PDF
     if not args.created:
         args.created = datetime.now().date().isoformat()
-    args.urls = ([args.url] if args.url else []) + args.url_pos
+    args.urls = [doi_link(u) for u in ([args.url] if args.url else []) + args.url_pos]
     if len(args.urls) > 1 and args.filename:
         parser.error('--filename works with one link at a time')
     if not args.urls:
@@ -6106,7 +6231,7 @@ def route_academia(url, args):
             print_note(note)
             return None, academia_doi
         filename = args.filename or generate_filename(meta.get('title', ''))
-        save_dir = save_note(note, args, 'docs', filename, images_dict, source_url=pdf_url)
+        save_dir, filename = save_note(note, args, 'docs', filename, images_dict, source_url=pdf_url)
         if args.keep_pdf:
             save_original_pdf(save_dir, filename, source=pdf_url)
         return None, academia_doi
@@ -6182,8 +6307,8 @@ def save_paper(url, args, academia_doi=None, pdf_file=None, converted=None, pdf_
         return
     note, book = as_book(note, args, None if pdf_file is None else pdf_file, meta)
     filename = book_filename(args, note) if book else paper_filename(args, meta)
-    save_dir = save_note(note, args, 'books' if book else 'papers', filename, images_dict, source_url=pdf_source or url)
-    if args.keep_pdf:
+    save_dir, filename = save_note(note, args, 'books' if book else 'papers', filename, images_dict, source_url=pdf_source or url)
+    if args.keep_pdf and not meta.get('web_text'):   # a document read from a web page has no PDF
         if pdf_source and not meta.get('pdf'):
             save_original_pdf(save_dir, filename, source=pdf_source)
         else:
@@ -6226,7 +6351,7 @@ def save_pdf(url, args):
     paper = args.as_type == 'paper'               # --as paper without a DOI: a paper all the same
     filename = book_filename(args, note) if book or paper else (args.filename or generate_filename(meta.get('title', '')))
     subdir = 'books' if book else 'papers' if paper else 'docs'
-    save_dir = save_note(note, args, subdir, filename, images_dict, source_url=url)
+    save_dir, filename = save_note(note, args, subdir, filename, images_dict, source_url=url)
     if args.keep_pdf:
         if meta and meta.get('pdf'):
             save_original_pdf(save_dir, filename, meta=meta)
@@ -6392,7 +6517,7 @@ def save_web(url, args, d, used_method):
         note = build_article(d, url, args.project, args.created, method=used_method)
     filename = slug.result() if slug else args.filename
 
-    def finish(note, save_dir):
+    def finish(note, save_dir, filename):
         if not (args.download and youtube):
             return note
         local = download_youtube(url, save_dir, filename, args.video_quality, args.audio_quality)
@@ -6409,6 +6534,8 @@ def save_web(url, args, d, used_method):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     args = parse_args(argv)
+    if args.project and not args.category:   # a project listed in projects.yaml saves under its category
+        args.category = project_category(args.project)
     if len(args.urls) > 1:
         sys.exit(run_batch(args.urls, argv))
     raw_url = args.urls[0]
