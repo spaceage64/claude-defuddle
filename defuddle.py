@@ -1802,6 +1802,7 @@ def get_paper_metadata(doi):
         work = data.get('message', {})
         title = ' '.join(work.get('title', [''])).strip()
         title = re.sub('[\u2010\u2011]', '-', title)   # Crossref's Unicode hyphens
+        title = ieee_symbols(title)                      # IEEE titles: 'The /spl phi/ accrual…'
         authors = []
         for a in work.get('author', []):
             name = _clean_author(f'{a.get("given", "")} {a.get("family", "")}')
@@ -1818,8 +1819,10 @@ def get_paper_metadata(doi):
             pub_date = ''
         container = work.get('container-title', [])
         journal = container[0] if container else work.get('publisher', '')
+        issns = sorted(work.get('issn-type') or [], key=lambda i: i.get('type') != 'print')
         return {'title': title, 'authors': authors, 'published': pub_date,
-                'journal': journal, 'doi': doi, 'type': work.get('type', '')}
+                'journal': journal, 'doi': doi, 'type': work.get('type', ''),
+                'issns': [i['value'] for i in issns if i.get('value')] or work.get('ISSN') or []}
     except Exception:
         return {}
 
@@ -2412,14 +2415,57 @@ def _pdf_first_pages_text(path):
         raw = f.read(65536)
     return b' '.join(re.findall(rb'[\x20-\x7e]{4,}', raw)).decode('ascii', errors='ignore')
 
+# IEEE's legacy symbol codes in Crossref metadata (/spl phi/ = φ, /spl times/ = ×); Greek letters
+# are looked up by their Unicode name, other codes here
+_IEEE_SYMBOLS = {'times': '×', 'infin': '∞', 'le': '≤', 'les': '≤', 'ge': '≥', 'ges': '≥', 'ne': '≠',
+                 'plusmn': '±', 'deg': '°', 'sim': '~', 'ap': '≈', 'approx': '≈', 'equiv': '≡', 'cong': '≅',
+                 'rarr': '→', 'larr': '←', 'harr': '↔', 'sqrt': '√', 'sum': '∑', 'prod': '∏', 'int': '∫',
+                 'partial': '∂', 'nabla': '∇', 'isin': '∈', 'cup': '∪', 'cap': '∩', 'forall': '∀',
+                 'exist': '∃', 'micro': 'µ', 'middot': '·', 'prop': '∝', 'ell': 'ℓ', 'dagger': '†',
+                 'ndash': '–', 'mdash': '—', 'varphi': 'ϕ', 'vartheta': 'ϑ', 'epsiv': 'ε'}
+
+
+def ieee_symbols(text):
+    """Text with IEEE's /spl name/ codes as the characters they stand for (unknown codes dropped)."""
+    def symbol(m):
+        name = m.group(1)
+        try:
+            return unicodedata.lookup(f'GREEK {"CAPITAL" if name[0].isupper() else "SMALL"} LETTER {name.upper()}')
+        except KeyError:
+            return _IEEE_SYMBOLS.get(name.lower(), '')
+    if '/spl' not in text:
+        return text
+    return re.sub(r'\s{2,}', ' ', re.sub(r'/spl\s+(\w+)/', symbol, text)).strip()
+
+
+def _title_words_in(title, text, gap=2):
+    """True when the title's words (letters and digits) appear in order in text, with at most gap
+    other words between two of them: a symbol written differently (φ, ϕ, /spl phi/) doesn't block it."""
+    words = [w for w in re.findall(r'[a-z0-9]+', _slug(title)) if len(w) > 1]
+    page = re.findall(r'[a-z0-9]+', _slug(text))
+    if len(words) < 4:
+        return False
+    for start in (i for i, w in enumerate(page) if w == words[0]):
+        pos = start
+        for w in words[1:]:
+            nxt = next((j for j in range(pos + 1, min(pos + 2 + gap, len(page))) if page[j] == w), None)
+            if nxt is None:
+                break
+            pos = nxt
+        else:
+            return True
+    return False
+
+
 def _pdf_matches(text, doi, title):
     """True when the text of a PDF's first pages carries this DOI, or else this title."""
     text = text.lower()
     if re.sub(r'\s+', '', doi.lower()) in re.sub(r'\s+', '', text):
         return True
     # Letters and digits only: survives line breaks and hyphenation in the title
-    key = re.sub(r'[^a-z0-9]', '', _slug(title or ''))
-    return len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text))
+    title = ieee_symbols(title or '')
+    key = re.sub(r'[^a-z0-9]', '', _slug(title))
+    return (len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text))) or _title_words_in(title, text)
 
 def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
     """Open the shadow library page (or another page: url, label) in the browser and wait for the user to save the PDF.
@@ -3934,6 +3980,202 @@ _FULLTEXT_LINK = re.compile(r'^(?:(?:compact |full |plain )?(?:html|text|txt)|fu
                             r'read (?:online|full text)|view (?:full )?(?:text|html|article))$', re.I)
 
 
+# ─── RFCs ─────────────────────────────────────────────────────────────────────
+# RFC Editor HTML as markdown with its links. Older RFCs (before ~8650) are the text version in
+# <pre> blocks with links added; newer ones (xml2rfc v3) are real HTML. Internal links travel as
+# _LINK tokens (target, text) until the headings they point to are known.
+
+_RFC_HTML = 'https://www.rfc-editor.org/rfc/rfc{}.html'
+_LINK = re.compile('\ue000([^\ue001]*)\ue001([^\ue002]*)\ue002')
+# Closing sections that some RFCs indent like body text (inside an appendix), so they aren't found by position
+_RFC_END_HEADING = re.compile(r"(?:authors?|editors?|contributors?)'? addresse?s?|acknowledge?ments|contributors|"
+                              r"full copyright statement|intellectual property", re.IGNORECASE)
+_RFC_LIST = re.compile(r'^(o|\*|-|\+|\(\w{1,4}(?:\.\w{1,3})*\)|\w{1,3}[.)]|\[[\w][\w.+-]*\])(\s+)(?=\S)')
+
+
+def _rfc_md_escape(text):
+    """Escape what markdown would read as formatting in RFC prose."""
+    text = re.sub(r'([\\`*\[\]])', r'\\\1', text)
+    text = re.sub(r'(?<!\w)_|_(?!\w)', r'\\_', text)     # an underscore inside a word is never emphasis
+    return re.sub(r'<(?=[A-Za-z/!])', r'\\<', text)
+
+
+def _rfc_link(href, text, number, headings, refs):
+    """A link token as markdown: another RFC, a heading in this note, or a web link."""
+    if m := re.match(r'(?:\./|https?://www\.rfc-editor\.org/rfc/)?rfc(\d+)(?:\.\w+)?(#.*)?$', href):
+        return f'[{text}]({_RFC_HTML.format(int(m.group(1)))}{m.group(2) or ""})'
+    if href.startswith('#'):
+        target = headings.get(href[1:]) or refs.get(href[1:])
+        if target:
+            return f'[[#{target}|{text}]]'
+        return f'[{text}]({_RFC_HTML.format(number)}{href})'
+    return f'[{text}]({urljoin(_RFC_HTML.format(number), href)})'
+
+
+def _rfc_render(text, number, headings, refs, code=False):
+    """Text with link tokens: escaped prose with links, or (code) plain text."""
+    out, pos = [], 0
+    for m in _LINK.finditer(text):
+        out.append(text[pos:m.start()] if code else _rfc_md_escape(text[pos:m.start()]))
+        out.append(m.group(2) if code else _rfc_link(m.group(1), _rfc_md_escape(m.group(2)), number, headings, refs))
+        pos = m.end()
+    out.append(text[pos:] if code else _rfc_md_escape(text[pos:]))
+    return ''.join(out)
+
+
+def _rfc_text_markdown(page, number):
+    """Markdown from an older RFC's HTML (the text version in <pre> blocks)."""
+    text = '\n'.join(re.findall(r'<pre[^>]*>(.*?)</pre>', page, re.S))
+    text = re.sub(r'<span class="grey">.*?</span>', '', text, flags=re.S)      # page headers and footers
+    text = re.sub(r'<span id="page-\d+"\s*></span>', '', text).replace('\f', '')
+    text = re.sub(r'<span class="h(\d)">(.*?)</span>',                         # headings, with their section id
+                  lambda m: '\ue010' + m.group(1) + '\ue011' + (i.group(1) if (i := re.search(r'id="([^"]+)"', m.group(2))) else '')
+                  + '\ue011' + re.sub(r'<[^>]+>', '', m.group(2)), text, flags=re.S)
+    text = re.sub(r'<a\s[^>]*\bid="(ref-[^"]+)"[^>]*>(.*?)</a>', '\ue020\\1\ue021\\2', text, flags=re.S)
+    text = re.sub(r'<a\s[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+                  lambda m: '\ue000' + html.unescape(m.group(1)) + '\ue001' + re.sub(r'<[^>]+>', '', m.group(2)) + '\ue002',
+                  text, flags=re.S)
+    text = html.unescape(re.sub(r'<[^>]+>', '', text))
+    visible = lambda l: re.sub('[\ue000-\ue021]', '', _LINK.sub(lambda m: m.group(2), l))
+    # Page footers and headers the HTML doesn't mark: "Paxson, et al.  Standards Track  [Page 11]"
+    page_line = re.compile(r'^\S.*\S\s{2,}\[Page \d+\]$|^RFC \d+\s{2,}.*\S\s{2,}\w+ \d{4}$')
+    lines = [l.rstrip() for l in text.split('\n') if not page_line.match(visible(l).strip())]
+
+    # Pass 1: headings and blocks (consecutive non-blank lines), the section each one is in
+    items, headings, refs, block, section = [], {}, {}, [], ''
+    def flush():
+        if block:
+            items.append(('block', section, list(block)))
+            block.clear()
+    started = False
+    for line in lines:
+        if line.strip() == 'Abstract' and not started:
+            flush()
+            started, section = True, 'Abstract'
+            items.append(('heading', 2, 'Abstract'))
+            continue
+        if m := re.match('^\\s*\ue010(\\d)\ue011([^\ue011]*)\ue011(.*)$', line):
+            flush()
+            level, sid, title = int(m.group(1)), m.group(2), re.sub(r'\s+', ' ', m.group(3)).strip()
+            if level == 1:
+                continue                                # the RFC's title: it is the note's title
+            section = title
+            if sid:
+                headings[sid] = title
+            items.append(('heading', min(level, 6), title))
+            continue
+        if not line.strip():
+            flush()
+            continue
+        if not block and started and len(line) < 70 and '\ue000' not in line and \
+                (not line.startswith(' ') or _RFC_END_HEADING.fullmatch(line.strip())):
+            section = re.sub(r'\s+', ' ', line).strip()   # unnumbered heading: Abstract, Copyright Notice…
+            items.append(('heading', 2, section))
+            continue
+        if not started:
+            items.append(('front', '', line))
+            continue
+        for rid in re.findall('\ue020([^\ue021]+)\ue021', line):
+            refs[rid] = section
+        block.append(re.sub('\ue020[^\ue021]+\ue021', '', line))
+    flush()
+
+    # Pass 2: markdown
+    out, front = [], [l for kind, _, l in items if kind == 'front']
+    if front:
+        while front and not front[-1].strip():
+            front.pop()
+        out.append('```text\n' + '\n'.join(visible(l) for l in front) + '\n```')
+    last = ''                    # kind of the last output: 'para' and 'item' can continue after a page break
+    for kind, section, data in items:
+        if kind == 'heading':    # ('heading', level, title)
+            out.append('#' * section + ' ' + _rfc_md_escape(data))
+            last = 'heading'
+            continue
+        if kind != 'block':
+            continue
+        vis = [visible(l) for l in data]
+        indent = min(len(l) - len(l.lstrip()) for l in vis)
+        if 'table of contents' in section.lower():
+            for l, v in zip(data, vis):
+                depth = max(0, (len(v) - len(v.lstrip()) - 3) // 3)
+                entry = re.sub(r'\s*\.{2,}\s*\d*\s*$|\s+\d+\s*$', '', l.strip())
+                out.append('  ' * depth + '- ' + _rfc_render(re.sub(r'\s+', ' ', entry), number, headings, refs))
+            continue
+        if 'address' in section.lower():   # Authors' Addresses: one line per line
+            out.append('\n'.join(_rfc_render(l.strip(), number, headings, refs) for l in data))
+            last = 'address'
+            continue
+        art = any(re.search(r'\S {3,}\S|[|+]-{2,}|-{4,}|\|\s', v.strip()) for v in vis)
+        short = max(len(v) for v in vis) < 60 and len(vis) > 1
+        marker = _RFC_LIST.match(vis[0].lstrip())
+        # Formulas: indented lines of assignments and operators that don't end like a sentence
+        formula = indent > 3 and not marker and all(
+            re.search(r'<-|[=+*/^]|\w\s?\(', v) and not re.search(r'[.!?]["\')]?$', v.strip()) for v in vis)
+        if art or formula or (indent >= 6 and short and not marker):
+            out.append('```text\n' + '\n'.join(_rfc_render(l[min(indent, 3):], number, headings, refs, code=True)
+                                               for l in data) + '\n```')
+            last = 'code'
+            continue
+        joined = re.sub(r'\s+', ' ', ' '.join(l.strip() for l in data))
+        depth = max(0, (indent - 3) // 3)
+        if last in ('para', 'item') and not marker and re.match(r'[a-z]', joined) \
+                and not re.search(r'[.:;!?)"\]]$', out[-1]):   # a sentence cut by a page break
+            out[-1] += ' ' + _rfc_render(joined, number, headings, refs)
+            continue
+        last = 'item' if marker else 'para'
+        if marker:   # bullets lose their marker; numbered or labelled items keep their label
+            mark = marker.group(1)
+            label = '' if mark in ('o', '*', '-', '+') else _rfc_md_escape(mark) + ' '
+            out.append('  ' * depth + '- ' + label + _rfc_render(joined[len(mark):].lstrip(), number, headings, refs))
+        else:
+            out.append(_rfc_render(joined, number, headings, refs))
+    return '\n\n'.join(o for o in out if o)
+
+
+def _rfc_v3_markdown(page, number):
+    """Markdown from a newer RFC's HTML (xml2rfc v3), parsed by defuddle after clean-up."""
+    page = re.sub(r'<a[^>]*class="[^"]*pilcrow[^"]*"[^>]*>.*?</a>', '', page, flags=re.S)
+    page = re.sub(r'<a[^>]*class="[^"]*selfRef[^"]*"[^>]*>(.*?)</a>', r'\1', page, flags=re.S)
+    # Section and reference targets: heading text by id
+    headings, refs = {}, {}
+    for sec in re.finditer(r'<section id="([^"]+)">\s*<h(\d)[^>]*>(.*?)</h\2>', page, re.S):
+        title = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', '', sec.group(3)))).strip()
+        headings[sec.group(1)] = title
+        if m := re.search(r'id="(name-[^"]+)"', sec.group(0)):
+            headings[m.group(1)] = title
+    for dl in re.finditer(r'<dl class="references">(.*?)</dl>', page, re.S):
+        heads = list(re.finditer(r'<h(\d)[^>]*>(.*?)</h\1>', page[max(0, dl.start() - 3000):dl.start()], re.S))
+        if not heads:
+            continue
+        title = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', '', heads[-1].group(2)))).strip()
+        for rid in re.findall(r'<dt id="([^"]+)"', dl.group(1)):
+            refs[rid] = title
+    page = re.sub(r'<a\s[^>]*href="(#[^"]*)"[^>]*>(.*?)</a>',
+                  lambda m: '\ue000' + m.group(1) + '\ue001' + html.unescape(re.sub(r'<[^>]+>', '', m.group(2))).strip() + '\ue002',
+                  page, flags=re.S)
+    d = fetch_defuddle(_RFC_HTML.format(number), page=page)
+    md = d.get('content') or ''
+    md = re.sub(r'^(#{1,6} .*?)\\\.', r'\1.', md, flags=re.M)                  # "## 2\. Introduction"
+    return _LINK.sub(lambda m: _rfc_link(m.group(1), m.group(2), number, headings, refs), md)
+
+
+def rfc_markdown(number):
+    """An RFC as markdown with its links (headings, paragraphs, lists, figures as text blocks,
+    links to other RFCs, sections and references), or None when the HTML can't be converted."""
+    page = curl(_RFC_HTML.format(number), '-A', BROWSER_UA, max_time=30, text=True).stdout or ''
+    try:
+        if re.search(r'<section id="section-1"', page):
+            md = _rfc_v3_markdown(page, number)
+        elif '<pre' in page:
+            md = _rfc_text_markdown(page, number)
+        else:
+            return None
+    except Exception:
+        return None
+    return md if len(md.split()) >= 300 else None
+
+
 # Crossref types whose landing page, when it's not free, shows an abstract (often with the reference
 # list) rather than the work itself: there only explicit full-text links count, not the page
 _ARTICLE_TYPES = {'journal-article', 'proceedings-article', 'book-chapter', 'book', 'monograph',
@@ -3998,6 +4240,14 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     method      = ''
     bbl_key_map = {}
     pdf_path    = None
+    # RFCs: the RFC Editor's HTML as markdown with its links (falls back to the text version below)
+    rfc = re.fullmatch(r'10\.17487/rfc(\d+)', doi or '', re.IGNORECASE)
+    if rfc and not converted:
+        print(f'Converting RFC {int(rfc.group(1))} from the RFC Editor HTML...', file=sys.stderr)
+        if md := rfc_markdown(int(rfc.group(1))):
+            content, method, meta['web_text'] = md, 'web', True
+            meta['fulltext_url'] = _RFC_HTML.format(int(rfc.group(1)))
+            arxiv_id = None
     with tempfile.TemporaryDirectory() as tmp_dir:
         if arxiv_id:
             if not shutil.which('pandoc'):
@@ -4183,6 +4433,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
         frontmatter_url(url, meta.get('fulltext_url')),   # the web page the text came from, if not a PDF
         f'doi: {doi_str}' if doi_str else None,
+        frontmatter_field('issn', paper_issn(doi_str, meta, content) if doi_str else ''),
         *author_lines,
         frontmatter_field('published', published),
         frontmatter_field('publication', journal),
@@ -4421,13 +4672,27 @@ _APOSTROPHES = re.compile("['\u2018\u2019\u02bc\u0060\u00b4]")
 _ABBREVIATION = re.compile(r'(?<![\w.])(?:[^\W\d_]{1,2}\.){2,}')   # U.S., Ph.D., e.g.
 
 
+_GREEK = '\u0370-\u03ff\u1f00-\u1fff\u00b5'
+_LONE_GREEK = re.compile(f'(?<![{_GREEK}])[{_GREEK}](?![{_GREEK}])')
+
+
+def _greek_name(c):
+    """The name of a Greek letter: φ, ϕ -> phi, Δ -> delta, ς -> sigma, µ -> mu ('' if not a letter)."""
+    words = re.sub(r' WITH .*', '', unicodedata.name(unicodedata.normalize('NFKC', c), '')).split()
+    words = [w for w in words if w not in ('GREEK', 'SMALL', 'CAPITAL', 'LETTER', 'SYMBOL', 'FINAL')]
+    return words[0].lower() if unicodedata.category(c).startswith('L') and words else ''
+
+
 def _slug(text):
     """Kebab-case slug. Latin letters become plain ASCII (Guéant -> gueant, ß -> ss); other scripts
-    (Greek, Cyrillic, kanji…) are kept as they are. Apostrophes and abbreviation dots join words
-    instead of splitting them (O'Hara -> ohara, U.S. -> us); & becomes 'and'."""
+    (Greek, Cyrillic, kanji…) are kept as they are, but lone Greek letters in a text without Greek
+    words are written out (the φ accrual -> the-phi-accrual). Apostrophes and abbreviation dots join words instead of
+    splitting them (O'Hara -> ohara, U.S. -> us); & becomes 'and'."""
     text = _APOSTROPHES.sub('', text)
     text = _ABBREVIATION.sub(lambda m: m.group(0).replace('.', ''), text)
     text = unicodedata.normalize('NFC', text.replace('&', ' and ').lower().translate(_TRANSLIT))
+    if not re.search(f'[{_GREEK}]{{2}}', text):           # no Greek words: lone letters are symbols
+        text = _LONE_GREEK.sub(lambda m: f' {_greek_name(m.group(0)) or m.group(0)} ', text)
     out = []
     for c in text:
         if c.isascii():
@@ -5897,6 +6162,33 @@ for raw in sys.argv[1:]:
         out.append([c, isbnlib.mask(c) or c])
 print(json.dumps(out))
 '''
+
+
+def valid_issn(text):
+    """text as a checked ISSN 'NNNN-NNNC' (ISO 3297: mod-11 check digit, X for 10), or ''."""
+    d = re.sub(r'[^0-9Xx]', '', text or '').upper()
+    if not re.fullmatch(r'\d{7}[\dX]', d):
+        return ''
+    check = (11 - sum(int(c) * w for c, w in zip(d[:7], range(8, 1, -1))) % 11) % 11
+    return f'{d[:4]}-{d[4:]}' if d[7] == ('X' if check == 10 else str(check)) else ''
+
+
+def paper_issn(doi, meta, content=''):
+    """The ISSN of a paper's journal or series: OpenAlex's ISSN-L (the linking ISSN that covers
+    the print and online editions), else Crossref's print or electronic ISSN, else an 'ISSN:' line
+    near the start of the document itself (RFCs: the RFC series ISSN). '' when none is known."""
+    try:
+        r = curl(f'https://api.openalex.org/works/doi:{quote(doi, safe="/")}?select=primary_location', max_time=15)
+        source = (json.loads(r.stdout or b'{}').get('primary_location') or {}).get('source') or {}
+        if issn := valid_issn(source.get('issn_l') or ''):
+            return issn
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        pass
+    for candidate in meta.get('issns') or []:
+        if issn := valid_issn(candidate):
+            return issn
+    m = re.search(r'\bISSN[:\s]+(\d{4}\s*-?\s*\d{3}[\dXx])\b', content[:6000])
+    return valid_issn(m.group(1)) if m else ''
 
 
 def isbn13s(candidates):
