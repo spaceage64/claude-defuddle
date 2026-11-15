@@ -678,8 +678,9 @@ def older_gemini_models(alias):
 _ai_last_model = None   # the model that last answered ai_request, for available_ai_model()
 
 
-def ai_request(prompt, timeout=60, json_reply=False):
+def ai_request(prompt, timeout=60, json_reply=False, image=None):
     """Send a prompt to the provider configured by AI_LLM / AI_MODEL and return the reply text.
+    image: (mime type, bytes) sent along with the prompt (a page of a PDF, for example).
     With a list of models, an overloaded or rate-limited one (HTTP 429/5xx, timeout) passes to the
     next, and then to AI_OLDER_MODELS older versions of a Gemini '-latest' alias. json_reply asks the
     provider for valid JSON only. Raises when all fail; callers then fall back to the Claude CLI."""
@@ -687,23 +688,26 @@ def ai_request(prompt, timeout=60, json_reply=False):
     import urllib.request as _urlreq, urllib.error as _urlerr
     models = [AI_MODEL] if isinstance(AI_MODEL, str) else list(AI_MODEL)
     older = AI_LLM == 'gemini' and AI_OLDER_MODELS > 0   # older versions not added yet
+    mime, data = (image[0], base64.b64encode(image[1]).decode()) if image else ('', '')
     i = 0
     while i < len(models):
         model = models[i]
         last = i == len(models) - 1 and not older
         if AI_LLM == 'gemini':
             url  = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}'
-            body = {'contents': [{'parts': [{'text': prompt}]}],
+            body = {'contents': [{'parts': [{'text': prompt}] + ([{'inline_data': {'mime_type': mime, 'data': data}}] if image else [])}],
                     **({'generationConfig': {'responseMimeType': 'application/json'}} if json_reply else {})}
             headers, pick = {}, lambda d: d['candidates'][0]['content']['parts'][0]['text']
         elif AI_LLM == 'openai':
             url  = (AI_BASE_URL.rstrip('/') + '/chat/completions') if AI_BASE_URL else 'https://api.openai.com/v1/chat/completions'
-            body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}],
+            content = [{'type': 'text', 'text': prompt}, {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{data}'}}] if image else prompt
+            body = {'model': model, 'messages': [{'role': 'user', 'content': content}],
                     **({'response_format': {'type': 'json_object'}} if json_reply else {})}
             headers, pick = {'Authorization': f'Bearer {AI_API_KEY}'}, lambda d: d['choices'][0]['message']['content']
         elif AI_LLM == 'ollama':
             url  = 'http://localhost:11434/api/generate'
-            body = {'model': model, 'prompt': prompt, 'stream': False, **({'format': 'json'} if json_reply else {})}
+            body = {'model': model, 'prompt': prompt, 'stream': False, **({'format': 'json'} if json_reply else {}),
+                    **({'images': [data]} if image else {})}
             headers, pick = {}, lambda d: d['response']
         else:
             raise ValueError(f'Unsupported AI_LLM: {AI_LLM!r}')
@@ -2668,7 +2672,7 @@ def _pdf_to_markdown(pdf_path, convert_path):
         return '', {}, ''
 
     markdown, images, method = result
-    markdown = _clean_pdf_markdown(markdown, images)
+    markdown = _clean_pdf_markdown(markdown, images, pdf_path)
     missing = _missing_equations(pdf_path, markdown)
     if missing:
         print(f'WARNING: equation{"s" if len(missing) > 1 else ""} {_number_ranges(missing)} from the PDF '
@@ -3326,7 +3330,7 @@ def restore_tex_escapes(md):
     return re.sub(r'\$[^$\n]*\$', lambda m: m.group(0).replace('\t', '\\t'), md)
 
 
-def _clean_pdf_markdown(md, images):
+def _clean_pdf_markdown(md, images, pdf_path=None):
     """Tidy marker/Datalab output for Obsidian: remove page anchors and links, descriptions without
     an image, and figures detected twice; split image descriptions that wrap other images; warn
     about display equations that won't render."""
@@ -3342,7 +3346,7 @@ def _clean_pdf_markdown(md, images):
     md = _tags_out_of_environments(md)
     md = _bold_titles_to_headings(md)
     md = _normalize_heading_levels(md)
-    md = repair_equations(md)
+    md = repair_equations(md, pdf_path)
     md = re.sub(r'!\[[^\]]*\]\(\s*\)[ \t]*\n*', '', md)
     md = re.sub(r'<span id="[^"]*">\s*</span>', '', md)
     md = re.sub(r'\[((?:\\.|[^\]\\])*)\]\(#page-[\d-]+\)',
@@ -3550,24 +3554,106 @@ def balance_equation(eq):
     return ''.join(out) + tail
 
 
-def repair_equations(md):
-    """Display equations with unpaired braces or \\left/\\right made renderable (balance_equation),
-    with a WARNING naming them so they can be checked against the PDF; ones it can't repair are
-    named too."""
-    fixed, failed = [], []
+def _pdf_pages_text(path):
+    """Text of each page of a PDF (pdftotext; pages split at form feeds), or []."""
+    if not shutil.which('pdftotext'):
+        return []
+    try:
+        return subprocess.run(['pdftotext', '-q', path, '-'], capture_output=True, text=True, timeout=120).stdout.split('\f')
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def _pdf_page_image(path, page):
+    """One page of a PDF (1-based) as a 150 dpi JPEG, or None."""
+    if not shutil.which('pdftoppm'):
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            subprocess.run(['pdftoppm', '-f', str(page), '-l', str(page), '-r', '150', '-jpeg', '-singlefile',
+                            path, os.path.join(tmp, 'page')], capture_output=True, timeout=60)
+            with open(os.path.join(tmp, 'page.jpg'), 'rb') as f:
+                return f.read()
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+
+def _prose(text):
+    """Text without math, for finding it in a PDF's text layer (formulas come out jumbled there)."""
+    return re.sub(r'\$\$.*?\$\$|\$[^$\n]*\$|\\[a-zA-Z]+|[*_#>|]', ' ', text, flags=re.S)
+
+
+def _eq_problem(eq):
+    """What doesn't pair up in a formula, in words: 'one { more than }, one \\left without \\right'."""
+    count = lambda n, a, b: f'{["", "one", "two", "three"][n] if n < 4 else n} {a} more than {b}'
+    braces = len(re.findall(r'(?<!\\)\{', eq)) - len(re.findall(r'(?<!\\)\}', eq))
+    lr = len(_EQ_LEFT.findall(eq)) - len(_EQ_RIGHT.findall(eq))
+    parts = ([count(abs(braces), '{' if braces > 0 else '}', '}' if braces > 0 else '{')] if braces else []) + \
+            ([count(abs(lr), '\\left' if lr > 0 else '\\right', '\\right' if lr > 0 else '\\left')] if lr else [])
+    return ', '.join(parts)
+
+
+def reread_equation(eq, before, after, pdf_path, pages):
+    """A display equation read again from its PDF page by the AI model (the page as an image), when
+    the converted version doesn't render. The page is found by the prose around the equation. None
+    unless the new version renders and is clearly the same equation (similarity to the old one)."""
+    words = lambda t: [w for w in re.findall(r'[a-z0-9]+', t.lower()) if len(w) > 2]
+    before_w, after_w = words(_prose(before))[-8:], words(_prose(after))[:8]
+    page = next((i + 1 for key in (before_w, after_w) if len(key) >= 4
+                 for i, text in enumerate(pages) if _title_words_in(' '.join(key), text, gap=4)), None)
+    image = _pdf_page_image(pdf_path, page) if page else None
+    if not image:
+        return None
+    prompt = (f'This image is page {page} of a paper. It has a display equation right after the text '
+              f'"…{" ".join(before_w)}" and before "{" ".join(after_w)}…". This is our transcription of it:\n\n{eq}\n\n'
+              f'It does not render: {_eq_problem(eq)}, so a bracket or part of the equation was lost. Compare it '
+              'with the equation in the image and reply with the complete, corrected equation in LaTeX that renders '
+              'without errors: every { closed by }, every \\left paired with a \\right in the same row. Keep our '
+              'style and the equation number as in our transcription, and restore anything missing (exponents, '
+              'primes, brackets). Reply with only the LaTeX, without $$, \\[ \\] or code fences.')
+    try:
+        reply = ai_request(prompt, timeout=120, image=('image/jpeg', image))
+    except Exception:
+        return None
+    new = re.sub(r'^\s*(?:```\w*|\$\$|\\\[)\s*|\s*(?:```|\$\$|\\\])\s*$', '', reply or '').strip()
+    compact = lambda t: re.sub(r'\s+', '', t)
+    if not new or _eq_unbalanced(new) or difflib.SequenceMatcher(None, compact(eq), compact(new)).ratio() < 0.6:
+        return None
+    end = re.search(r'[.,;]\s*$', eq)              # the sentence's punctuation after the equation
+    return new + end.group(0).strip() if end and not re.search(r'[.,;]\s*$', new) else new
+
+
+def repair_equations(md, pdf_path=None):
+    """Display equations with unpaired braces or \\left/\\right, which Obsidian can't render: read
+    again from the PDF page (reread_equation) when the PDF is at hand, else made renderable by
+    balance_equation, with a WARNING naming those so they can be checked against the PDF."""
+    reread, fixed, failed, pages = [], [], [], None
     def label(eq):
         num = re.search(r'(?:\\tag\{|\()(\d+[a-z]?)[)}]\s*$', eq.strip())
         return f'({num.group(1)})' if num else repr(eq.strip()[:40] + '…')
-    def fix(eq):
+    def fix(eq, before, after):
+        nonlocal pages
         if not _eq_unbalanced(eq):
             return eq
+        if pdf_path:
+            pages = _pdf_pages_text(pdf_path) if pages is None else pages
+            new = reread_equation(eq, before, after, pdf_path, pages)
+            if new:
+                reread.append(label(eq))
+                return new
         new = balance_equation(eq)
         (failed if _eq_unbalanced(new) else fixed).append(label(eq))
         return eq if _eq_unbalanced(new) else new
-    md = re.sub(r'^([ \t]*\$\$[ \t]*\n)(.*?)(\n[ \t]*\$\$[ \t]*)$',
-                lambda m: m.group(1) + fix(m.group(2)) + m.group(3), md, flags=re.S | re.M)
-    md = re.sub(r'^([ \t]*\$\$)((?!\s*$).+?)(\$\$[ \t]*)$',
-                lambda m: m.group(1) + fix(m.group(2)) + m.group(3), md, flags=re.M)
+    for pattern, flags in ((r'^[ \t]*\$\$[ \t]*\n(.*?)\n[ \t]*\$\$[ \t]*$', re.S | re.M),
+                           (r'^[ \t]*\$\$(?!\s*$)(.+?)\$\$[ \t]*$', re.M)):
+        out, pos = [], 0
+        for m in re.finditer(pattern, md, flags):
+            out += [md[pos:m.start(1)], fix(m.group(1), md[max(0, m.start() - 800):m.start()], md[m.end():m.end() + 800])]
+            pos = m.end(1)
+        md = ''.join(out) + md[pos:]
+    if reread:
+        print(f'Read {len(reread)} display equation(s) again from the PDF page, as the converted version '
+              f'did not render: {", ".join(reread[:10])}', file=sys.stderr)
     if fixed:
         print(f'WARNING: closed unpaired brackets in {len(fixed)} display equation(s) so they render: '
               f'{", ".join(fixed[:10])}; check them against the PDF.', file=sys.stderr)
@@ -3575,7 +3661,6 @@ def repair_equations(md):
         print(f'WARNING: {len(failed)} display equation(s) have unbalanced brackets and won\'t render in '
               f'Obsidian: {", ".join(failed[:10])}; check them against the PDF.', file=sys.stderr)
     return md
-
 
 def unescape_in_html(md):
     """Markdown escapes inside inline HTML (marker writes <sup>\\*</sup>): Obsidian shows the backslash,

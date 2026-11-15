@@ -175,7 +175,7 @@ A concise AI-generated summary of the article's key points...
 | [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→Markdown (default); version 2 also needs `llama-server` | `pipx install marker-pdf` and `brew install llama.cpp` |
 | Datalab API key | Cloud PDF→Markdown fallback | [datalab.to](https://datalab.to): free accounts get $10 in credits (roughly 10–15 cents per paper) |
 | tesseract | OCR text layer for scanned PDFs (`OCR_PDF`) | `brew install tesseract` |
-| poppler | Sharp arXiv PDF figures (200 dpi); reads PDF text for the shadow library check | `brew install poppler` |
+| poppler | Sharp arXiv PDF figures (200 dpi); reads PDF text for the shadow library check; renders PDF pages to re-read broken formulas | `brew install poppler` |
 | Ghostscript | Renders EPS figures of arXiv papers (skipped with a warning without it) | `brew install ghostscript` |
 | [uv](https://docs.astral.sh/uv/) | Runs PyMuPDF in isolation for PDF compression | `brew install uv` |
 
@@ -265,6 +265,8 @@ Papers get a note with the abstract, keywords as tags and the bibliography. For 
 The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To use Datalab, set `DATALAB_API_KEY` (in the script or your keys file).
 
 **Marker quality.** Local `marker` has two settings, chosen with `MARKER_PRECISE`:
+
+**Formulas that don't render.** A converted formula sometimes loses a bracket (a `}` or a `\right`), and Obsidian then shows an error instead of the formula. defuddle finds such formulas, renders their PDF page and asks the AI model to read the formula again from the image, telling it exactly what doesn't pair up. The new version is used when it renders and is clearly the same formula; otherwise the missing brackets are closed so it renders, with a warning to check it against the PDF. Correct formulas are never changed.
 
 | Setting | What it does | Best for |
 |---|---|---|
