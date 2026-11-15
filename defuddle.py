@@ -85,8 +85,12 @@ ENABLE_IMAGES            = True
 ENABLE_IMAGE_COMPRESSION = True
 # ║  Grayscale figures (with compression) — requires: uv. Grey images (scanned   ║
 # ║  graphs, line art) become PNG with 8 grey levels, or 32 when 8 would show    ║
-# ║  bands in smooth shading; photos and colour images are left alone.           ║
+# ║  bands in smooth shading; photos are left alone.                             ║
 GRAYSCALE_FIGURES        = False
+# ║  Colour figures (with compression) — requires: uv. Charts and diagrams       ║
+# ║  (one colour, the background, covers most of the image) become PNG with 16   ║
+# ║  colours, or 64 when 16 would show bands; photos are left alone.             ║
+COLOR_FIGURES            = False
 # ║  PDF compression (--keep-pdf) — requires: uv                                 ║
 # ║  Images above 160 dpi go to 150 dpi; fonts are trimmed.                      ║
 ENABLE_PDF_COMPRESSION   = True
@@ -3420,6 +3424,34 @@ def fix_list_markers(md):
     return '\n'.join(out)
 
 
+def fix_reference_list(md):
+    """Numbered references as one list: '- [1] …' → '- \\[1\\] …' (Obsidian renders '- [1] ', any single
+    character in brackets, as a checkbox), and '[1] …' paragraphs in a run of two or more references, or
+    next to such a list item, become list items too, without blank lines between them. Code blocks are
+    left alone; '[1](…)' links and '[1]: …' definitions don't match."""
+    lines, fence, refs = md.split('\n'), False, {}
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(('```', '~~~')):
+            fence = not fence
+        m = None if fence else re.match(r'^(\s*)([-*+]\s+)?\\?\[(\d{1,4})\\?\]\s+(?=\S)', line)
+        if m:
+            refs[i] = m
+    nonblank = lambda i, step: next((j for j in range(i + step, len(lines) if step > 0 else -1, step)
+                                     if lines[j].strip()), None)
+    keep = {i for i, m in refs.items() if m.group(2) or nonblank(i, -1) in refs or nonblank(i, 1) in refs}
+    out, in_refs = [], False
+    for i, line in enumerate(lines):
+        if i in keep:
+            m = refs[i]
+            line, in_refs = f'{m.group(1)}- \\[{m.group(3)}\\] ' + line[m.end():], True
+        elif not line.strip():
+            if in_refs and nonblank(i, 1) in keep:
+                continue
+            in_refs = False
+        out.append(line)
+    return '\n'.join(out)
+
+
 def join_page_breaks(md):
     """Paragraphs or list items cut in two by a page break, joined again: a text block that doesn't end
     like a sentence, followed by one that starts with a lowercase letter."""
@@ -4748,8 +4780,6 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     # Normalise abstract heading: "--- Abstract" → "Abstract"
     content = re.sub(r'^(#{1,4})\s*---\s*Abstract', r'\1 Abstract', content,
                      flags=re.MULTILINE | re.IGNORECASE)
-    # Fix reference list items: "- [N] " → "[N] " (prevents Obsidian checkbox rendering)
-    content = re.sub(r'^- (\[\d+\] )', r'\1', content, flags=re.MULTILINE)
 
     # Fix paper structure: strip pre-title content, remove duplicate titles, move abstract to top
     if method != 'web':   # the PDF repairs (text before the title, duplicate titles…) don't apply to a web page
@@ -5475,8 +5505,8 @@ def download_images(content, docs_dir, filename_base, images_dict=None, source_u
     if blank:
         print(f'Left out {len(blank)} blank image{"s" if len(blank) > 1 else ""}', file=sys.stderr)
     saved = [os.path.join(img_dir, n) for n in seen.values()]
-    if saved and ENABLE_IMAGE_COMPRESSION and GRAYSCALE_FIGURES:
-        for old, new in optimize_grayscale_figures(saved).items():
+    if saved and ENABLE_IMAGE_COMPRESSION and (GRAYSCALE_FIGURES or COLOR_FIGURES):
+        for old, new in optimize_figures(saved, GRAYSCALE_FIGURES, COLOR_FIGURES).items():
             content = content.replace(f'(img/{os.path.basename(old)})', f'(img/{os.path.basename(new)})')
     # Don't leave an empty img/ behind when every download failed
     if os.path.isdir(img_dir) and not os.listdir(img_dir):
@@ -5937,7 +5967,7 @@ def fetch_for_method(url, method):
 
 # Scans above 160 dpi go to 150 dpi at JPEG quality 75, fonts are trimmed to the characters used.
 # Forms and protected files are left alone; the result is only used if pages and text are unchanged.
-_GRAY_FIGURES = r'''
+_FIGURES = r'''
 import json, os, subprocess, sys
 import numpy as np
 from PIL import Image
@@ -5947,33 +5977,58 @@ def box(a, r=3):
     s = p[k:, k:] - p[:-k, k:] - p[k:, :-k] + p[:-k, :-k]
     return s[:a.shape[0], :a.shape[1]] / (k * k)
 
+gray_on, color_on = sys.argv[1] == '1', sys.argv[2] == '1'
 out = {}
-for path in sys.argv[1:]:
+for path in sys.argv[3:]:
     try:
         im = Image.open(path)
         if im.mode in ('RGBA', 'LA', 'P') and 'transparency' in im.info or im.mode in ('RGBA', 'LA'):
             continue                                        # keep transparency as it is
         rgb = np.asarray(im.convert('RGB'), dtype=np.float64)
-        if np.percentile(np.ptp(rgb, axis=2), 99) > 24:
-            continue                                        # a colour image
+        colour = np.percentile(np.ptp(rgb, axis=2), 99) > 24
+        if not (color_on if colour else gray_on):
+            continue
         g = rgb.mean(axis=2)
-        clean = np.where(g > 225, 255, np.where(g < 30, 0, g))   # scan noise to pure white / black
         mean = box(g); std = np.sqrt(np.maximum(box(g * g) - mean ** 2, 0))
         smooth = (g > 40) & (g < 215) & (std < 6)            # grey areas without edges: where bands would show
-        if ((g > 40) & (g < 215)).mean() > 0.6 and smooth.mean() < 0.1:
-            continue                                        # mostly textured grey: a photo, not a figure
-        base = Image.fromarray(clean.astype(np.uint8), 'L')
-        tmp = os.path.splitext(path)[0] + '.gray.png'
-        for levels in (8, 32):
-            q = base.quantize(colors=levels, dither=Image.Dither.NONE)
-            band = float(np.abs(np.asarray(q.convert('L'), dtype=np.float64) - mean)[smooth].mean()) if smooth.sum() > 500 else 0.0
-            if smooth.mean() <= 0.03 or band <= 3.0:
-                q.save(tmp, optimize=True)
-                subprocess.run(['pngquant', '--force', '--skip-if-larger', '--speed', '1', '--quality', '90-100',
-                                '--ext', '.png', tmp], capture_output=True)
-                break
+        tmp = os.path.splitext(path)[0] + '.fig.png'
+        if colour:
+            # a chart or diagram has a background: one colour (16 levels per channel) covers most of it
+            keys = (rgb.astype(np.int32) >> 4) @ np.array([256, 16, 1])
+            if np.bincount(keys.ravel()).max() / keys.size < 0.65:
+                continue                                    # a photo
+            # JPEG noise to pure white / black, so the palette isn't spent on it
+            clean = np.where((rgb.min(axis=2) > 225)[..., None], 255, np.where((rgb.max(axis=2) < 30)[..., None], 0, rgb))
+            Image.fromarray(clean.astype(np.uint8), 'RGB').save(tmp)
+            for levels in (16, 64):
+                if subprocess.run(['pngquant', '--force', '--nofs', '--speed', '1', '--output', tmp, str(levels), tmp],
+                                  capture_output=True).returncode != 0:
+                    break
+                q = np.asarray(Image.open(tmp).convert('RGB'), dtype=np.float64)
+                err = np.sqrt(((q - clean) ** 2).sum(axis=2))
+                band = float(err[smooth].mean()) if smooth.sum() > 500 else 0.0
+                if smooth.mean() <= 0.03 or band <= (6.0 if levels == 16 else 12.0):
+                    break
+                Image.fromarray(clean.astype(np.uint8), 'RGB').save(tmp)
+            else:
+                os.remove(tmp); continue                    # bands even with 64 colours: shading, not flat colour
         else:
-            continue                                        # a photo: bands even with 32 greys
+            clean = np.where(g > 225, 255, np.where(g < 30, 0, g))   # scan noise to pure white / black
+            if ((g > 40) & (g < 215)).mean() > 0.6 and smooth.mean() < 0.1:
+                continue                                    # mostly textured grey: a photo, not a figure
+            base = Image.fromarray(clean.astype(np.uint8), 'L')
+            for levels in (8, 32):
+                q = base.quantize(colors=levels, dither=Image.Dither.NONE)
+                band = float(np.abs(np.asarray(q.convert('L'), dtype=np.float64) - mean)[smooth].mean()) if smooth.sum() > 500 else 0.0
+                if smooth.mean() <= 0.03 or band <= 3.0:
+                    q.save(tmp, optimize=True)
+                    subprocess.run(['pngquant', '--force', '--skip-if-larger', '--speed', '1', '--quality', '90-100',
+                                    '--ext', '.png', tmp], capture_output=True)
+                    break
+            else:
+                continue                                    # a photo: bands even with 32 greys
+        if not os.path.exists(tmp):
+            continue
         if os.path.getsize(tmp) > 2 * os.path.getsize(path):
             os.remove(tmp); continue
         final = os.path.splitext(path)[0] + '.png'
@@ -5986,15 +6041,18 @@ for path in sys.argv[1:]:
 print(json.dumps(out))
 '''
 
-def optimize_grayscale_figures(paths):
-    """Grey images (scanned graphs, line art) as PNG with 8 grey levels, or 32 when 8 would show bands
-    in smooth shading; colour images, photos and transparent images are left alone. One uv run for
-    all paths (Pillow + numpy in isolation). Returns {old path: new path} for the images that changed."""
-    if not paths or not shutil.which('uv'):
+def optimize_figures(paths, gray=True, color=True):
+    """Figures as small palette PNGs: grey images (scanned graphs, line art) with 8 grey levels, or 32
+    when 8 would show bands in smooth shading; colour charts and diagrams (one colour, the background,
+    covers at least 65% of the image) with 16 colours, or 64. Photos and transparent images are left
+    alone, and so is an image whose PNG would be more than twice its size. One uv run for all paths
+    (Pillow + numpy in isolation). Returns {old path: new path} for the images that changed."""
+    if not paths or not (gray or color) or not shutil.which('uv'):
         return {}
     try:
         r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pillow', '--with', 'numpy',
-                            'python', '-c', _GRAY_FIGURES, *paths], capture_output=True, text=True, timeout=600)
+                            'python', '-c', _FIGURES, str(int(gray)), str(int(color)), *paths],
+                           capture_output=True, text=True, timeout=600)
         return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
@@ -6817,7 +6875,7 @@ def save_note(note, args, subdir, filename, images_dict=None, source_url=None, f
         note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=source_url)
     if finish:
         note = finish(note, save_dir, filename)
-    note = _dedup_note_tags(note)
+    note = fix_reference_list(_dedup_note_tags(note))
     with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
         f.write(note)
     print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
