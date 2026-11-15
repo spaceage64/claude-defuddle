@@ -176,6 +176,7 @@ A concise AI-generated summary of the article's key points...
 | Datalab API key | Cloud PDF→Markdown fallback | [datalab.to](https://datalab.to): free accounts get $10 in credits (roughly 10–15 cents per paper) |
 | tesseract | OCR text layer for scanned PDFs (`OCR_PDF`) | `brew install tesseract` |
 | poppler | Sharp arXiv PDF figures (200 dpi); reads PDF text for the shadow library check; renders PDF pages to re-read broken formulas | `brew install poppler` |
+| Node.js | Checks formulas with MathJax (installed automatically into `~/.cache/defuddle/mathjax` on first use) | `brew install node` |
 | Ghostscript | Renders EPS figures of arXiv papers (skipped with a warning without it) | `brew install ghostscript` |
 | [uv](https://docs.astral.sh/uv/) | Runs PyMuPDF in isolation for PDF compression | `brew install uv` |
 
@@ -266,7 +267,7 @@ The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To us
 
 **Marker quality.** Local `marker` has two settings, chosen with `MARKER_PRECISE`:
 
-**Formulas that don't render.** A converted formula sometimes loses a bracket (a `}` or a `\right`), and Obsidian then shows an error instead of the formula. defuddle finds such formulas, renders their PDF page and asks the AI model to read the formula again from the image, telling it exactly what doesn't pair up. The new version is used when it renders and is clearly the same formula; otherwise the missing brackets are closed so it renders, with a warning to check it against the PDF. Correct formulas are never changed.
+**Formulas that don't render.** Every converted formula is checked with MathJax, the engine Obsidian renders math with (installed once into `~/.cache/defuddle/mathjax` when Node is available). A formula with an error (a lost bracket, an unclosed environment, an unknown command) is read again by the AI model from an image of its PDF page, with MathJax's own error message; an answer that still errors gets the new message back, up to three times. Without Node, unpaired brackets are what is checked. If no clean version comes back, missing brackets are closed so the formula renders, with a warning to check it against the PDF. Correct formulas are never changed. For arXiv papers, commands the paper defines itself (also in its own `.sty` files) are written out in the formulas.
 
 | Setting | What it does | Best for |
 |---|---|---|
