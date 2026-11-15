@@ -868,6 +868,7 @@ def clean_heading_text(text):
                   lambda m: m.group(1).translate(_SUPERSCRIPT) if re.fullmatch(r'[0-9+\-=()n]+', m.group(1))
                   else m.group(1), text)
     text = re.sub(r'</?(?:sub|sup|em|strong|i|b|span)\b[^>]*>', '', text)
+    text = re.sub(r'(\*\*|__)(.+?)\1', r'\2', text)      # **bold** (marker bolds titles): no markup in frontmatter
     return re.sub(r'\s*\|\s*', ' / ', text).rstrip()
 
 
@@ -1825,7 +1826,7 @@ def get_paper_metadata(doi):
         journal = container[0] if container else work.get('publisher', '')
         issns = sorted(work.get('issn-type') or [], key=lambda i: i.get('type') != 'print')
         return {'title': title, 'authors': authors, 'published': pub_date,
-                'journal': journal, 'doi': doi, 'type': work.get('type', ''),
+                'journal': journal, 'doi': doi, 'type': work.get('type', ''), 'isbns': work.get('ISBN') or [],
                 'issns': [i['value'] for i in issns if i.get('value')] or work.get('ISSN') or []}
     except Exception:
         return {}
@@ -1997,6 +1998,96 @@ def _inline_inputs(content, source_dir, depth=0):
         with open(path, encoding='utf-8', errors='replace') as f:
             return m.group(1) + _inline_inputs(f.read(), source_dir, depth + 1)
     return re.sub(r'^([^%\n]*)\\(?:input|include)\{([^}]+)\}', _sub, content, flags=re.MULTILINE)
+
+
+def _braced_end(text, i):
+    """Index just after the {…} group that opens at text[i] (nested braces counted), or -1."""
+    depth = 0
+    for j in range(i, len(text)):
+        c = text[j]
+        if c == '\\':
+            continue
+        if c == '{' and (j == 0 or text[j - 1] != '\\'):
+            depth += 1
+        elif c == '}' and text[j - 1] != '\\':
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+
+def _source_macros(content, source_dir):
+    """Simple macros the paper defines (\\newcommand, \\renewcommand, \\providecommand, \\def,
+    \\DeclareMathOperator) in its main file or its own style files (\\usepackage{x} with x.sty in the
+    source folder), as {name: (number of arguments, body)}; only those the paper uses, and what they use."""
+    texts = [content]
+    root = os.path.realpath(source_dir)
+    for m in re.finditer(r'^[^%\n]*\\usepackage(?:\[[^\]]*\])?\{([^}]+)\}', content, re.MULTILINE):
+        for name in (n.strip() for n in m.group(1).split(',')):
+            path = os.path.realpath(os.path.join(source_dir, name + '.sty'))
+            if path.startswith(root + os.sep) and os.path.isfile(path):
+                with open(path, encoding='utf-8', errors='replace') as f:
+                    texts.append(f.read())
+    defs = {}
+    for text in texts:
+        text = re.sub(r'(?<!\\)%.*', '', text)
+        for d in re.finditer(r'\\(?:(?:new|renew|provide)command\*?\s*\{?(\\[a-zA-Z]+)\}?\s*(?:\[(\d)\])?'
+                             r'|def\s*(\\[a-zA-Z]+)((?:#\d)*)|(DeclareMathOperator)\*?\s*\{(\\[a-zA-Z]+)\})\s*(?=\{)', text):
+            end = _braced_end(text, d.end())
+            if end < 0 or '@' in text[d.start():end]:
+                continue
+            body = text[d.end() + 1:end - 1]
+            if d.group(5):                        # \DeclareMathOperator{\diag}{diag}
+                name, nargs, body = d.group(6), 0, r'\operatorname{' + body + '}'
+            else:
+                name = d.group(1) or d.group(3)
+                nargs = int(d.group(2) or 0) if d.group(1) else len(re.findall(r'#\d', d.group(4) or ''))
+            defs.setdefault(name, (nargs, body))
+    used, todo = set(), set(re.findall(r'\\[a-zA-Z]+', content)) & set(defs)
+    while todo:
+        used |= todo
+        todo = {c for n in todo for c in re.findall(r'\\[a-zA-Z]+', defs[n][1]) if c in defs} - used
+    return {n: defs[n] for n in used}
+
+
+def _expand_macros(md, macros):
+    """The paper's own macros (_source_macros) written out in the markdown's math ($…$ and $$…$$),
+    for when pandoc couldn't expand them (it skips style files, and its fallback mode expands nothing)."""
+    if not macros:
+        return md
+    call = re.compile(r'(' + '|'.join(re.escape(n) for n in sorted(macros, key=len, reverse=True)) + r')(?![a-zA-Z])')
+    def expand(tex):
+        for _ in range(5):                        # macros that use other macros
+            out, pos, changed = [], 0, False
+            for m in call.finditer(tex):
+                if m.start() < pos:
+                    continue
+                nargs, body = macros[m.group(1)]
+                i, args = m.end(), []
+                for _ in range(nargs):
+                    while i < len(tex) and tex[i] == ' ':
+                        i += 1
+                    end = _braced_end(tex, i) if i < len(tex) and tex[i] == '{' else -1
+                    args.append(tex[i + 1:end - 1] if end > 0 else tex[i:i + 1])
+                    i = end if end > 0 else i + 1
+                for k, a in enumerate(args, 1):
+                    body = body.replace(f'#{k}', a)
+                out += [tex[pos:m.start()], '{' + body + '}' if nargs else body + ('' if re.match(r'[^a-zA-Z]', body[-1:] or ' ') else ' ')]
+                pos, changed = i, True
+            tex = ''.join(out) + tex[pos:]
+            if not changed:
+                break
+        return tex
+    return re.sub(r'\$\$.*?\$\$|\$[^$\n]+\$', lambda m: expand(m.group(0)), md, flags=re.S)
+
+def _strip_ensuremath(md):
+    """\\ensuremath{x} -> {x}: it only matters outside math, and MathJax doesn't know it."""
+    while (i := md.find('\\ensuremath{')) >= 0:
+        end = _braced_end(md, i + len('\\ensuremath'))
+        if end < 0:
+            break
+        md = md[:i] + md[i + len('\\ensuremath'):end] + md[end:]
+    return md
 
 
 def _number_figures(content):
@@ -2292,6 +2383,7 @@ def latex_to_markdown(tex_path, tmp_dir):
     # sharing info (e.g. \newtheorem{cor}[thm]{Corollary}).
     source_dir = os.path.dirname(tex_path)
     raw = _inline_inputs(raw, source_dir)
+    macros = _source_macros(raw, source_dir)
     nt_data = _parse_newtheorem(raw)
     raw, fig_labels = _number_figures(raw)
     preprocessed = _preprocess_latex(raw)
@@ -2338,7 +2430,7 @@ def latex_to_markdown(tex_path, tmp_dir):
         md = f.read()
     # Strip YAML frontmatter pandoc may emit
     md = re.sub(r'^---\n.*?\n---\n\n?', '', md, count=1, flags=re.DOTALL)
-    return md.strip()
+    return _strip_ensuremath(_expand_macros(md, macros)).strip()
 
 def openalex_free(doi):
     """Free copies of a paper according to OpenAlex: (direct PDF links, page with the free
@@ -3306,11 +3398,17 @@ def fix_list_markers(md):
     '1. **4. Re-allocation:**' → '4. **Re-allocation:**' (the document's number; a list may start at any
     number, so 1, 2, 3 / 4, 5 split by a page break stays 4, 5), '- • Problem' → '- Problem', and items
     numbered '1.1' or '(a)', which Markdown can't number, as bullets that keep their label.
-    Code blocks are left alone."""
-    out, fence = [], False
+    Items labelled '(1)', '**(2)**' (also after a Markdown marker: '1. (1) …') become '1.', '2.' when they
+    continue a sequence. Code blocks are left alone."""
+    out, fence, last = [], False, 0
     for line in md.split('\n'):
         if line.lstrip().startswith(('```', '~~~')):
             fence = not fence
+        m = None if fence else re.match(r'^(\s*)(?:\d{1,3}[.)]\s+)?(?:\*\*\((\d{1,3})\)\*\*|__\((\d{1,3})\)__|\((\d{1,3})\))\s+(?=\S)', line)
+        num = int(next(g for g in m.groups()[1:] if g)) if m else 0
+        if m and num in (1, last + 1):
+            last = num
+            line = f'{m.group(1)}{last}. ' + line[m.end():]
         if not fence:
             line = re.sub(r'^(\s*)[-*+]\s+[•◦▪‣·●○■□]\s*', r'\1- ', line)
             line = re.sub(r'^(\s*)\d{1,3}[.)]\s+([*_]{0,2})(\d{1,3})[.)]\s+', r'\1\3. \2', line)
@@ -3320,6 +3418,25 @@ def fix_list_markers(md):
             line = re.sub(r'^(\s*)\d{1,3}[.)]\s+(?=\(?(?:[a-z]|[ivx]{1,4})\)\s)', r'\1- ', line)
         out.append(line)
     return '\n'.join(out)
+
+
+def join_page_breaks(md):
+    """Paragraphs or list items cut in two by a page break, joined again: a text block that doesn't end
+    like a sentence, followed by one that starts with a lowercase letter."""
+    blocks = re.split(r'\n{2,}', md)
+    plain = lambda b: bool(b) and not re.match(r'\s*(?:#|!\[|\||\$\$|>|```|~~~|<|\[\^)', b)
+    out = []
+    for b in blocks:
+        if out and plain(out[-1]) and plain(b) and re.match(r'[a-z]', b) and not re.match(r'[a-z]\s+[A-Z]', b) \
+                and not re.search(r'[.:;!?)\]"”*_`$]\s*$', out[-1]) and out[-1].count('```') % 2 == 0:
+            # 'b Econometric Institute' (an affiliation's footnote letter) is not a continued sentence
+            if re.search(r'[a-z]-\s*$', out[-1]):    # a word hyphenated across the break: presenta- / tion
+                out[-1] = re.sub(r'-\s*$', '', out[-1]) + b.lstrip()
+            else:
+                out[-1] = out[-1].rstrip() + ' ' + b.lstrip()
+        else:
+            out.append(b)
+    return '\n\n'.join(out)
 
 
 def restore_tex_escapes(md):
@@ -3336,7 +3453,7 @@ def _clean_pdf_markdown(md, images, pdf_path=None):
     about display equations that won't render."""
     md = unescape_in_html(sup_symbols(md))
     md = restore_tex_escapes(md)
-    md = fix_list_markers(md)
+    md = join_page_breaks(fix_list_markers(md))
     md, _ = merge_split_tables(md)
     # The AI step sometimes wraps one panel's image inside another's description:
     # ![Description 1: ![](a.jpeg) | Description 2: caption](b.jpeg) -> both images
@@ -3554,6 +3671,60 @@ def balance_equation(eq):
     return ''.join(out) + tail
 
 
+# Formula check with MathJax, the engine Obsidian renders math with: installed once with npm into this
+# folder (no global install); without Node the check falls back to pairing brackets
+MATHJAX_DIR = '~/.cache/defuddle/mathjax'
+_MATHJAX_VERSION = '3.2.2'
+_MATHJAX_CHECK = r"""// JSON list of TeX formulas on stdin -> JSON list: null when it renders, else MathJax's error message
+const {mathjax} = require('mathjax-full/js/mathjax.js');
+const {TeX} = require('mathjax-full/js/input/tex.js');
+const {SVG} = require('mathjax-full/js/output/svg.js');
+const {liteAdaptor} = require('mathjax-full/js/adaptors/liteAdaptor.js');
+const {RegisterHTMLHandler} = require('mathjax-full/js/handlers/html.js');
+const {AllPackages} = require('mathjax-full/js/input/tex/AllPackages.js');
+RegisterHTMLHandler(liteAdaptor());
+// noundefined/noerrors would draw an unknown command or an error in red instead of reporting it
+const packages = AllPackages.filter(p => !['noundefined', 'noerrors'].includes(p));
+const doc = mathjax.document('', {InputJax: new TeX({packages, formatError: (jax, err) => { throw err; }}),
+                                  OutputJax: new SVG({fontCache: 'none'})});
+let input = '';
+process.stdin.on('data', d => input += d).on('end', () => {
+  process.stdout.write(JSON.stringify(JSON.parse(input).map(tex => {
+    try { doc.convert(tex, {display: true}); return null; } catch (e) { return String(e.message || e); }
+  })));
+});
+"""
+
+
+def mathjax_errors(formulas):
+    """MathJax's error message for each formula (None where it renders), or None when MathJax can't
+    run (no Node). MathJax is installed with npm into MATHJAX_DIR the first time it is needed."""
+    if not formulas:
+        return []
+    if not shutil.which('node'):
+        return None
+    folder = os.path.expanduser(MATHJAX_DIR)
+    try:
+        if not os.path.isdir(os.path.join(folder, 'node_modules', 'mathjax-full')):
+            if not shutil.which('npm'):
+                return None
+            print('Installing MathJax for the formula check (once)...', file=sys.stderr)
+            os.makedirs(folder, exist_ok=True)
+            subprocess.run(['npm', 'install', '--silent', '--no-audit', '--no-fund', '--prefix', folder,
+                            f'mathjax-full@{_MATHJAX_VERSION}'], capture_output=True, timeout=600)
+            if not os.path.isdir(os.path.join(folder, 'node_modules', 'mathjax-full')):
+                return None
+        script = os.path.join(folder, 'check.js')
+        if not os.path.exists(script) or open(script, encoding='utf-8').read() != _MATHJAX_CHECK:
+            with open(script, 'w', encoding='utf-8') as f:
+                f.write(_MATHJAX_CHECK)
+        r = subprocess.run(['node', script], input=json.dumps(formulas), capture_output=True, text=True, timeout=300)
+        errors = json.loads(r.stdout)
+        return errors if len(errors) == len(formulas) else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def _pdf_pages_text(path):
     """Text of each page of a PDF (pdftotext; pages split at form feeds), or []."""
     if not shutil.which('pdftotext'):
@@ -3593,59 +3764,94 @@ def _eq_problem(eq):
     return ', '.join(parts)
 
 
-def reread_equation(eq, before, after, pdf_path, pages):
+def _equation_page(pages, before, after):
+    """The PDF page (1-based) holding the prose around an equation: the page with the most of its
+    distinctive words (4+ letters, the 40 before and after it), or None when no page clearly has them."""
+    words = lambda t: re.findall(r'[a-z]{4,}', t.lower())
+    key = set(words(_prose(before))[-40:] + words(_prose(after))[:40])
+    if len(key) < 5:
+        return None
+    scores = [len(key & set(words(text))) for text in pages]
+    best = max(range(len(scores)), key=scores.__getitem__, default=None)
+    return best + 1 if best is not None and scores[best] >= max(5, 0.4 * len(key)) else None
+
+
+def reread_equation(eq, before, after, pdf_path, pages, problem, error_of):
     """A display equation read again from its PDF page by the AI model (the page as an image), when
-    the converted version doesn't render. The page is found by the prose around the equation. None
-    unless the new version renders and is clearly the same equation (similarity to the old one)."""
-    words = lambda t: [w for w in re.findall(r'[a-z0-9]+', t.lower()) if len(w) > 2]
-    before_w, after_w = words(_prose(before))[-8:], words(_prose(after))[:8]
-    page = next((i + 1 for key in (before_w, after_w) if len(key) >= 4
-                 for i, text in enumerate(pages) if _title_words_in(' '.join(key), text, gap=4)), None)
+    the converted version doesn't render (problem: why, e.g. MathJax's error). The page is found by the
+    prose around the equation. If the answer still has an error (error_of: MathJax's message or None),
+    the model gets it back, up to 3 rounds. None unless the result renders and is clearly the same equation."""
+    page = _equation_page(pages, before, after)
     image = _pdf_page_image(pdf_path, page) if page else None
     if not image:
         return None
-    prompt = (f'This image is page {page} of a paper. It has a display equation right after the text '
-              f'"…{" ".join(before_w)}" and before "{" ".join(after_w)}…". This is our transcription of it:\n\n{eq}\n\n'
-              f'It does not render: {_eq_problem(eq)}, so a bracket or part of the equation was lost. Compare it '
-              'with the equation in the image and reply with the complete, corrected equation in LaTeX that renders '
-              'without errors: every { closed by }, every \\left paired with a \\right in the same row. Keep our '
-              'style and the equation number as in our transcription, and restore anything missing (exponents, '
-              'primes, brackets). Reply with only the LaTeX, without $$, \\[ \\] or code fences.')
-    try:
-        reply = ai_request(prompt, timeout=120, image=('image/jpeg', image))
-    except Exception:
-        return None
-    new = re.sub(r'^\s*(?:```\w*|\$\$|\\\[)\s*|\s*(?:```|\$\$|\\\])\s*$', '', reply or '').strip()
+    words = lambda t: [w for w in re.findall(r'[a-z0-9]+', t.lower()) if len(w) > 2]
+    before_w, after_w = words(_prose(before))[-8:], words(_prose(after))[:8]
     compact = lambda t: re.sub(r'\s+', '', t)
-    if not new or _eq_unbalanced(new) or difflib.SequenceMatcher(None, compact(eq), compact(new)).ratio() < 0.6:
-        return None
-    end = re.search(r'[.,;]\s*$', eq)              # the sentence's punctuation after the equation
-    return new + end.group(0).strip() if end and not re.search(r'[.,;]\s*$', new) else new
-
+    current, why = eq, problem
+    for _ in range(3):
+        prompt = (f'This image is page {page} of a paper. It has a display equation right after the text '
+                  f'"…{" ".join(before_w)}" and before "{" ".join(after_w)}…". This is our transcription of it:\n\n{current}\n\n'
+                  f'It does not render: {why}. Compare it with the equation in the image and reply with the complete, '
+                  'corrected equation in LaTeX that renders without errors in MathJax: every { closed by }, every \\left '
+                  'paired with a \\right in the same row, every environment closed, and only standard commands (write '
+                  'out any command MathJax does not know, e.g. a macro the paper defined itself). Keep our style and the '
+                  'equation number as in our transcription, and restore anything missing (exponents, primes, brackets). '
+                  'Reply with only the LaTeX, without $$, \\[ \\] or code fences.')
+        try:
+            reply = ai_request(prompt, timeout=120, image=('image/jpeg', image))
+        except Exception:
+            return None
+        new = re.sub(r'^\s*(?:```\w*|\$\$|\\\[)\s*|\s*(?:```|\$\$|\\\])\s*$', '', reply or '').strip()
+        if not new or difflib.SequenceMatcher(None, compact(eq), compact(new)).ratio() < 0.6:
+            return None                           # not recognisably the same equation
+        why = error_of(new)
+        if not why:
+            end = re.search(r'[.,;]\s*$', eq)     # the sentence's punctuation after the equation
+            return new + end.group(0).strip() if end and not re.search(r'[.,;]\s*$', new) else new
+        current = new                             # still an error: show the model its answer and the new error
+    return None
 
 def repair_equations(md, pdf_path=None):
-    """Display equations with unpaired braces or \\left/\\right, which Obsidian can't render: read
-    again from the PDF page (reread_equation) when the PDF is at hand, else made renderable by
-    balance_equation, with a WARNING naming those so they can be checked against the PDF."""
+    """Display equations that won't render in Obsidian, found with MathJax (mathjax_errors; without it,
+    by unpaired braces or \\left/\\right): read again from the PDF page with the problem described
+    (reread_equation) when the PDF is at hand, else, for bracket problems, made renderable by
+    balance_equation. A WARNING names what was closed or is still broken, to check against the PDF."""
+    patterns = ((r'^[ \t]*\$\$[ \t]*\n(.*?)\n[ \t]*\$\$[ \t]*$', re.S | re.M), (r'^[ \t]*\$\$(?!\s*$)(.+?)\$\$[ \t]*$', re.M))
+    formulas = [m.group(1) for pattern, flags in patterns for m in re.finditer(pattern, md, flags)]
+    errors = mathjax_errors(formulas)
+    if errors is None:                        # no MathJax: unpaired brackets are what we can see
+        problems = {eq: _eq_problem(eq) for eq in formulas if _eq_unbalanced(eq)}
+        error_of = lambda tex: _eq_problem(tex) or None
+    else:
+        problems = {eq: (f'MathJax says "{err}"' + (f' ({_eq_problem(eq)})' if _eq_unbalanced(eq) else ''))
+                    for eq, err in zip(formulas, errors) if err}
+        def error_of(tex):
+            err = (mathjax_errors([tex]) or [None])[0]
+            return (f'MathJax says "{err}"' if err else '') or (_eq_problem(tex) if _eq_unbalanced(tex) else None)
+    if not problems:
+        return md
     reread, fixed, failed, pages = [], [], [], None
     def label(eq):
         num = re.search(r'(?:\\tag\{|\()(\d+[a-z]?)[)}]\s*$', eq.strip())
         return f'({num.group(1)})' if num else repr(eq.strip()[:40] + '…')
     def fix(eq, before, after):
         nonlocal pages
-        if not _eq_unbalanced(eq):
+        if eq not in problems:
             return eq
         if pdf_path:
             pages = _pdf_pages_text(pdf_path) if pages is None else pages
-            new = reread_equation(eq, before, after, pdf_path, pages)
+            new = reread_equation(eq, before, after, pdf_path, pages, problems[eq], error_of)
             if new:
                 reread.append(label(eq))
                 return new
-        new = balance_equation(eq)
-        (failed if _eq_unbalanced(new) else fixed).append(label(eq))
-        return eq if _eq_unbalanced(new) else new
-    for pattern, flags in ((r'^[ \t]*\$\$[ \t]*\n(.*?)\n[ \t]*\$\$[ \t]*$', re.S | re.M),
-                           (r'^[ \t]*\$\$(?!\s*$)(.+?)\$\$[ \t]*$', re.M)):
+        new = balance_equation(eq) if _eq_unbalanced(eq) else eq
+        if new != eq and not error_of(new):
+            fixed.append(label(eq))
+            return new
+        failed.append(f'{label(eq)}: {problems[eq]}')
+        return eq
+    for pattern, flags in patterns:
         out, pos = [], 0
         for m in re.finditer(pattern, md, flags):
             out += [md[pos:m.start(1)], fix(m.group(1), md[max(0, m.start() - 800):m.start()], md[m.end():m.end() + 800])]
@@ -3658,8 +3864,8 @@ def repair_equations(md, pdf_path=None):
         print(f'WARNING: closed unpaired brackets in {len(fixed)} display equation(s) so they render: '
               f'{", ".join(fixed[:10])}; check them against the PDF.', file=sys.stderr)
     if failed:
-        print(f'WARNING: {len(failed)} display equation(s) have unbalanced brackets and won\'t render in '
-              f'Obsidian: {", ".join(failed[:10])}; check them against the PDF.', file=sys.stderr)
+        print(f'WARNING: {len(failed)} display equation(s) won\'t render in Obsidian: {"; ".join(failed[:10])}; '
+              'check them against the PDF.', file=sys.stderr)
     return md
 
 def unescape_in_html(md):
@@ -4605,6 +4811,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
         frontmatter_url(url, meta.get('fulltext_url')),   # the web page the text came from, if not a PDF
         f'doi: {doi_str}' if doi_str else None,
         frontmatter_field('issn', paper_issn(doi_str, meta, content) if doi_str else ''),
+        frontmatter_field('isbn', paper_isbn(meta, content)),
         *author_lines,
         frontmatter_field('published', published),
         frontmatter_field('publication', journal),
@@ -4769,6 +4976,8 @@ def build_pdf(url, project, created, skip_doi=False):
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
         *([] if local_path else [frontmatter_url(url)]),
+        frontmatter_field('isbn', paper_isbn({}, content)),          # printed in the document
+        frontmatter_field('issn', paper_issn('', {}, content)),
         *(['author:'] + [f'  - {yaml_str(a)}' for a in pdf_authors] if pdf_authors else []),
         frontmatter_field('published', pdf_published),
         frontmatter_field('site', site),
@@ -6344,11 +6553,21 @@ def valid_issn(text):
     return f'{d[:4]}-{d[4:]}' if d[7] == ('X' if check == 10 else str(check)) else ''
 
 
+def paper_isbn(meta, content=''):
+    """The ISBN of the book or proceedings a paper appeared in, hyphenated ISBN-13: Crossref's, else an
+    'ISBN …' line near the start of the document (conference papers print it). '' when none is valid."""
+    candidates = list(meta.get('isbns') or []) + re.findall(r'\bISBN(?:-1[03])?[:\s]+([\d][\d -]{8,16}[\dXx])\b', content[:6000])
+    found = isbn13s(candidates[:5]) if candidates else []
+    return found[0][1] if found else ''
+
+
 def paper_issn(doi, meta, content=''):
     """The ISSN of a paper's journal or series: OpenAlex's ISSN-L (the linking ISSN that covers
     the print and online editions), else Crossref's print or electronic ISSN, else an 'ISSN:' line
     near the start of the document itself (RFCs: the RFC series ISSN). '' when none is known."""
     try:
+        if not doi:
+            raise ValueError('no DOI')
         r = curl(f'https://api.openalex.org/works/doi:{quote(doi, safe="/")}?select=primary_location', max_time=15)
         source = (json.loads(r.stdout or b'{}').get('primary_location') or {}).get('source') or {}
         if issn := valid_issn(source.get('issn_l') or ''):
