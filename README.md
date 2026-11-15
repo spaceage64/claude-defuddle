@@ -269,6 +269,8 @@ The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To us
 
 **Formulas that don't render.** Every converted formula is checked with MathJax, the engine Obsidian renders math with (installed once into `~/.cache/defuddle/mathjax` when Node is available). A formula with an error (a lost bracket, an unclosed environment, an unknown command) is read again by the AI model from an image of its PDF page, with MathJax's own error message; an answer that still errors gets the new message back, up to three times. Without Node, unpaired brackets are what is checked. If no clean version comes back, missing brackets are closed so the formula renders, with a warning to check it against the PDF. Correct formulas are never changed. For arXiv papers, commands the paper defines itself (also in its own `.sty` files) are written out in the formulas.
 
+**Equation numbers and LaTeX from the AI.** marker's AI model returns formulas as JSON, and a single backslash there turns `\tag`, `\tau`, `\text`, `\nu`, `\frac` or `\beta` into a tab, line break or other control character; the formula still renders, but wrong. defuddle starts marker with a small fix (in `~/.cache/defuddle/marker`) that keeps those backslashes. Equation numbers that end up outside their formula (a `(17)` line under it, a `\quad (18)` at its end, or a table row `| $formula$ | (4) |`) become `\tag{17}` in the formula, so the check for equations missing from the note only reports real gaps.
+
 | Setting | What it does | Best for |
 |---|---|---|
 | `MARKER_PRECISE = False` (default) | Normal conversion: about a minute or two per paper | Papers with little math |

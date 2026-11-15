@@ -871,9 +871,12 @@ def clean_heading_text(text):
     text = re.sub(r'<sup>([^<]*)</sup>',
                   lambda m: m.group(1).translate(_SUPERSCRIPT) if re.fullmatch(r'[0-9+\-=()n]+', m.group(1))
                   else m.group(1), text)
+    # Crossref titles can be wrapped XML: '1/\n      <i>N</i>\n      Portfolio' is '1/N Portfolio'
+    text = re.sub(r'(?<=[/(\[-])\s*\n\s*', '', text)
     text = re.sub(r'</?(?:sub|sup|em|strong|i|b|span)\b[^>]*>', '', text)
     text = re.sub(r'(\*\*|__)(.+?)\1', r'\2', text)      # **bold** (marker bolds titles): no markup in frontmatter
-    return re.sub(r'\s*\|\s*', ' / ', text).rstrip()
+    text = re.sub(r'\s+', ' ', text)
+    return re.sub(r'\s*\|\s*', ' / ', text).strip()
 
 
 def link_safe_headings(content):
@@ -2690,7 +2693,7 @@ def _pdf_to_markdown(pdf_path, convert_path):
         marker_service, key_flag, model_flag = _MARKER_LLM.get(AI_LLM, (None, None, None))
         use_llm = bool(marker_service and (AI_API_KEY or AI_LLM == 'ollama'))
         with tempfile.TemporaryDirectory() as out_dir:
-            cmd = ['marker_single', convert_path, '--output_dir', out_dir, '--output_format', 'markdown']
+            cmd = _marker_cmd([convert_path, '--output_dir', out_dir, '--output_format', 'markdown'])
             if precise:
                 cmd += ['--force_ocr']   # without it inline math can stay broken text (*Xt* instead of $X_t$)
             if use_llm:
@@ -2797,6 +2800,57 @@ def _pdf_to_markdown(pdf_path, convert_path):
         print(f'WARNING: {", ".join(missing)} from the PDF missing in the note (no heading for '
               f'{"it" if len(missing) == 1 else "them"}); check it against the PDF.', file=sys.stderr)
     return markdown, images, method
+
+
+# marker asks the LLM for JSON with LaTeX in it, and the model sometimes writes a single backslash:
+# '\tag', '\tau', '\text', '\nu', '\frac', '\beta', '\rho' are then valid JSON escapes (tab, newline,
+# form feed, backspace, return) and the formula silently loses them; other commands ('\alpha')
+# are invalid JSON, and marker retries or drops the block. Repaired before marker parses the reply.
+_MARKER_JSON_FIX = r"""
+import json, re
+_LATEX = set('tag tau text textbf textit textrm textsf texttt textstyle times theta tilde to top tfrac '
+             'tanh tan triangle therefore nu neq ne nabla newline not ni nonumber notin nolimits ngeq nleq '
+             'frac forall flat beta bar bf big bigg bigl bigr bigm binom bullet backslash bot bmatrix begin '
+             'boldsymbol bm boxed rho right rangle rightarrow rm rceil rfloor rbrace Re'.split())
+_ESC = re.compile(r'\\(\\|[tnfbr][A-Za-z]*|u[0-9a-fA-F]{4}|["/]|.)', re.S)
+
+def _fix(m):
+    t = m.group(1)
+    if t == '\\' or t in ('"', '/') or (t[0] == 'u' and len(t) == 5):
+        return m.group(0)                      # a real JSON escape
+    if t[0] in 'tnfbr' and t not in _LATEX:
+        return m.group(0)                      # '\n' before text: a real newline
+    return '\\\\' + t                          # a LaTeX command: keep its backslash
+
+class _Json:
+    JSONDecodeError = json.JSONDecodeError
+    dumps = staticmethod(json.dumps)
+    @staticmethod
+    def loads(text, *a, **k):
+        return json.loads(_ESC.sub(_fix, text), *a, **k)
+
+import marker.services.gemini as _g
+_g.json = _Json
+"""
+
+def _marker_cmd(args):
+    """marker_single's command with the JSON repair above loaded first: its own Python (from the
+    script's first line, without -E, which would also be fine) runs a small bootstrap. Falls back
+    to plain marker_single when the script can't be read."""
+    exe = shutil.which('marker_single')
+    try:
+        with open(exe, encoding='utf-8') as f:
+            python = f.readline()[2:].split()[0]
+        fix_dir = os.path.expanduser('~/.cache/defuddle/marker')
+        os.makedirs(fix_dir, exist_ok=True)
+        with open(os.path.join(fix_dir, 'defuddle_marker_fix.py'), 'w', encoding='utf-8') as f:
+            f.write(_MARKER_JSON_FIX)
+    except (OSError, TypeError, IndexError):
+        return [exe, *args]
+    boot = (f'import sys; sys.path.insert(0, {fix_dir!r}); import defuddle_marker_fix; '
+            'from marker.scripts.convert_single import convert_single_cli; '
+            'sys.argv[0] = "marker_single"; sys.exit(convert_single_cli())')
+    return [python, '-c', boot, *args]
 
 
 def _run_marker(cmd, timeout=4 * 3600):
@@ -3492,7 +3546,7 @@ def _clean_pdf_markdown(md, images, pdf_path=None):
     md = re.sub(r'!\[Description \d+: (!\[[^\]]*\]\([^)\s]+\)).*?\]\(([^)\s]+\.(?:jpe?g|png|gif|webp))\)',
                 r'\1\n\n![](\2)', md, flags=re.S)
     md = _separate_inline_math(md)
-    md = _tags_out_of_environments(md)
+    md = _tags_out_of_environments(_attach_equation_numbers(md))
     md = _bold_titles_to_headings(md)
     md = _normalize_heading_levels(md)
     md = repair_equations(md, pdf_path)
@@ -3618,6 +3672,55 @@ def _bold_titles_to_headings(md):
              r'[^*\n]{2,120}?')
     return re.sub(rf'(?:^|(?<=\n\n))\*\*({title})\*\*[ \t]*(?=\n\n|\n?$)',
                   lambda m: '## ' + m.group(1).strip(), md)
+
+def _attach_equation_numbers(md):
+    """Equation numbers the converter left outside their formula, put back as \\tag{N}: a '(17)' or
+    '\\quad (18)' line right after a $$ block, a '\\quad (19)' at the end of the formula itself, and a
+    table whose rows are only '| $formula$ | (4) |' (the number in its own cell; the norm bars
+    '\\|' that the table cells swallowed, left as '\\ ', are restored)."""
+    num = r'\((\d{1,3}[a-z]?)\)'
+    tagged = lambda body, n: body if '\\tag' in body else body.rstrip() + f' \\tag{{{n}}}'
+    lines, out, i = md.split('\n'), [], 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == '$$':                             # a display block
+            j = next((k for k in range(i + 1, len(lines)) if lines[k].strip() == '$$'), None)
+            if j is None:
+                out.append(line); i += 1; continue
+            body = '\n'.join(lines[i + 1:j])
+            m = re.search(rf'(?:\\q?quad\s*|,\s*)+{num}\s*[.,]?\s*$', body)
+            if m and '\\tag' not in body:
+                body = tagged(body[:m.start()], m.group(1))
+            k = j + 1
+            if k < len(lines) and not lines[k].strip():
+                k += 1
+            after = re.fullmatch(rf'\s*(?:\\q?quad\s*)*{num}\s*', lines[k]) if k < len(lines) else None
+            if after and '\\tag' not in body:
+                body, j = tagged(body, after.group(1)), k
+            out += ['$$', body, '$$']
+            i = j + 1
+            continue
+        if line.startswith('|'):                             # a table of numbered formulas only
+            j = i
+            while j < len(lines) and lines[j].startswith('|'):
+                j += 1
+            rows = [l for l in lines[i:j] if not re.fullmatch(r'[|\s:-]+', l)]
+            eqs = [re.fullmatch(rf'\|(?:\s*\|)*\s*\$([^$]+)\$\s*\|\s*{num}\s*\|', r) for r in rows]
+            if rows and all(eqs):
+                for m in eqs:
+                    body = m.group(1).strip()
+                    if body.count('\\ ') % 2 == 0:
+                        body = body.replace('\\ ', '\\|')
+                    out += ['$$', f'{body} \\tag{{{m.group(2)}}}', '$$', '']
+                i = j
+                continue
+            out += lines[i:j]
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return '\n'.join(out)
+
 
 def _tags_out_of_environments(md):
     """Obsidian's math renderer rejects \\tag inside aligned/split/gathered/...: move a single tag
