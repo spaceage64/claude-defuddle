@@ -190,8 +190,10 @@ AI_API_KEY = {'gemini': GEMINI_API_KEY, 'openai': OPENAI_API_KEY}.get(AI_LLM, ''
 
 def curl(url, *options, max_time=15, text=False, follow=True, capture=True):
     """Run curl -s on url (following redirects unless follow=False) with extra curl options,
-    stopped after max_time seconds. Returns the CompletedProcess: stdout as bytes, or str with text=True."""
-    return subprocess.run(['curl', '-sL' if follow else '-s', '--max-time', str(max_time), *options, url],
+    stopped after max_time seconds. Returns the CompletedProcess: stdout as bytes, or str with text=True.
+    --compressed decodes a gzip/deflate body (Wayback's id_ snapshots are served with
+    Content-Encoding: gzip) and only asks for encodings this curl can decode."""
+    return subprocess.run(['curl', '-sL' if follow else '-s', '--compressed', '--max-time', str(max_time), *options, url],
                           capture_output=capture, text=text, timeout=max_time + 5)
 
 
@@ -7295,6 +7297,22 @@ def usable(d):
     return not (d.get('wordCount', 0) < BLOCKED_PAGE_WORDS and _BLOCKED_PAGE.search(head))
 
 
+_REFRESH_SEEN = set()
+
+def refresh_target(url):
+    """The target of a redirect stub page (<meta http-equiv="refresh" content="0;url=...">, used by
+    static sites for moved pages), or None. Each URL is followed once, so a redirect loop stops."""
+    _REFRESH_SEEN.add(url)
+    try:
+        page = curl(url, max_time=15).stdout[:65536].decode('utf-8', errors='replace')
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\']\s*0\s*[;,]\s*url\s*=\s*([^"\'>]+)',
+                  page, re.IGNORECASE)
+    target = urljoin(url, html.unescape(m.group(1).strip())) if m else None
+    return target if target and target not in _REFRESH_SEEN else None
+
+
 def fetch_article(url):
     """Auto-cascade: native-md → native-page → google → wayback (snapshot, then Save Page Now) →
     archive-is → arquivo → common-crawl.
@@ -7414,6 +7432,9 @@ def main(argv=None):
         if not d:
             print('Could not read this video (defuddle and yt-dlp both failed).', file=sys.stderr)
             return
+    elif target := refresh_target(url):
+        print(f'Page redirects to {target} — following...', file=sys.stderr)
+        return main([target if a == raw_url else a for a in argv])
     elif args.method:
         d, used_method = fetch_for_method(url, args.method)
     else:
