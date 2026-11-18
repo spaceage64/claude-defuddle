@@ -9,7 +9,7 @@ Usage:
 """
 
 import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64, difflib, gzip
-from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin
+from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin, urlencode
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
@@ -2452,23 +2452,48 @@ def openalex_free(doi):
     page = next((l.get('landing_page_url') or l.get('pdf_url') for l in locs if l.get('landing_page_url') or l.get('pdf_url')), None)
     return pdfs, page
 
+PDF_ORIGINAL_NAME = ''   # file name of the PDF as it was found (server, Downloads, local file): 'filename' field
+
+def _set_pdf_name(name):
+    global PDF_ORIGINAL_NAME
+    PDF_ORIGINAL_NAME = os.path.basename(name or '').strip()
+
+def curl_pdf(url, path, max_time):
+    """Download url to path. Returns (content type, file name the server gives it): the
+    Content-Disposition name, else the last part of the final URL when it ends in .pdf."""
+    head = path + '.headers'
+    try:
+        out = curl(url, '-o', path, '-D', head, '-w', '%{content_type}\n%{url_effective}', max_time=max_time, text=True).stdout
+        with open(head, encoding='latin-1') as f:
+            headers = f.read()
+        os.remove(head)
+    except (OSError, subprocess.SubprocessError):
+        return '', ''
+    ctype, _, final = out.partition('\n')
+    names = re.findall(r'(?im)^content-disposition:.*?\bfilename\*?=(?:[\w-]+\'[\w-]*\')?"?([^";\r\n]+)', headers)
+    base = unquote(urlparse(final.strip()).path.rsplit('/', 1)[-1])
+    return ctype, unquote(names[-1]).strip() if names else base if base.lower().endswith('.pdf') else ''
+
 def _download_pdf(url, tmp_dir, name='free.pdf'):
     """Download a PDF link; the path if it really is a PDF, else None."""
     path = os.path.join(tmp_dir, name)
+    _, server_name = curl_pdf(url, path, 60)
     try:
-        curl(url, '-o', path, max_time=60)
         with open(path, 'rb') as f:
             ok = f.read(5) == b'%PDF-' and os.path.getsize(path) > 1000
-    except (OSError, subprocess.SubprocessError):
+    except OSError:
         ok = False
+    if ok:
+        _set_pdf_name(server_name)
     return path if ok else None
 
 def fetch_doi_pdf(doi, tmp_dir):
     """Try to download PDF by following a DOI redirect."""
     pdf_path = os.path.join(tmp_dir, 'paper.pdf')
-    result = curl(f'https://doi.org/{doi}', '-o', pdf_path, '-w', '%{content_type}', max_time=20, text=True)
-    if 'pdf' in result.stdout.lower() and \
+    ctype, server_name = curl_pdf(f'https://doi.org/{doi}', pdf_path, 20)
+    if 'pdf' in ctype.lower() and \
             os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
+        _set_pdf_name(server_name)
         return pdf_path
     return None
 
@@ -2628,6 +2653,7 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
                 text = _pdf_first_pages_text(path)
                 if _pdf_matches(text, doi, title):
                     print(f'Found {name}', file=sys.stderr)
+                    _set_pdf_name(name)
                     return path
                 other = extract_doi_from_pdf_text(text)
                 why   = f'it is a different paper (DOI {other})' if other else f'no DOI {doi} or matching title on its first pages'
@@ -4813,10 +4839,11 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 print(f'Trying arXiv PDF ({arxiv_id})...', file=sys.stderr)
                 arxiv_pdf_url = f'https://arxiv.org/pdf/{arxiv_id}'
                 arxiv_pdf_path = os.path.join(tmp_dir, 'arxiv.pdf')
-                result = curl(arxiv_pdf_url, '-o', arxiv_pdf_path, '-w', '%{content_type}', max_time=30, text=True)
-                if 'pdf' in result.stdout.lower() and \
+                ctype, server_name = curl_pdf(arxiv_pdf_url, arxiv_pdf_path, 30)
+                if 'pdf' in ctype.lower() and \
                         os.path.exists(arxiv_pdf_path) and os.path.getsize(arxiv_pdf_path) > 1000:
                     pdf_path = arxiv_pdf_path
+                    _set_pdf_name(server_name or f'{arxiv_id}.pdf')
             if not pdf_path and doi:
                 print('Trying direct PDF download...', file=sys.stderr)
                 pdf_path = fetch_doi_pdf(doi, tmp_dir)
@@ -4944,6 +4971,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
         frontmatter_url(url, meta.get('fulltext_url')),   # the web page the text came from, if not a PDF
+        None if meta.get('web_text') else frontmatter_field('filename', PDF_ORIGINAL_NAME),   # the PDF's own file name
         f'doi: {doi_str}' if doi_str else None,
         frontmatter_field('issn', paper_issn(doi_str, meta, content) if doi_str else ''),
         frontmatter_field('isbn', paper_isbn(meta, content)),
@@ -5000,6 +5028,7 @@ def build_article(d, url, project, created, method=None):
         frontmatter_url(url, d.get('archive_url')),   # archived copy as a second source
         *([f'author:\n  - {yaml_str(author)}'] if author else []),
         frontmatter_field('published', published),
+        frontmatter_field('updated', d.get('updated')),   # e.g. a CMS's updatedAt (archived content API)
         frontmatter_field('site', site),
         frontmatter_field('words', words, quote=False) if words else None,
         method_field(method),
@@ -5034,9 +5063,10 @@ def build_pdf(url, project, created, skip_doi=False):
         if local_path:
             import shutil as _shutil
             _shutil.copy2(local_path, pdf_path)
+            _set_pdf_name(local_path)
         else:
             print('Downloading PDF...', file=sys.stderr)
-            curl(url, '-o', pdf_path, max_time=115)
+            _set_pdf_name(curl_pdf(url, pdf_path, 115)[1])
         if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 1024:
             print('Failed to download PDF or file too small.', file=sys.stderr)
             return '', {}, {}
@@ -5111,6 +5141,7 @@ def build_pdf(url, project, created, skip_doi=False):
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
         *([] if local_path else [frontmatter_url(url)]),
+        frontmatter_field('filename', PDF_ORIGINAL_NAME),   # the PDF's own file name
         frontmatter_field('isbn', paper_isbn({}, content)),          # printed in the document
         frontmatter_field('issn', paper_issn('', {}, content)),
         *(['author:'] + [f'  - {yaml_str(a)}' for a in pdf_authors] if pdf_authors else []),
@@ -7170,6 +7201,7 @@ def save_pdf(url, args):
         if os.path.isabs(url):
             with open(url, 'rb') as f:
                 meta['pdf_bytes'] = f.read()
+            _set_pdf_name(url)
     else:
         note, images_dict, meta = build_pdf(url, args.project, args.created)
 
@@ -7295,6 +7327,165 @@ def usable(d):
         return False
     head = (d.get('title') or '') + '\n' + (d.get('content') or '')[:1500]
     return not (d.get('wordCount', 0) < BLOCKED_PAGE_WORDS and _BLOCKED_PAGE.search(head))
+
+
+# ─── Archived copies given as the link ────────────────────────────────────────
+
+_ARCHIVED = [
+    ('wayback',    re.compile(r'https?://web\.archive\.org/web/(\d{1,14})(?:[a-z]{2}_)?/(.+)')),
+    ('archive-is', re.compile(r'https?://archive\.(?:is|ph|today|li|vn|md|fo)/(\d{8,14}|\d{4}\.\d\d\.\d\d-\d{6}|newest|oldest)/(.+)')),
+    ('archive-is', re.compile(r'https?://archive\.(?:is|ph|today|li|vn|md|fo)/([A-Za-z0-9]{4,6})()$')),
+    ('arquivo',    re.compile(r'https?://arquivo\.pt/(?:wayback|noFrame/replay)/(\d{1,14})(?:[a-z]{2}_)?/(.+)')),
+]
+WAYBACK_TRIES = 4        # tries per Wayback request when it is offline or returns nothing
+WAYBACK_RETRY_WAIT = 15  # seconds between those tries
+
+
+def archived_link(url):
+    """(archive, timestamp or id, original URL) when url is a copy in a web archive, else None.
+    The original is '' for archive.today's short links (archive.ph/AbCdE)."""
+    for name, pattern in _ARCHIVED:
+        m = pattern.match(url)
+        if m:
+            return name, m.group(1), re.sub(r'^(https?):/+', r'\1://', m.group(2))
+    return None
+
+
+def wayback_get(url, max_time=60):
+    """Body of a Wayback Machine URL as bytes (gzip undone), retried while the archive is
+    'Temporarily Offline' or answers with nothing. None if it stays down."""
+    for attempt in range(WAYBACK_TRIES):
+        if attempt:
+            print(f'Wayback Machine not answering, trying again in {WAYBACK_RETRY_WAIT} s '
+                  f'({attempt + 1}/{WAYBACK_TRIES})...', file=sys.stderr, flush=True)
+            time.sleep(WAYBACK_RETRY_WAIT)
+        try:
+            body = curl(url, max_time=max_time).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if body[:2] == b'\x1f\x8b':                     # stored still compressed
+            try:
+                body = gzip.decompress(body)
+            except (OSError, EOFError):
+                continue
+        if body.strip() and not re.search(rb'<title>[^<]*Temporarily Offline', body[:5000], re.I):
+            return body
+    print(f'The Wayback Machine stayed unavailable for {url}', file=sys.stderr)
+    return None
+
+
+def wayback_cdx(url, *params, max_time=60):
+    """Rows of a CDX query (timestamp, original, ...) as lists, without the header row."""
+    query = urlencode([('url', url), ('output', 'json'), ('filter', 'statuscode:200')]
+                      + [tuple(p.split('=', 1)) for p in params])
+    body = wayback_get(f'https://web.archive.org/cdx/search/cdx?{query}', max_time=max_time)
+    try:
+        return json.loads(body)[1:] if body else []
+    except ValueError:
+        return []
+
+
+def wayback_closest(url, ts, *params):
+    """(timestamp, original) of the capture of url closest to ts, or None. Each archived file has
+    its own capture time; asking for it under another page's timestamp returns nothing."""
+    rows = wayback_cdx(url, 'fl=timestamp,original', f'closest={ts}', 'sort=closest', 'limit=1', *params)
+    return tuple(rows[0][:2]) if rows else None
+
+
+def _site_domain(netloc):
+    return '.'.join(netloc.lower().split(':')[0].split('.')[-2:])
+
+
+def _json_text(data):
+    """(title, text, dates) from a CMS-style JSON reply: string fields with prose or HTML become
+    markdown, fields named like createdAt/updated_at/publishedDate are kept as dates."""
+    title, parts, dates = '', [], {}
+    def walk(v, key=''):
+        nonlocal title
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, k)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, key)
+        elif isinstance(v, str):
+            low = key.lower()
+            if re.fullmatch(r'(created|updated|modified|published)(_?at|_?date|_?on)?', low):
+                dates.setdefault(re.sub(r'[_]?(at|date|on)$', '', low), v)
+            elif low in ('title', 'name', 'heading') and not title and len(v) < 200:
+                title = v
+            elif len(v) > 40 and (' ' in v or '<' in v) and not re.match(r'https?://\S+$', v):
+                parts.append(html_to_markdown(v) if re.search(r'<[a-z][^>]*>', v, re.I) else v)
+    walk(data)
+    return title, '\n\n'.join(dict.fromkeys(p.strip() for p in parts if p.strip())), dates
+
+
+def wayback_js_page(original, ts, page_html):
+    """Text of a JavaScript-rendered page from the archive: the page's own scripts (each at its
+    own capture time) name the content API's host; a capture of that API whose URL holds the
+    page's path is read as JSON. A parsed page dict, or {}."""
+    slug = urlparse(original).path.strip('/').split('/')[-1]
+    if not slug:
+        return {}
+    site = _site_domain(urlparse(original).netloc)
+    html_str = page_html.decode('utf-8', errors='replace')
+    scripts = [urljoin(original, s) for s in re.findall(r'<script[^>]+src=["\']([^"\']+)', html_str, re.I)]
+    scripts = [re.sub(r'^https?://web\.archive\.org/web/\d+[a-z_]*/', '', s) for s in scripts]
+    scripts = [s for s in dict.fromkeys(scripts) if _site_domain(urlparse(s).netloc) == site][:6]
+    hosts = {urlparse(original).netloc}
+    for script in scripts:
+        hit = wayback_closest(script, ts)
+        body = hit and wayback_get(f'https://web.archive.org/web/{hit[0]}id_/{hit[1]}')
+        if body:
+            hosts |= {h for h in re.findall(r'https?://([a-z0-9.-]+\.[a-z]{2,})', body.decode('utf-8', 'replace'), re.I)
+                      if _site_domain(h) == site}
+    print(f'JavaScript page: looking for archived content from {", ".join(sorted(hosts))}', file=sys.stderr)
+    found = []
+    for host in sorted(hosts):
+        found += [r for r in wayback_cdx(f'{host}/', 'matchType=prefix', 'fl=timestamp,original,mimetype',
+                                         f'filter=original:.*[/=]{re.escape(slug)}([/?&#].*)?$', 'collapse=digest',
+                                         'limit=200', max_time=90)
+                  if r[1].rstrip('/') != original.rstrip('/') and 'html' not in r[2]]
+    for stamp, api_url, _ in sorted(found, key=lambda r: abs(int(r[0][:14].ljust(14, '0')) - int(ts.ljust(14, '0')))):
+        body = wayback_get(f'https://web.archive.org/web/{stamp}id_/{api_url}')
+        try:
+            title, text, dates = _json_text(json.loads(body)) if body else ('', '', {})
+        except ValueError:
+            continue
+        if len(text.split()) > MIN_WORDS:
+            when = f'{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}'
+            note = (f'> [!note] Archived content API\n> The archived page is a JavaScript shell; this text is '
+                    f'from [{api_url}](https://web.archive.org/web/{stamp}/{api_url}), captured {when}.')
+            return {'content': f'{note}\n\n{text}', 'wordCount': len(text.split()), 'title': title,
+                    'site': re.sub(r'^www\.', '', urlparse(original).netloc), 'author': '',
+                    'published': dates.get('published') or dates.get('created', ''),
+                    'updated': dates.get('updated') or dates.get('modified', '')}
+    return {}
+
+
+def fetch_archived(url, kind, stamp, original):
+    """An archive copy given as the link: read from that archive only, never archived again.
+    Wayback: the capture closest to the link's date (a short date like 20201031 is fine), read
+    raw; a JavaScript shell falls back to wayback_js_page. Returns (d, method)."""
+    if kind == 'archive-is':
+        return _with_archive(fetch_archive_is(original or url, url), url), kind
+    if kind == 'arquivo':
+        return _with_archive(fetch_snapshot(original, url), url), kind
+    hit = wayback_closest(original, stamp)
+    if not hit:
+        print(f'No Wayback capture of {original} found.', file=sys.stderr)
+        return {}, kind
+    ts, archived = hit
+    if ts[:len(stamp)] != stamp:
+        print(f'Closest capture: {ts[:4]}-{ts[4:6]}-{ts[6:8]}', file=sys.stderr)
+    snapshot = f'https://web.archive.org/web/{ts}/{archived}'
+    body = wayback_get(f'https://web.archive.org/web/{ts}id_/{archived}')
+    if not body:
+        return {}, kind
+    d = parse_fallback(snapshot, original, page=body.decode('utf-8', errors='replace'))
+    if not usable(d):
+        d = wayback_js_page(original, ts, body) or d
+    return _with_archive(d, snapshot), kind
 
 
 _REFRESH_SEEN = set()
@@ -7432,6 +7623,12 @@ def main(argv=None):
         if not d:
             print('Could not read this video (defuddle and yt-dlp both failed).', file=sys.stderr)
             return
+    elif archived := archived_link(url):
+        d, used_method = fetch_archived(url, *archived)
+        if not usable(d):
+            print(f'No usable text in this archived copy: {url}', file=sys.stderr)
+            return
+        return save_web(archived[2] or url, args, d, used_method)
     elif target := refresh_target(url):
         print(f'Page redirects to {target} — following...', file=sys.stderr)
         return main([target if a == raw_url else a for a in argv])
