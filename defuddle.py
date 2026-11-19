@@ -870,6 +870,7 @@ def clean_heading_text(text):
     text, '|' as ' / ' (it breaks [[#heading]] links), no trailing spaces."""
     text = sup_symbols(text)
     text = re.sub(r'\s*<sup>[^<]{1,4}</sup>\s*$', '', text)
+    text = re.sub(r'(?<=[\w.)?!])\s*(?:(?:\\\*){1,3}|[†‡§]{1,3})\s*$', '', text)   # …UNCERTAINTY\* (footnote marker)
     text = re.sub(r'<sup>([^<]*)</sup>',
                   lambda m: m.group(1).translate(_SUPERSCRIPT) if re.fullmatch(r'[0-9+\-=()n]+', m.group(1))
                   else m.group(1), text)
