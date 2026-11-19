@@ -4529,6 +4529,8 @@ _RFC_END_HEADING = re.compile(r"(?:authors?|editors?|contributors?)'? addresse?s
 # A line of program code (RFCs print their reference code at column 0, body text is indented 3)
 _RFC_CODE = re.compile(r'^\s*(?:#\s*(?:include|define|undef|if|ifdef|ifndef|elif|else|endif|pragma)\b|/\*|\*/|\*(?:\s|$)|//|[{}]'
                        r'|.*[;{}]\s*(?:/\*.*\*/)?$|.*\*/$)')
+# A line that starts a stretch of code (stricter: prose can end in ';' too)
+_RFC_CODE_START = re.compile(r'^\s*(?:#\s*(?:include|define|undef|if|ifdef|ifndef|pragma)\b|/\*|//|[{}]\s*$|.*[=(].*;\s*(?:/\*.*\*/)?$)')
 _RFC_LIST = re.compile(r'^(o|\*|-|\+|\(\w{1,4}(?:\.\w{1,3})*\)|\w{1,3}[.)]|\[[\w][\w.+-]*\])(\s+)(?=\S)')
 
 
@@ -4595,7 +4597,7 @@ def _rfc_text_markdown(page, number):
             block.clear()
             page_break = False
     started = False
-    for line in lines:
+    for i, line in enumerate(lines):
         if line == '\ue030':
             page_break = True
             continue
@@ -4618,11 +4620,12 @@ def _rfc_text_markdown(page, number):
         if not line.strip():
             flush()
             continue
-        if started and not line.startswith(' ') and _RFC_CODE.match(visible(line)) and not in_code:
+        if started and not line.startswith(' ') and _RFC_CODE_START.match(visible(line)) and not in_code:
             flush()
             in_code = True
         if not block and started and len(line) < 70 and '\ue000' not in line and \
                 not (in_code and not _RFC_END_HEADING.fullmatch(line.strip())) and \
+                (i + 1 == len(lines) or not lines[i + 1].strip() or lines[i + 1] == '\ue030') and \
                 (not line.startswith(' ') or _RFC_END_HEADING.fullmatch(line.strip())):
             section = re.sub(r'\s+', ' ', line).strip()   # unnumbered heading: Abstract, Copyright Notice…
             items.append(('heading', 2, section))
@@ -4644,6 +4647,8 @@ def _rfc_text_markdown(page, number):
     last = ''                    # kind of the last output: 'para' and 'item' can continue after a page break
     for kind, section, data in items:
         if kind == 'heading':    # ('heading', level, title)
+            if data.lower() == 'table of contents':
+                continue         # the note's own Contents links every section
             out.append('#' * section + ' ' + _rfc_md_escape(data))
             last = 'heading'
             continue
@@ -4661,10 +4666,6 @@ def _rfc_text_markdown(page, number):
         vis = [visible(l) for l in data]
         indent = min(len(l) - len(l.lstrip()) for l in vis)
         if 'table of contents' in section.lower():
-            for l, v in zip(data, vis):
-                depth = max(0, (len(v) - len(v.lstrip()) - 3) // 3)
-                entry = re.sub(r'\s*\.{2,}\s*\d*\s*$|\s+\d+\s*$', '', l.strip())
-                out.append('  ' * depth + '- ' + _rfc_render(re.sub(r'\s+', ' ', entry), number, headings, refs))
             continue
         if 'address' in section.lower():   # Authors' Addresses: one line per line
             out.append('\n'.join(_rfc_render(l.strip(), number, headings, refs) for l in data))
