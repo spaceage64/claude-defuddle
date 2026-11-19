@@ -4526,6 +4526,9 @@ _LINK = re.compile('\ue000([^\ue001]*)\ue001([^\ue002]*)\ue002')
 # Closing sections that some RFCs indent like body text (inside an appendix), so they aren't found by position
 _RFC_END_HEADING = re.compile(r"(?:authors?|editors?|contributors?)'? addresse?s?|acknowledge?ments|contributors|"
                               r"full copyright statement|intellectual property", re.IGNORECASE)
+# A line of program code (RFCs print their reference code at column 0, body text is indented 3)
+_RFC_CODE = re.compile(r'^\s*(?:#\s*(?:include|define|undef|if|ifdef|ifndef|elif|else|endif|pragma)\b|/\*|\*/|\*(?:\s|$)|//|[{}]'
+                       r'|.*[;{}]\s*(?:/\*.*\*/)?$|.*\*/$)')
 _RFC_LIST = re.compile(r'^(o|\*|-|\+|\(\w{1,4}(?:\.\w{1,3})*\)|\w{1,3}[.)]|\[[\w][\w.+-]*\])(\s+)(?=\S)')
 
 
@@ -4562,7 +4565,7 @@ def _rfc_render(text, number, headings, refs, code=False):
 def _rfc_text_markdown(page, number):
     """Markdown from an older RFC's HTML (the text version in <pre> blocks)."""
     text = '\n'.join(re.findall(r'<pre[^>]*>(.*?)</pre>', page, re.S))
-    text = re.sub(r'<span class="grey">.*?</span>', '', text, flags=re.S)      # page headers and footers
+    text = re.sub(r'<span class="grey">.*?</span>', '\ue030', text, flags=re.S)   # page headers and footers: a page break
     text = re.sub(r'<span id="page-\d+"\s*></span>', '', text).replace('\f', '')
     text = re.sub(r'<span class="h(\d)">(.*?)</span>',                         # headings, with their section id
                   lambda m: '\ue010' + m.group(1) + '\ue011' + (i.group(1) if (i := re.search(r'id="([^"]+)"', m.group(2))) else '')
@@ -4575,16 +4578,27 @@ def _rfc_text_markdown(page, number):
     visible = lambda l: re.sub('[\ue000-\ue021]', '', _LINK.sub(lambda m: m.group(2), l))
     # Page footers and headers the HTML doesn't mark: "Paxson, et al.  Standards Track  [Page 11]"
     page_line = re.compile(r'^\S.*\S\s{2,}\[Page \d+\]$|^RFC \d+\s{2,}.*\S\s{2,}\w+ \d{4}$')
-    lines = [l.rstrip() for l in text.split('\n') if not page_line.match(visible(l).strip())]
+    lines = [('\ue030' if page_line.match(visible(l).strip()) else l.rstrip()) for l in text.split('\n')]   # \ue030: page break
 
     # Pass 1: headings and blocks (consecutive non-blank lines), the section each one is in
     items, headings, refs, block, section = [], {}, {}, [], ''
+    in_code = False      # inside program code printed at column 0 (until the next numbered heading)
+    page_break = False   # a page break since the last block (code continues there without a blank line)
     def flush():
+        nonlocal in_code, page_break
         if block:
-            items.append(('block', section, list(block)))
+            vis = [visible(l) for l in block]
+            indent = min(len(v) - len(v.lstrip()) for v in vis)
+            code = in_code and (indent != 3 or any(_RFC_CODE.match(v) for v in vis))
+            in_code = code
+            items.append(('code', section, (list(block), page_break)) if code else ('block', section, list(block)))
             block.clear()
+            page_break = False
     started = False
     for line in lines:
+        if line == '\ue030':
+            page_break = True
+            continue
         if line.strip() == 'Abstract' and not started:
             flush()
             started, section = True, 'Abstract'
@@ -4592,6 +4606,7 @@ def _rfc_text_markdown(page, number):
             continue
         if m := re.match('^\\s*\ue010(\\d)\ue011([^\ue011]*)\ue011(.*)$', line):
             flush()
+            in_code = False
             level, sid, title = int(m.group(1)), m.group(2), re.sub(r'\s+', ' ', m.group(3)).strip()
             if level == 1:
                 continue                                # the RFC's title: it is the note's title
@@ -4603,7 +4618,11 @@ def _rfc_text_markdown(page, number):
         if not line.strip():
             flush()
             continue
+        if started and not line.startswith(' ') and _RFC_CODE.match(visible(line)) and not in_code:
+            flush()
+            in_code = True
         if not block and started and len(line) < 70 and '\ue000' not in line and \
+                not (in_code and not _RFC_END_HEADING.fullmatch(line.strip())) and \
                 (not line.startswith(' ') or _RFC_END_HEADING.fullmatch(line.strip())):
             section = re.sub(r'\s+', ' ', line).strip()   # unnumbered heading: Abstract, Copyright Notice…
             items.append(('heading', 2, section))
@@ -4627,6 +4646,15 @@ def _rfc_text_markdown(page, number):
         if kind == 'heading':    # ('heading', level, title)
             out.append('#' * section + ' ' + _rfc_md_escape(data))
             last = 'heading'
+            continue
+        if kind == 'code':
+            code_lines, after_break = data
+            body = '\n'.join(_rfc_render(l, number, headings, refs, code=True) for l in code_lines)
+            if last == 'code':          # code split by blank lines or a page break: one block
+                out[-1] = out[-1][:-4] + ('\n' if after_break else '\n\n') + body + '\n```'
+            else:
+                out.append('```c\n' + body + '\n```')
+            last = 'code'
             continue
         if kind != 'block':
             continue
