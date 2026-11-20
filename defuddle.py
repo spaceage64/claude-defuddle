@@ -6431,22 +6431,33 @@ def save_original_pdf(save_dir, filename, source=None, meta=None):
         _compress_pdf(pdf_path)
 
 
-def run_batch(urls, argv):
+METHODS = ('native', 'native-md', 'native-page', 'google', 'wayback', 'common-crawl', 'archive-is', 'arquivo')
+# Options that can differ per link: (option, args attribute, allowed values or None)
+PER_LINK = (('--filename', 'filename', None), ('--method', 'method', METHODS), ('--doi', 'doi', None),
+            ('--pages', 'pages', None), ('--as', 'as_type', ('doc', 'paper', 'book')))
+
+
+def run_batch(urls, argv, per_link=None):
     """Process several links, PARALLEL_JOBS at a time, each in its own defuddle process.
+    per_link: {option: values} for the PER_LINK options, one value for every link or one per link.
     Progress lines are prefixed with the link's number; each link's output follows when it is done."""
+    per_link = per_link or {}
+    own_opts = ('--url',) + tuple(opt for opt, _, _ in PER_LINK)
     rest, skip = [], False
     for a in argv:
         if skip:
             skip = False
-        elif a == '--url':
+        elif a in own_opts:
             skip = True
-        elif not a.startswith('--url=') and a not in urls:
+        elif not a.startswith(tuple(o + '=' for o in own_opts)) and a not in urls:
             rest.append(a)
     print(f'Processing {len(urls)} links, {PARALLEL_JOBS} at a time...', file=sys.stderr, flush=True)
 
     def one(n, url):
         with tempfile.TemporaryFile('w+', encoding='utf-8') as out:
-            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), url] + rest,
+            own = [x for opt, vals in per_link.items() if vals and (v := vals[n - 1 if len(vals) > 1 else 0])
+                   for x in (opt, v)]
+            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), url] + rest + own,
                                  stdout=out, stderr=subprocess.PIPE, text=True)
             assert p.stderr   # set by stderr=PIPE
             for line in p.stderr:
@@ -7072,9 +7083,11 @@ def parse_args(argv):
     parser.add_argument('--project',  default=None)
     parser.add_argument('--category', default=None, help=argparse.SUPPRESS)   # optional parent folder above --project
     parser.add_argument('--created',  default=None)
-    parser.add_argument('--filename', default=None)
-    parser.add_argument('--method',   default=None, choices=['native', 'native-md', 'native-page', 'google', 'wayback', 'common-crawl',
-                                                             'archive-is', 'arquivo'])
+    # --filename, --method, --doi, --pages and --as: once = for every link, or once per link in the
+    # same order ('' = none for that link); see PER_LINK
+    parser.add_argument('--filename', action='append', default=None, help='name of the note (without .md)')
+    parser.add_argument('--method',   action='append', default=None,
+                        help='articles: one of ' + ', '.join(METHODS))
     _num = lambda unit: (lambda s: int(re.sub(rf'(?i){unit}$', '', s.strip())))
     parser.add_argument('--download', action='store_true',
                         help='YouTube: also save the video to vid/ and embed the local file')
@@ -7084,19 +7097,36 @@ def parse_args(argv):
     parser.add_argument('--audio-quality', type=_num('k'), default=None, metavar='KBPS',
                         help='max audio bitrate in kbps, e.g. 64 or 64k; 0 = video without sound '
                              '(implies --download; default: highest)')
-    parser.add_argument('--doi', default=None,
+    parser.add_argument('--doi', action='append', default=None,
                         help='PDFs: the paper\'s DOI when it is known (e.g. a PDF saved from a shadow library); '
                              'saves it as a paper without searching')
-    parser.add_argument('--pages', default=None, metavar='FIRST-LAST',
+    parser.add_argument('--pages', action='append', default=None, metavar='FIRST-LAST',
                         help='PDFs: convert only these pages, e.g. 305-393 (1-based, as in a PDF viewer); '
                              'for debugging or filling in part of a book')
-    parser.add_argument('--as', dest='as_type', choices=['doc', 'paper', 'book'], default=None,
+    parser.add_argument('--as', dest='as_type', action='append', default=None, metavar='{doc,paper,book}',
                         help='PDFs: save as this type instead of detecting it: doc (docs/, no DOI or book '
                              'detection), paper (papers/, also without a DOI) or book (books/, book structure)')
     parser.add_argument('--keep-pdf', action=argparse.BooleanOptionalAction, default=None,
                         help='papers and PDFs: also save the original PDF next to the note, with the same name '
                              '(default: KEEP_PDF)')
     args = parser.parse_args(argv)
+    args.urls = [doi_link(u) for u in ([args.url] if args.url else []) + args.url_pos]
+    if not args.urls:
+        parser.error('URL required as first argument or via --url')
+    args.per_link = {}
+    for opt, dest, allowed in PER_LINK:
+        values = getattr(args, dest) or []
+        if len(values) > 1 and len(values) != len(args.urls):
+            parser.error(f'give {opt} once (for every link) or once per link in the same order '
+                         f'({len(args.urls)} links, {len(values)} values)')
+        if allowed and (bad := [v for v in values if v and v not in allowed]):
+            parser.error(f'{opt}: {bad[0]!r} is not one of {", ".join(allowed)}')
+        if opt == '--filename' and values and len(args.urls) > 1:
+            names = [v for v in values if v]
+            if len(values) == 1 or len(set(names)) != len(names):
+                parser.error('--filename: each link needs its own name')
+        args.per_link[opt] = values
+        setattr(args, dest, (values[0] or None) if values and len(args.urls) == 1 else None)
     if args.video_quality == args.audio_quality == 0:
         parser.error('--video-quality and --audio-quality cannot both be 0')
     # 0 is a valid value (skip that track), so test for None rather than truthiness
@@ -7115,11 +7145,6 @@ def parse_args(argv):
         args.keep_pdf = KEEP_PDF
     if not args.created:
         args.created = datetime.now().date().isoformat()
-    args.urls = [doi_link(u) for u in ([args.url] if args.url else []) + args.url_pos]
-    if len(args.urls) > 1 and args.filename:
-        parser.error('--filename works with one link at a time')
-    if not args.urls:
-        parser.error('URL required as first argument or via --url')
     return args
 
 
@@ -7619,7 +7644,7 @@ def main(argv=None):
     if args.project and not args.category:   # a project listed in projects.yaml saves under its category
         args.category = project_category(args.project)
     if len(args.urls) > 1:
-        sys.exit(run_batch(args.urls, argv))
+        sys.exit(run_batch(args.urls, argv, args.per_link))
     raw_url = args.urls[0]
 
     _is_special = (
