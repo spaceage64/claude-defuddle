@@ -53,7 +53,7 @@ OPENAI_API_KEY           = ''   # only with AI_LLM = 'openai'
 DATALAB_API_KEY          = ''   # PDF conversion via Datalab (https://datalab.to)
 INTERNET_ARCHIVE_API_KEY = ''   # 'access:secret' for Save Page Now (https://archive.org/account/s3.php)
 # ║                                                                              ║
-# ║  Vault path — where notes are saved. Leave '' to read from projects.yaml.    ║
+# ║  Vault path — where notes are saved. Leave '' for ~/Documents/Obsidian.      ║
 # ║  Example: '/Users/you/Documents/Obsidian'                                    ║
 VAULT_PATH = ''
 # ║                                                                              ║
@@ -5201,30 +5201,20 @@ def build_pdf(url, project, created, skip_doi=False):
 
 
 def get_vault_path():
-    """Return vault path: VAULT_PATH setting > ~/.claude/projects.yaml > ~/Documents/Obsidian."""
-    if VAULT_PATH:
-        return os.path.expanduser(VAULT_PATH)
-    try:
-        content = open(os.path.expanduser('~/.claude/projects.yaml')).read()
-        m = re.search(r'path:\s*(.+)', content)
-        return m.group(1).strip() if m else os.path.expanduser('~/Documents/Obsidian')
-    except Exception:
-        return os.path.expanduser('~/Documents/Obsidian')
+    """Return vault path: VAULT_PATH setting, else ~/Documents/Obsidian."""
+    return os.path.expanduser(VAULT_PATH or '~/Documents/Obsidian')
 
 
 def project_category(project):
-    """The category (parent folder) of a project in ~/.claude/projects.yaml, or '' (no file or not listed)."""
+    """The category of an existing project folder: the one top-level vault folder that has a folder
+    named project in it, or '' (none, or more than one)."""
+    vault = get_vault_path()
     try:
-        with open(os.path.expanduser('~/.claude/projects.yaml'), encoding='utf-8') as f:
-            category = ''
-            for line in f:
-                if m := re.match(r'^  ([A-Za-z][\w-]*):\s*$', line):
-                    category = m.group(1)
-                elif re.match(rf'^      {re.escape(project)}:\s*$', line):
-                    return category
+        found = [c for c in os.listdir(vault)
+                 if not c.startswith('.') and os.path.isdir(os.path.join(vault, c, project))]
     except OSError:
-        pass
-    return ''
+        return ''
+    return found[0] if len(found) == 1 else ''
 
 
 def get_save_dir(vault, category, project, subdir):
@@ -7641,7 +7631,7 @@ def save_web(url, args, d, used_method):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     args = parse_args(argv)
-    if args.project and not args.category:   # a project listed in projects.yaml saves under its category
+    if args.project and not args.category:   # an existing project folder saves under its category
         args.category = project_category(args.project)
     if len(args.urls) > 1:
         sys.exit(run_batch(args.urls, argv, args.per_link))
