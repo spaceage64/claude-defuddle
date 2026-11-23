@@ -4577,6 +4577,52 @@ def _rfc_render(text, number, headings, refs, code=False):
     return ''.join(out)
 
 
+def _rfc_grid_table(lines):
+    """A +---+ grid table drawn in an RFC as a markdown table, or None when it isn't one, has
+    one column or has merged cells. The header is the part above the first inner border, its lines joined (else line
+    one). Below it each line is a row; a line with an empty first cell continues the row above,
+    empty lines are dropped."""
+    indent = min(len(l) - len(l.lstrip()) for l in lines)
+    lines = [l[indent:].rstrip() for l in lines]
+    border = re.compile(r'\+(?:[-=]+\+)+')
+    if not (border.fullmatch(lines[0]) and border.fullmatch(lines[-1])):
+        return None
+    cols = [i for i, c in enumerate(lines[0]) if c == '+']
+    if len(cols) < 3:
+        return None            # one column: a box with text laid out inside, not a table
+    sections, cells = [], []   # the lines between borders, as cells
+    for l in lines[1:]:
+        if border.fullmatch(l):
+            if [i for i, c in enumerate(l) if c == '+'] != cols:
+                return None
+            sections.append(cells)
+            cells = []
+        elif len(l) == cols[-1] + 1 and all(l[i] == '|' for i in cols):
+            cells.append([re.sub(r'\s+', ' ', l[a + 1:b]).strip() for a, b in zip(cols, cols[1:])])
+        elif l.startswith('|') and l.endswith('|') and l.count('|') == len(cols):   # a row drawn a bit off
+            cells.append([re.sub(r'\s+', ' ', c).strip() for c in l[1:-1].split('|')])
+        else:
+            return None
+    sections = [[c for c in sec if any(c)] for sec in sections]
+    sections = [sec for sec in sections if sec]
+    if not sections:
+        return None
+    head = None
+    if len(sections) > 1:
+        head = [' '.join(c for c in col if c) for col in zip(*sections.pop(0))]
+    body = []
+    for c in (c for sec in sections for c in sec):
+        if body and not c[0]:
+            body[-1] = [x + y if re.search(r'\w-$', x) and y else f'{x} {y}'.strip()   # "client-" "formatted"
+                        for x, y in zip(body[-1], c)]
+        else:
+            body.append(c)
+    if head is None:
+        head, body = body[0], body[1:]
+    row = lambda cells: '| ' + ' | '.join(_rfc_md_escape(c).replace('|', '\\|') for c in cells) + ' |'
+    return '\n'.join([row(head), '|' + '---|' * len(head)] + [row(r) for r in body])
+
+
 def _rfc_text_markdown(page, number):
     """Markdown from an older RFC's HTML (the text version in <pre> blocks)."""
     text = '\n'.join(re.findall(r'<pre[^>]*>(.*?)</pre>', page, re.S))
@@ -4650,6 +4696,16 @@ def _rfc_text_markdown(page, number):
             refs[rid] = section
         block.append(re.sub('\ue020[^\ue021]+\ue021', '', line))
     flush()
+    # A grid table cut by a page break: its pieces (no bottom border, no top border) as one block
+    grid = lambda l: re.fullmatch(r'\s*\+(?:[-=]+\+)+\s*', visible(l))
+    i = 0
+    while i < len(items) - 1:
+        prev, cur = items[i], items[i + 1]
+        if prev[0] == cur[0] == 'block' and grid(prev[2][0]) and not grid(prev[2][-1]) \
+                and all(re.match(r'\s*[|+]', visible(l)) for l in cur[2]):
+            items[i:i + 2] = [('block', prev[1], prev[2] + cur[2])]   # more pieces may follow
+        else:
+            i += 1
 
     # Pass 2: markdown
     out, front = [], [l for kind, _, l in items if kind == 'front']
@@ -4690,10 +4746,19 @@ def _rfc_text_markdown(page, number):
         # Formulas: indented lines of assignments and operators that don't end like a sentence
         formula = indent > 3 and not marker and all(
             re.search(r'<-|[=+*/^]|\w\s?\(', v) and not re.search(r'[.!?]["\')]?$', v.strip()) for v in vis)
-        if art or formula or (indent >= 6 and short and not marker):
-            out.append('```text\n' + '\n'.join(_rfc_render(l[min(indent, 3):], number, headings, refs, code=True)
-                                               for l in data) + '\n```')
-            last = 'code'
+        if art and (table := _rfc_grid_table(vis)):
+            out.append(table)
+            last = 'table'
+            continue
+        abnf = indent > 3 and any(v.lstrip().startswith(';') for v in vis)   # ABNF comments: prose never starts with ;
+        if art or formula or abnf or (indent >= 6 and short and not marker):
+            body = '\n'.join(_rfc_render(l[min(indent, 3):], number, headings, refs, code=True) for l in data)
+            grammar = abnf or any(re.match(r'\s*[A-Za-z][\w-]*\s+=/?\s', v) for v in vis)   # ABNF rules
+            if grammar and last == 'grammar':   # a grammar split by blank lines: one block
+                out[-1] = out[-1][:-4] + '\n\n' + body + '\n```'
+            else:
+                out.append('```text\n' + body + '\n```')
+            last = 'grammar' if grammar else 'code'
             continue
         joined = re.sub(r'\s+', ' ', ' '.join(l.strip() for l in data))
         depth = max(0, (indent - 3) // 3)
