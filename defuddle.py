@@ -139,8 +139,9 @@ MARKER_PRECISE = False
 # ║               Leave AI_BASE_URL = '' for standard OpenAI.                    ║
 # ║    'ollama' — Local Ollama server (no key needed). https://ollama.com        ║
 # ║               Set AI_MODEL to any pulled model, e.g. llama3.2                ║
-# ║  AI_MODEL can be a list: the next model is tried when one is overloaded      ║
-# ║  or rate-limited (HTTP 429/5xx, timeout), before falling back to Claude.     ║
+# ║  AI_MODEL can be a list: the next model is tried when one is overloaded,     ║
+# ║  rate-limited or retired (HTTP 404/429/5xx, timeout), before falling back    ║
+# ║  to Claude.                                                                  ║
 # ║  AI_OLDER_MODELS: for a Gemini '-latest' alias, also try this many older     ║
 # ║  versions of it, newest first, found in Gemini's model list when needed.     ║
 # ║  Older models are usually less busy than the newest.                         ║
@@ -661,10 +662,16 @@ def download_youtube(url, save_dir, filename_base, video_quality=None, audio_qua
     return f'{sub}/{name}.{ext}'
 
 
-def older_gemini_models(alias):
+# Gemini 4 models are named after elements instead of their family: the family each one replaces
+GEMINI_ELEMENTS = {'hydrogen': 'flash'}
+
+
+def older_gemini_models(alias, newest=False):
     """Older stable versions of a Gemini '-latest' alias's family, newest first, from Gemini's model
-    list (e.g. gemini-flash-lite-latest → gemini-3.1-flash-lite, gemini-2.5-flash-lite). The newest
-    version is left out: that is the one the alias points at. [] for other names or when the list fails."""
+    list (e.g. gemini-flash-lite-latest → gemini-3.1-flash-lite, gemini-2.5-flash-lite); element-named
+    models (gemini-4-hydrogen) count for the family in GEMINI_ELEMENTS. The newest version is left out:
+    that is the one the alias points at, unless newest (the alias itself is gone, HTTP 404).
+    [] for other names or when the list fails."""
     family = re.fullmatch(r'gemini-(.+)-latest', alias)
     if not family:
         return []
@@ -675,10 +682,11 @@ def older_gemini_models(alias):
         return []
     versions = []
     for m in listed:
-        v = re.fullmatch(rf'models/(gemini-(\d+(?:\.\d+)*)-{re.escape(family.group(1))})', m.get('name', ''))
-        if v and 'generateContent' in m.get('supportedGenerationMethods', []):
+        v = re.fullmatch(r'models/(gemini-(\d+(?:\.\d+)*)-([a-z-]+))', m.get('name', ''))
+        if v and GEMINI_ELEMENTS.get(v.group(3), v.group(3)) == family.group(1) \
+                and 'generateContent' in m.get('supportedGenerationMethods', []):
             versions.append((tuple(map(int, v.group(2).split('.'))), v.group(1)))
-    return [name for _, name in sorted(versions, reverse=True)[1:]]
+    return [name for _, name in sorted(versions, reverse=True)[0 if newest else 1:]]
 
 
 _ai_last_model = None   # the model that last answered ai_request, for available_ai_model()
@@ -687,8 +695,9 @@ _ai_last_model = None   # the model that last answered ai_request, for available
 def ai_request(prompt, timeout=60, json_reply=False, image=None):
     """Send a prompt to the provider configured by AI_LLM / AI_MODEL and return the reply text.
     image: (mime type, bytes) sent along with the prompt (a page of a PDF, for example).
-    With a list of models, an overloaded or rate-limited one (HTTP 429/5xx, timeout) passes to the
-    next, and then to AI_OLDER_MODELS older versions of a Gemini '-latest' alias. json_reply asks the
+    With a list of models, an overloaded, rate-limited or retired one (HTTP 404/429/5xx, timeout) passes
+    to the next, and then to AI_OLDER_MODELS older versions of a Gemini '-latest' alias (with the newest
+    version itself when the alias is gone). json_reply asks the
     provider for valid JSON only. Raises when all fail; callers then fall back to the Claude CLI."""
     global _ai_last_model
     import urllib.request as _urlreq, urllib.error as _urlerr
@@ -726,11 +735,14 @@ def ai_request(prompt, timeout=60, json_reply=False, image=None):
             _ai_last_model = model
             return reply
         except (_urlerr.HTTPError, TimeoutError, _urlerr.URLError) as e:
-            busy = isinstance(e, TimeoutError) or getattr(e, 'code', 0) in (429, 500, 502, 503, 504) \
+            gone = getattr(e, 'code', 0) == 404   # model retired or renamed
+            busy = gone or isinstance(e, TimeoutError) or getattr(e, 'code', 0) in (429, 500, 502, 503, 504) \
                    or isinstance(getattr(e, 'reason', None), TimeoutError)
             if busy and older and i == len(models) - 1:
                 older = False
-                models += [m for m in older_gemini_models(models[0]) if m not in models][:AI_OLDER_MODELS]
+                retired = gone and model == models[0]
+                models += [m for m in older_gemini_models(models[0], newest=retired)
+                           if m not in models][:AI_OLDER_MODELS + retired]
             if not busy or i == len(models) - 1:
                 raise
             print(f'{model} unavailable ({e}) — trying {models[i + 1]}...', file=sys.stderr)
@@ -804,7 +816,8 @@ Content:
             capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120
         )
         return _parse(result.stdout)
-    except Exception:
+    except Exception as e:
+        print(f'Claude enrichment failed too ({e}) — no description, summary or tags.', file=sys.stderr)
         return '', '', [], []
 
 
@@ -4959,7 +4972,9 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
         r'#{1,4}\s+Abstract\s*\n+(.*?)(?=\n#{1,4}\s|\Z)', content,
         re.DOTALL | re.IGNORECASE
     )
-    gemini_context = abstract_m.group(1).strip() if abstract_m else ' '.join(content.split()[:800])
+    gemini_context = abstract_m.group(1).strip() if abstract_m else ''
+    if len(gemini_context.split()) < MIN_WORDS:   # no abstract, or an empty one: the start of the text
+        gemini_context = ' '.join(content.split()[:800])
 
     title   = clean_heading_text(meta.get('title', ''))
     authors = meta.get('authors', [])

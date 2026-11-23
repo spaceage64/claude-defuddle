@@ -197,7 +197,7 @@ A concise AI-generated summary of the article's key points...
 
 Choose a provider with `AI_LLM` in `defuddle.py`.
 
-**Gemini (default).** Set `GEMINI_API_KEY` as shown in Quick install. The default is `AI_MODEL = 'gemini-flash-lite-latest'`: Google's `-latest` alias always points at its newest model, so there is nothing to update. When it is overloaded or rate-limited, defuddle looks up the older versions in Gemini's model list and tries `AI_OLDER_MODELS` (default 2) of them, newest first, before falling back to Claude; older models are usually less busy. Both are on the free tier. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for free tier eligibility. To go back to the free tier later, just remove your billing info.
+**Gemini (default).** Set `GEMINI_API_KEY` as shown in Quick install. The default is `AI_MODEL = 'gemini-flash-lite-latest'`: Google's `-latest` alias always points at its newest model, so there is nothing to update. When it is overloaded or rate-limited, defuddle looks up the older versions in Gemini's model list and tries `AI_OLDER_MODELS` (default 2) of them, newest first, before falling back to Claude; older models are usually less busy. When the alias itself is gone (HTTP 404), the family's newest model is tried first; Gemini 4 models named after elements (`gemini-4-hydrogen`) count for the family they replace (`GEMINI_ELEMENTS`). Both are on the free tier. See the [API pricing overview](https://ai.google.dev/gemini-api/docs/pricing) for free tier eligibility. To go back to the free tier later, just remove your billing info.
 
 **OpenAI or compatible APIs.** Set `AI_LLM = 'openai'` and `OPENAI_API_KEY` (in the script or your keys file).
 
