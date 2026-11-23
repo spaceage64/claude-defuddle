@@ -798,7 +798,8 @@ Content:
         return (
             data.get('description', ''),
             data.get('summary', ''),
-            data.get('tags', []),
+            # Not every model keeps to kebab case (gemini-2.5-flash-lite: 'database systems', 'MonetDB')
+            list(dict.fromkeys(t for t in (_slug(t) for t in data.get('tags', [])) if t)),
             data.get('chapters', [])
         )
 
@@ -989,8 +990,7 @@ def build_youtube(d, url, project, created):
 
     # Collect and deduplicate tags (no # prefix — Obsidian adds it in display)
     desc_tags = extract_desc_tags(desc)
-    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
-    all_tags = list(dict.fromkeys(desc_tags + ai_tags_clean))
+    all_tags = list(dict.fromkeys(desc_tags + ai_tags))
 
     # Remove hashtags from description text
     desc = remove_desc_tags(desc)
@@ -1347,7 +1347,7 @@ def build_apple_podcast(url, project, created, ttml_path, meta=None):
 
     # Frontmatter
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter(created, [t.lower() for t in ai_tags], [
+    fm = build_frontmatter(created, ai_tags, [
         frontmatter_field('title',     title),
         f'description: {yaml_str(fm_description)}',
         frontmatter_url(url),
@@ -5125,14 +5125,13 @@ def build_article(d, url, project, created, method=None):
 
     # Gemini enrichment
     ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, author, content)
-    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
 
     # Build index from article headings
     content = link_safe_headings(content)
     index = build_index(content)
 
     fm_description = ai_desc if ai_desc else '[Description to be added]'
-    fm = build_frontmatter(created, ai_tags_clean, [
+    fm = build_frontmatter(created, ai_tags, [
         frontmatter_field('title', title),
         f'description: {yaml_str(fm_description)}',
         frontmatter_url(url, d.get('archive_url')),   # archived copy as a second source
@@ -5234,7 +5233,6 @@ def build_pdf(url, project, created, skip_doi=False):
 
     words = len(content.split())
     ai_desc, ai_summary, ai_tags, _ = ai_enrich(title, '', content)
-    ai_tags_clean = [t for t in (_slug(t) for t in ai_tags) if t]   # tags can't contain spaces
 
     if local_path:
         site = ''
@@ -5247,7 +5245,7 @@ def build_pdf(url, project, created, skip_doi=False):
             if len(parts) > 2:
                 site = fetch_defuddle(f'{p.scheme}://www.{".".join(parts[-2:])}').get('site', '')
 
-    fm = build_frontmatter(created, ai_tags_clean, [
+    fm = build_frontmatter(created, ai_tags, [
         frontmatter_field('title', title),
         f'description: {yaml_str(ai_desc or "[Description to be added]")}',
         *([] if local_path else [frontmatter_url(url)]),
