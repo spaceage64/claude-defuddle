@@ -2302,6 +2302,115 @@ def _ieee_commands(tex):
     return tex
 
 
+_ALGORITHMS = {}   # placeholder -> markdown of an algorithm block (_algorithms), put back after pandoc
+
+_ALGO_OPEN = {'while': ('while', 'do'), 'for': ('for', 'do'), 'forall': ('for all', 'do'), 'if': ('if', 'then'),
+              'loop': ('loop', ''), 'repeat': ('repeat', ''), 'procedure': ('procedure', ''), 'function': ('function', '')}
+_ALGO_MID = {'elsif': ('else if', 'then'), 'elseif': ('else if', 'then'), 'else': ('else', '')}
+_ALGO_CLOSE = {'endwhile': 'end while', 'endfor': 'end for', 'endif': 'end if', 'endloop': 'end loop',
+               'until': 'until', 'endprocedure': 'end procedure', 'endfunction': 'end function'}
+
+
+def _algo_text(t):
+    """LaTeX text in an algorithm line as markdown (math stays as it is)."""
+    t = re.sub(r'\\label\{[^}]*\}|\\(?:small|footnotesize|scriptsize)\b|\\fontsize\{[^}]*\}\{[^}]*\}\\selectfont', '', t)
+    t = re.sub(r'\\(?:textbf|mathbf)\{([^{}]*)\}', r'**\1**', t)
+    t = re.sub(r'\\(?:emph|textit)\{([^{}]*)\}', r'*\1*', t)
+    t = re.sub(r'\\texttt\{([^{}]*)\}|\{\\tt\s+([^{}]*)\}', lambda m: f'`{m.group(1) or m.group(2)}`', t)
+    return re.sub(r'\s+', ' ', t.replace('~', ' ')).strip()
+
+
+def _algorithms(tex):
+    """algorithm floats with algorithmic/algpseudocode steps (which pandoc can't read: it glues them into
+    one quoted line) -> a placeholder, and the markdown for it in _ALGORITHMS: '**Algorithm N.** caption',
+    **Input:**/**Output:**, then each step as a list item with its line number (when the paper numbers
+    them) and **while … do**, **if … then**, **end while**… in bold, nested by depth."""
+    _ALGORITHMS.clear()
+    count = [0]
+    def steps(body, numbered):
+        out, depth, n = [], 0, 0
+        cmd = re.compile(r'\\(?i:(state|statex|require|ensure|return|comment|print|' + '|'.join(
+            list(_ALGO_OPEN) + list(_ALGO_MID) + list(_ALGO_CLOSE)) + r'))\b\s*')
+        pieces = list(cmd.finditer(body))
+        for k, m in enumerate(pieces):
+            name = m.group(1).lower()
+            rest = body[m.end():pieces[k + 1].start() if k + 1 < len(pieces) else len(body)]
+            arg = ''
+            if rest.startswith('{'):
+                end = _braced_end(rest, 0)
+                if end > 0:
+                    arg, rest = rest[1:end - 1], rest[end:]
+            if name in ('procedure', 'function') and rest.lstrip().startswith('{'):   # \Procedure{name}{args}
+                r = rest.lstrip(); end = _braced_end(r, 0)
+                arg, rest = f'{arg}({r[1:end - 1]})', r[end:]
+            text = _algo_text(' '.join(x for x in (arg, rest) if x.strip()))
+            if name in ('require', 'ensure'):
+                out.append(f'**{"Input" if name == "require" else "Output"}:** {text}')
+                continue
+            if name in _ALGO_CLOSE:
+                depth = max(0, depth - 1)
+                line = f'**{_ALGO_CLOSE[name]}**' + (f' {text}' if name == 'until' and text else '')
+            elif name in _ALGO_MID:
+                word, then = _ALGO_MID[name]
+                line = f'**{word}**' + (f' {_algo_text(arg)} **{then}**' if then else '')
+                if rest.strip():
+                    line += ' ' + _algo_text(rest)
+                depth = max(0, depth - 1)
+            elif name in _ALGO_OPEN:
+                word, do = _ALGO_OPEN[name]
+                cond = _algo_text(arg)
+                line = f'**{word}**' + (f' {cond}' if cond else '') + (f' **{do}**' if do else '')
+                if rest.strip():
+                    line += ' ' + _algo_text(rest)
+            elif name == 'return':
+                line = f'**return** {text}'
+            elif name == 'comment':   # a side note on the step before it
+                if out and out[-1].lstrip().startswith('- '):
+                    out[-1] += f' *▷ {text}*'
+                    continue
+                line = f'*▷ {text}*'
+            else:
+                line = text
+            if not line:
+                continue
+            if numbered and name != 'statex':
+                n += 1
+                line = f'`{n}` {line}'
+            out.append(('    ' * depth) + '- ' + line)
+            if name in _ALGO_OPEN or name in _ALGO_MID:   # the steps after it are one level deeper
+                depth += 1
+        return out
+    def fix(m):
+        block = m.group(0)
+        algo = re.search(r'\\begin\{algorithmic\}(\[[^\]]*\])?(.*?)\\end\{algorithmic\}', block, re.S)
+        caption, raw_caption = '', ''
+        if c := re.search(r'\\caption(?:\[[^\]]*\])?(?=\{)', block):
+            end = _braced_end(block, c.end())
+            if end > 0:
+                raw_caption = block[c.end() + 1:end - 1]
+                caption = _algo_text(raw_caption)
+                block = block[:c.start()] + block[end:]
+        if not algo:
+            if not block.startswith('\\begin{algorithm'):
+                return m.group(0)
+            # steps written as a list or text (often in a framed box, which pandoc drops with them):
+            # the content for pandoc, without the frame, with the caption under it
+            count[0] += 1
+            inner = re.sub(r'^\\begin\{algorithm\*?\}(?:\[[^\]]*\])?|\\end\{algorithm\*?\}$', '', block.strip())
+            inner = re.sub(r'\\(?:begin|end)\{minipage\}(?:\[[^\]]*\])?(?:\{[^{}]*\})?|\\label\{[^}]*\}|\\vskip\s*-?[\d.]+\w+', '', inner)
+            inner = re.sub(r'\\(?:fbox|framebox|boxed)\s*(?=\{)', '', inner)
+            return f'\n\n{inner}\n\n\\textbf{{Algorithm {count[0]}.}} {raw_caption}\n\n'
+        count[0] += 1
+        lines = steps(algo.group(2), bool(algo.group(1)))
+        head = [f'**Algorithm {count[0]}.**' + (f' {caption}' if caption else '')]
+        body = [l for l in lines if l.startswith('**')] + [''] + [l for l in lines if not l.startswith('**')]
+        key = f'DEFUDDLEALGORITHM{count[0]}X'
+        _ALGORITHMS[key] = '\n'.join(head + [''] + body).strip()
+        return f'\n\n{key}\n\n'
+    tex = re.sub(r'\\begin\{algorithm\*?\}.*?\\end\{algorithm\*?\}', fix, tex, flags=re.S)
+    return re.sub(r'\\begin\{algorithmic\}.*?\\end\{algorithmic\}', fix, tex, flags=re.S)   # outside a float
+
+
 def _listing_figures(tex):
     """A figure that holds program code (lstlisting, \\lstinputlisting, verbatim, minted) and no image ->
     the code with its caption after it as a paragraph, '**Figure N.** caption': pandoc writes a code
@@ -2325,7 +2434,7 @@ def _listing_figures(tex):
 
 def _preprocess_latex(content):
     """Preprocess LaTeX so pandoc can parse it without choking."""
-    content = _listing_figures(_unwrap_subfigures(_ieee_commands(content)))
+    content = _algorithms(_listing_figures(_unwrap_subfigures(_ieee_commands(content))))
     # Size and alignment environments only change the look; pandoc makes nested ::: blocks of them,
     # which hide what is inside (a table, the bibliography) from the clean-up after it
     content = re.sub(r'\\(?:begin|end)\{(?:tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge|'
@@ -2335,7 +2444,7 @@ def _preprocess_latex(content):
     content = _expand_simple_macros(content)
     content = _resolve_toggles(content)
     # Strip optional spacing args from \\ line breaks in math: \\[6pt] → \\
-    content = re.sub(r'\\\\(\[\s*[\d.]+\s*(?:pt|em|ex|cm|mm|in|bp|pc|sp)\s*\])', r'\\\\', content)
+    content = re.sub(r'\\\\(\[\s*-?[\d.]+\s*(?:pt|em|ex|cm|mm|in|bp|pc|sp)\s*\])', r'\\\\', content)   # also \\[-0.3cm]
     # Strip \iffalse...\fi blocks (commented-out code)
     content = re.sub(r'\\iffalse\b.*?\\fi\b', '', content, flags=re.DOTALL)
     # Strip \newtheorem declarations so pandoc does not add its own sequential
@@ -2624,23 +2733,43 @@ def _pstex_layout(pstex):
 
 def figure_labels(path, pstex=None):
     """The text in a figure as lines, for readers that can't see it (Claude, search): the LaTeX labels of
-    an xfig figure (its .pstex_t) with where they are (_pstex_layout), else the text Ghostscript finds
-    in an EPS/PS/PDF figure on one line, keeping only what
-    reads well: legends and labels with a word of three letters or an '=' (axis numbers, and the
-    loose letters that rotated or sub/superscript text breaks into, are left out). [] for bitmaps or when nothing usable is found."""
+    an xfig figure (its .pstex_t) with where they are (_pstex_layout), else the text of an EPS/PS/PDF
+    figure on one line, without its axis numbers (pdftotext, else Ghostscript with a stricter filter).
+    [] for bitmaps or when nothing usable is found."""
     if pstex:
         return _pstex_layout(pstex)
-    else:
-        gs = shutil.which('gs') or shutil.which('gswin64c')
-        if not gs or not re.search(r'\.(?:e?ps|pdf)$', path, re.I):
-            return []
+    gs = shutil.which('gs') or shutil.which('gswin64c')
+    if not re.search(r'\.(?:e?ps|pdf)$', path or '', re.I):
+        return []
+    number = re.compile(r'[-−+\d.\s,()%]+')
+    labels = []
+    if shutil.which('pdftotext') and (path.lower().endswith('.pdf') or gs):
+        # pdftotext reads by position, so a symbol set a little higher or lower (≈, ±, Greek) stays in its
+        # line and rotated text comes out whole; an EPS/PS figure goes to PDF first
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = path
+            if not path.lower().endswith('.pdf'):
+                pdf = os.path.join(tmp, 'figure.pdf')
+                if subprocess.run([gs, '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-dEPSCrop', '-sDEVICE=pdfwrite',
+                                   f'-sOutputFile={pdf}', path], capture_output=True).returncode:
+                    return []
+            try:
+                text = subprocess.run(['pdftotext', pdf, '-'], capture_output=True, timeout=60).stdout.decode('utf-8', 'replace')
+            except (OSError, subprocess.SubprocessError):
+                return []
+        labels = [l.strip() for l in text.splitlines() if l.strip() and not number.fullmatch(l.strip())]
+    elif gs:
+        # Ghostscript alone reads line by line by height: keep only what reads well (legends, labels and
+        # values of six characters or more, or with a word or an '='), not the loose letters and signs
+        # that rotated or raised text breaks into
         try:
             text = subprocess.run([gs, '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-sDEVICE=txtwrite', '-sOutputFile=-', path],
                                   capture_output=True, timeout=60).stdout.decode('utf-8', 'replace')
         except (OSError, subprocess.SubprocessError):
             return []
         labels = [t.strip() for line in text.splitlines() for t in re.split(r'\s{2,}', line)
-                  if re.search(r'[A-Za-z\u0370-\u03ff]{3,}|\S\s*=\s*\S', t) and not re.fullmatch(r'[-−\d.\s,]+', t.strip())]
+                  if (re.search(r'[A-Za-z\u0370-\u03ff]{3,}|\S\s*=\s*\S', t) or len(t.strip()) >= 6)
+                  and not number.fullmatch(t.strip())]
     labels = list(dict.fromkeys(labels))
     return [' · '.join(labels)] if labels else []
 
@@ -2790,7 +2919,26 @@ def latex_to_markdown(tex_path, tmp_dir):
     # Strip YAML frontmatter pandoc may emit
     md = re.sub(r'^---\n.*?\n---\n\n?', '', md, count=1, flags=re.DOTALL)
     md = pandoc_grid_tables(md)
+    for key, algo in _ALGORITHMS.items():
+        md = re.sub(rf'^[> ]*{key}[ \t]*$', lambda m: algo, md, flags=re.M)
+    md = _inline_math_one_line(md)
+    # A $$ block is already display math: an equation*/displaymath wrapper inside it is an error to MathJax
+    md = re.sub(r'\$\$.*?\$\$', lambda m: re.sub(r'\\(?:begin|end)\{(?:equation|displaymath)\*?\}', '', m.group(0)),
+                md, flags=re.S)
     return _strip_ensuremath(_expand_macros(md, macros)).strip()
+
+
+def _inline_math_one_line(md):
+    """$…$ formulas that the source wraps over two lines on one line: Obsidian only renders an inline
+    formula whose $ signs are on the same line. $$ blocks and code are left alone."""
+    parts = re.split(r'(^```.*?^```[ \t]*$|\$\$.*?\$\$)', md, flags=re.S | re.M)
+    for i in range(0, len(parts), 2):
+        # an opening $ is followed by a non-space and a closing $ preceded by one, so the end of one
+        # formula and the start of the next never pass for a formula
+        parts[i] = re.sub(r'(?<![\\$])\$(?![$\s])([^$\n]+(?:\n[^$\n]+)+?)(?<!\s)\$(?!\$)',
+                          lambda m: '$' + re.sub(r'\s*\n\s*', ' ', m.group(1)) + '$'
+                          if '\n\n' not in m.group(1) else m.group(0), parts[i])
+    return ''.join(parts)
 
 
 def pandoc_grid_tables(md):
@@ -4620,13 +4768,40 @@ def _latex_strip_markup(s):
     s = re.sub(r'\s+', ' ', s)
     return s.strip()
 
+_LATEX_ACCENTS = {"'": '\u0301', '`': '\u0300', '"': '\u0308', '^': '\u0302', '~': '\u0303', '=': '\u0304',
+                  '.': '\u0307', 'u': '\u0306', 'v': '\u030c', 'H': '\u030b', 'c': '\u0327', 'k': '\u0328', 'r': '\u030a'}
+
+
+def _latex_accents(text):
+    """LaTeX accent commands as letters: L\\'opez, L\\'{o}pez, {\\'o} -> López; \\"u -> ü, \\c{c} -> ç, \\v{s} -> š."""
+    def accent(m):
+        letter = 'i' if m.group(2) in ('\\i', '{\\i}') else m.group(2).strip('{}')
+        return unicodedata.normalize('NFC', letter + _LATEX_ACCENTS[m.group(1)])
+    text = re.sub(r'\{?\\([\'`"^~=.])\s*(\{?(?:\\i|[A-Za-z])\}?)\}?', accent, text)
+    text = re.sub(r'\{?\\([uvHckr])\s*(\{(?:\\i|[A-Za-z])\}|\s[A-Za-z])\}?', lambda m: accent(
+        re.match(r'(.)(.*)', m.group(1) + m.group(2).strip())), text)
+    return text
+
+
+def _fuller_names(crossref, latex):
+    """True when the LaTeX source names the same people as Crossref (same last names, same order) and
+    writes out first names that Crossref only gives as initials ('R. Cont' -> 'Rama Cont')."""
+    if not crossref or len(crossref) != len(latex):
+        return False
+    last = lambda n: _slug(n.split()[-1]) if n.split() else ''
+    if [last(a) for a in crossref] != [last(b) for b in latex]:
+        return False
+    initials = lambda n: bool(re.match(r'^(?:[A-Z]\.\s*-?)+\s', n + ' '))
+    return any(initials(a) and not initials(b) for a, b in zip(crossref, latex))
+
+
 def _metadata_from_latex(tex_path):
     """Extract title and authors from a LaTeX source file."""
     try:
         with open(tex_path, encoding='utf-8', errors='replace') as f:
             content = f.read()
 
-        raw_title = _latex_braced_arg(content, 'title')
+        raw_title = _latex_accents(_latex_braced_arg(content, 'title'))
         # Strip reference/footnote-marker commands entirely (don't preserve their content)
         raw_title = re.sub(r'\\(?:tnoteref|fnref|corref|thanks)\{[^{}]*\}', '', raw_title)
         title = _latex_strip_markup(raw_title)
@@ -4637,11 +4812,11 @@ def _metadata_from_latex(tex_path):
         elsevier = re.findall(r'\\author\[[^\]]*\]\{([^}]+)\}', content)
         if elsevier:
             for name in elsevier:
-                name = _latex_strip_markup(name)
+                name = _latex_strip_markup(_latex_accents(name))
                 if name:
                     authors.append(name)
         else:
-            raw_author = _latex_braced_arg(content, 'author')
+            raw_author = _latex_accents(_latex_braced_arg(content, 'author'))
             raw_author = re.sub(r'\\(?:thanks|tnoteref|fnref|corref)\{[^{}]*\}', '', raw_author)
             raw_author = re.sub(r'(?<!\\)%.*', '', raw_author)                              # comments
             raw_author = re.sub(r'\\(?:[hv]space\*?\{[^{}]*\}|footnotemark(?:\[[^\]]*\])?)', '', raw_author)
@@ -4650,7 +4825,12 @@ def _metadata_from_latex(tex_path):
             # \and, \And, \AND separate authors; within one, lines after \\ are affiliations and e-mails
             for name in re.split(r'\\and\b', raw_author, flags=re.I):
                 name = _latex_strip_markup(re.split(r'\\\\', name.strip())[0])
-                if name:
+                # several people in one part: 'Rama Cont, Arseniy Kukanov and Sasha Stoikov' (each piece
+                # a name of two words or more, so 'Smith, John' stays one person)
+                people = [p for p in re.split(r'\s*,\s*(?:and\s+)?|\s+and\s+', name) if p]
+                if len(people) > 1 and all(2 <= len(p.split()) <= 4 and p[0].isupper() for p in people):
+                    authors.extend(people)
+                elif name:
                     authors.append(name)
 
         abstract_m = re.search(r'\\begin\{abstract\}(.*?)\\end\{abstract\}', content, re.DOTALL)
@@ -5486,6 +5666,8 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 tex_path = get_arxiv_latex(arxiv_id, tmp_dir)
                 if tex_path:
                     latex_meta = _metadata_from_latex(tex_path)
+                    if _fuller_names(meta.get('authors') or [], latex_meta.get('authors') or []):
+                        meta['authors'] = latex_meta['authors']   # 'Rama Cont' instead of Crossref's 'R. Cont'
                     for k, v in latex_meta.items():
                         if v and not meta.get(k):
                             meta[k] = v
