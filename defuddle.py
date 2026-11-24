@@ -121,6 +121,12 @@ PDF_PROCESSOR = 'local_first'
 # ║  MARKER_PRECISE: False = normal (quick, but inline math can break).          ║
 # ║  True = precise: full-page OCR, inline math re-read by the LLM (slower).     ║
 MARKER_PRECISE = False
+# ║  marker's load on the Mac: MARKER_NICE = CPU priority (0 normal – 19 lowest, ║
+# ║  so other work goes first); MARKER_THREADS = CPU threads per marker run      ║
+# ║  (0 = torch's default, all performance cores). Links in one batch run        ║
+# ║  marker one at a time either way.                                            ║
+MARKER_NICE = 19
+MARKER_THREADS = 4
 # ║                                                                              ║
 # ║  AI enrichment — provider for summaries, tags, chapters, and filenames.      ║
 # ║  Always falls back to Claude CLI if the provider fails or has no key.        ║
@@ -2899,24 +2905,41 @@ def _run_marker(cmd, timeout=4 * 3600):
     """Run marker and show that it is working: its progress bars as short lines ('marker:
     Recognizing Text 120/360 (30%)', once per 10% per step) when it draws any, and a line
     every 5 minutes. Returns a CompletedProcess whose stderr holds marker's last lines."""
+    # One marker at a time: each loads its own models (several GB) and all share one GPU, so
+    # parallel links wait here while their other steps (downloads, metadata, images) go on
+    lock = None
+    try:
+        import fcntl
+        lock = open(os.path.join(os.path.expanduser('~/.cache/defuddle'), 'marker.lock'), 'w')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('marker: waiting for another conversion to finish...', file=sys.stderr, flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+    except (ImportError, OSError):   # Windows, or no cache folder: run without waiting
+        pass
+    env = {**os.environ, **({k: str(MARKER_THREADS) for k in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')}
+                            if MARKER_THREADS else {})}
+    nice = (lambda: os.nice(MARKER_NICE)) if MARKER_NICE and hasattr(os, 'nice') else None
     # marker only draws progress bars on a terminal, so give it a pseudo-terminal where possible
     master = None
     if os.name != 'nt':
         import pty
         master, slave = pty.openpty()
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=slave)
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=slave, env=env, preexec_fn=nice)
         os.close(slave)
         read = lambda: os.read(master, 4096)
     else:
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
         read = lambda: p.stderr.read1(4096)
     tail, shown, buf, start = [], {}, b'', time.time()
 
     # This marker version prints no progress bars, so say every 5 minutes that it is still working
     import threading
     done = threading.Event()
-    pages = (re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', cmd[1]], capture_output=True, text=True).stdout, re.M)
-             if shutil.which('pdfinfo') else None)
+    pdf = next((a for a in cmd if a.lower().endswith('.pdf')), None)
+    pages = (re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', pdf], capture_output=True, text=True).stdout, re.M)
+             if pdf and shutil.which('pdfinfo') else None)
     pages = f', {pages.group(1)} pages' if pages else ''
 
     def heartbeat():
@@ -2957,6 +2980,8 @@ def _run_marker(cmd, timeout=4 * 3600):
     done.set()
     if master is not None:
         os.close(master)
+    if lock:
+        lock.close()   # releases the lock for the next link
     return subprocess.CompletedProcess(cmd, p.returncode, '', '\n'.join(tail))
 
 
