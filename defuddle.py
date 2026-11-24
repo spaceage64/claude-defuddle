@@ -1872,6 +1872,44 @@ def _crossref_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 
+# Title case for titles registered in capitals: small words stay lower case except first, last and
+# after a colon; abbreviations (no vowel, a digit, or listed) stay in capitals
+_TITLE_SMALL = {'a', 'an', 'the', 'and', 'but', 'or', 'nor', 'for', 'so', 'yet', 'as', 'at', 'by', 'from', 'in',
+                'into', 'of', 'off', 'on', 'onto', 'per', 'to', 'up', 'upon', 'via', 'with', 'vs', 'versus', 'than'}
+_TITLE_ABBREVIATIONS = {'ARMA', 'ARIMA', 'GARCH', 'ARCH', 'VAR', 'VAR(1)', 'VWAP', 'TWAP', 'ETF', 'ETFS', 'OU', 'US', 'USA',
+                        'UK', 'EU', 'NYSE', 'NASDAQ', 'IPO', 'CEO', 'CAPM', 'APT', 'OLS', 'GMM', 'PCA', 'NBER', 'IMF', 'ECB',
+                        'FX', 'OTC', 'LOB', 'HFT', 'TCP', 'IP', 'HTTP', 'API', 'CPU', 'GPU', 'SQL', 'NUMA', 'SIMD', 'AI', 'ML',
+                        'II', 'III', 'IV', 'VI', 'VII', 'VIII', 'IX', 'XI', 'XII', 'PDE', 'SDE', 'ODE', 'MCMC', 'LSTM',
+                        'ISO', 'IEC', 'ANSI', 'NISO', 'DIN', 'EN', 'NEN', 'BS', 'ASTM', 'IEEE', 'ITU', 'IETF', 'RFC', 'UN'}
+
+
+def title_case(title):
+    """A title written entirely in capitals ('OPTIMAL MEAN REVERSION TRADING WITH TRANSACTION COSTS') in
+    title case ('Optimal Mean Reversion Trading with Transaction Costs'); any other title unchanged."""
+    letters = [c for c in title if c.isalpha()]
+    if len(letters) < 8 or sum(c.isupper() for c in letters) < 0.9 * len(letters):
+        return title
+    if len([w for w in re.findall(r'[A-Za-z]{4,}', title) if w.upper() not in _TITLE_ABBREVIATIONS]) < 2:
+        return title      # mostly codes and numbers (DIN EN ISO 3166-1:2007): not a sentence
+    words = title.split(' ')
+    out = []
+    for i, word in enumerate(words):
+        bare = re.sub(r'^\W+|\W+$', '', word)
+        after_colon = i > 0 and re.search(r'[:—–?!]$', words[i - 1])
+        def part(w, small_ok):
+            core = re.sub(r'\W', '', w)
+            if core.upper() in _TITLE_ABBREVIATIONS or re.search(r'\d', core) or (len(core) > 1 and not re.search(r'[AEIOUY]', core.upper())):
+                return w.upper()
+            if small_ok and core.lower() in _TITLE_SMALL:
+                return w.lower()
+            return re.sub(r'[A-Za-z][^\W\d_]*', lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(), w, count=1) \
+                if re.match(r'\W*[A-Za-z]', w) else w.lower()
+        small_ok = 0 < i < len(words) - 1 and not after_colon and bool(bare)
+        out.append('/'.join('-'.join(part(w, small_ok and j == 0 and '-' not in word and '/' not in word)
+                                     for j, w in enumerate(piece.split('-'))) for piece in word.split('/')))
+    return ' '.join(out)
+
+
 def get_paper_metadata(doi):
     """Fetch paper metadata from CrossRef API, with arXiv API fallback."""
     # For arXiv DOIs (10.48550/arXiv.XXXX), use the arXiv API directly
@@ -1882,7 +1920,7 @@ def get_paper_metadata(doi):
         result = curl(f'https://api.crossref.org/works/{doi}', '-H', 'User-Agent: defuddle/1.0 (mailto:user@example.com)', max_time=10)
         data = json.loads(result.stdout.decode('utf-8', errors='replace'))
         work = data.get('message', {})
-        title = _crossref_text(' '.join(work.get('title', [''])))
+        title = title_case(_crossref_text(' '.join(work.get('title', ['']))))
         title = re.sub('[\u2010\u2011]', '-', title)   # Crossref's Unicode hyphens
         title = ieee_symbols(title)                      # IEEE titles: 'The /spl phi/ accrual…'
         authors = []
@@ -3699,6 +3737,16 @@ def fix_list_markers(md):
             line = re.sub(r'^(\s*)\d{1,3}[.)]\s+(?=\(?(?:[a-z]|[ivx]{1,4})\)\s)', r'\1- ', line)
         out.append(line)
     return '\n'.join(out)
+
+
+def drop_empty_quotes(md):
+    """Remove blockquotes with nothing in them but line breaks ('> \\', '>'), which pandoc makes of
+    LaTeX's \\\\ in an empty quote or centre block. Code blocks are left alone."""
+    parts = re.split(r'(^```.*?^```[ \t]*$)', md, flags=re.S | re.M)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r'(?:^>[ \t]*\\?[ \t]*\n)+(?:\n|\Z)', lambda m: '' if m.start() else m.group(0),
+                          parts[i], flags=re.M)
+    return ''.join(parts)
 
 
 def fix_reference_list(md):
@@ -7400,21 +7448,37 @@ def as_book(note, args, source=None, meta=None):
         return bookify_note(note, path, structure)[0], True
 
 
-_ORGANISATION = re.compile(r'\b(?:Company|Co|Corp(?:oration)?|Inc|Ltd|LLC|plc|GmbH|AG|Bank|Trust|Group|'
-                           r'University|Institute|Association|Society|Council|Committee|Agency|Foundation|'
-                           r'Organi[sz]ation|Office|Department|Ministry|Board|Commission|Press)\b\.?', re.I)
+# Words that mark an organisation, in English, Dutch, German, French, Spanish, Portuguese and Italian
+_ORGANISATION = re.compile(
+    r'\b(?:Company|Co|Corp(?:oration)?|Inc|Ltd|LLC|plc|GmbH|AG|SA|S\.A|SpA|NV|BV|Bank|Banco|Banca|Banque|Trust|'
+    r'Group|Grupo|Gruppo|Groupe|Gruppe|Groep|Universit\w*|Universidad\w*|Universiteit|Institut\w*|Istituto|'
+    r'Association|Asociaci\w+|Associa\w+|Vereniging|Verein|Verband|Society|Soci[eé]t[eé]|Sociedad|Societ[aà]|'
+    r'Gesellschaft|Council|Conseil|Consejo|Consiglio|Raad|Committee|Comit[eé]|Agency|Agence|Agencia|Agenzia|Agentur|'
+    r'Foundation|Fundaci[oó]n|Funda[cç][aã]o|Fondazione|Fondation|Stiftung|Stichting|Organi[sz]a\w+|Office|Oficina|'
+    r'Bureau|Department|Departamento|Ministry|Minist\w+|Board|Commission|Comisi[oó]n|Commissione|Kommission|Commissie|'
+    r'Press|Verlag|Editorial|[EÉ]ditions|Editora|Editore|Uitgeverij)\b\.?', re.I)
 
 
-_ARTICLES = {'the', 'a', 'an', 'de', 'het', 'een', 'le', 'la', 'les', 'der', 'die', 'das', 'el', 'il', 'lo'}
-_LINK_WORDS = _ARTICLES | {'of', 'for', 'and', 'on', 'in', 'with', 'to', 'at', 'by', 'from', 'as', 'into', 'upon', 'or',
-                           'und', 'fur', 'mit', 'zu', 'zur', 'zum', 'von', 'en', 'van', 'voor', 'met', 'te', 'op', 'bij',
-                           'aan', 'du', 'des', 'et', 'pour', 'sur', 'au', 'aux', 'y', 'di', 'del', 'della', 'da', 'per'}
+# Articles (skipped before an organisation's first word) and the small words between its main words
+# ('Bank for International Settlements' -> bank-international), after _slug(): für -> fur, à -> a.
+# English, Dutch, German, French, Spanish, Portuguese, Italian
+_ARTICLES = {'the', 'a', 'an', 'de', 'het', 'een', 'der', 'die', 'das', 'ein', 'eine', 'le', 'la', 'les', 'l', 'un',
+             'une', 'el', 'los', 'las', 'una', 'o', 'os', 'as', 'um', 'uma', 'il', 'lo', 'gli', 'i', 'uno'}
+_LINK_WORDS = _ARTICLES | {
+    'of', 'for', 'and', 'on', 'in', 'with', 'to', 'at', 'by', 'from', 'into', 'upon', 'or',
+    'van', 'voor', 'en', 'met', 'te', 'op', 'bij', 'aan', 'uit',
+    'und', 'fur', 'mit', 'zu', 'zur', 'zum', 'von', 'vom', 'im', 'am', 'aus', 'bei',
+    'du', 'des', 'et', 'pour', 'sur', 'au', 'aux', 'avec', 'dans', 'par',
+    'del', 'y', 'e', 'con', 'para', 'por', 'al',
+    'do', 'da', 'dos', 'das', 'com', 'em', 'no', 'na', 'nos', 'nas',
+    'di', 'della', 'dello', 'dei', 'delle', 'degli', 'per', 'nel', 'nella'}
 
 
 def _author_slug(name):
     """The file-name part for an author: a person's last name, an organisation's first word after any
-    article, and the next one too when that word is short ('Morgan Guaranty Trust Company' -> morgan,
-    'The MIT Press' -> mit-press)."""
+    article, and the next meaningful one too when that word is short or only names the kind of
+    organisation ('Morgan Guaranty Trust Company' -> morgan, 'The MIT Press' -> mit-press,
+    'Banco de España' -> banco-espana)."""
     words = name.split()
     if not words:
         return ''
@@ -7424,7 +7488,9 @@ def _author_slug(name):
     while len(words) > 1 and words[0] in _ARTICLES:
         words.pop(0)
     second = next((w for w in words[1:] if w not in _LINK_WORDS), '')
-    return f'{words[0]}-{second}' if len(words[0]) < 5 and second else words[0]
+    # a short first word, or one that only says what kind of organisation it is (Banco de España)
+    generic = _ORGANISATION.fullmatch(words[0])
+    return f'{words[0]}-{second}' if second and (len(words[0]) < 5 or generic) else words[0]
 
 
 def book_filename(args, note):
@@ -7494,7 +7560,7 @@ def save_note(note, args, subdir, filename, images_dict=None, source_url=None, f
         note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=source_url)
     if finish:
         note = finish(note, save_dir, filename)
-    note = fix_reference_list(_dedup_note_tags(note))
+    note = drop_empty_quotes(fix_reference_list(_dedup_note_tags(note)))
     with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
         f.write(note)
     print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
