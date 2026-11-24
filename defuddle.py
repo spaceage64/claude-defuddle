@@ -73,7 +73,7 @@ SHADOW_BASE_URL = ''
 # ║  Downloads folder — watched for the PDF you save from the shadow library.    ║
 # ║  '' = the system default (macOS, Windows, Linux XDG). Example: '~/Downloads' ║
 DOWNLOADS_DIR = ''
-# ║  Seconds to wait for that PDF before giving up.                              ║
+# ║  Seconds to wait for that PDF before giving up; 0 = wait until it appears.   ║
 SHADOW_WAIT   = 600
 # ║                                                                              ║
 # ║  Images — download and localise images into a /img subfolder.                ║
@@ -103,7 +103,11 @@ OCR_PDF = False
 KEEP_PDF = False
 # ║  Parallel jobs — links processed at the same time when several are given,    ║
 # ║  and images downloaded at the same time for one note.                        ║
+# ║  FETCH_JOBS: links that start at once to fetch their paper or page, so every ║
+# ║  browser tab for a PDF you have to save opens at the start of a batch. The   ║
+# ║  converting then runs PARALLEL_JOBS at a time.                               ║
 PARALLEL_JOBS = 4
+FETCH_JOBS    = 16
 IMAGE_JOBS    = 6
 # ║                                                                              ║
 # ║  Datalab — converts paper PDFs to markdown via cloud API.                    ║
@@ -2626,7 +2630,9 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
     Shadow libraries sit behind JavaScript browser checks (e.g. DDoS-Guard) that curl
     can't pass, so the download happens in the user's browser. Returns the path of the
     new PDF in the downloads folder whose first pages show this DOI (or title), or None
-    after SHADOW_WAIT. PDFs of other papers are skipped, so several runs can wait at once.
+    after SHADOW_WAIT (0: no limit). PDFs of other papers are skipped, so several runs can wait at
+    once; in a batch, PDFs saved since the batch started count too, and one that is already there
+    is used without opening the browser.
     Partial downloads (.crdownload, .part, .download) are ignored; the file is left in place.
     """
     import webbrowser
@@ -2637,16 +2643,34 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
         print(f'Download the PDF manually and pass the local file to defuddle: {url}', file=sys.stderr)
         return None
     start  = time.time()
+    since  = min(start, float(os.environ.get('DEFUDDLE_BATCH_START') or start))
     before = set(os.listdir(folder))
+    # Saved already (in a batch, while other links ran): use it without opening the browser
+    for name in sorted(before):
+        path = os.path.join(folder, name)
+        try:
+            if not name.lower().endswith('.pdf') or os.path.getmtime(path) < since or os.path.getsize(path) <= 1000 \
+                    or any(n in before for n in (name + '.part', name + '.crdownload', name + '.download')):
+                continue
+            with open(path, 'rb') as f:
+                if f.read(5) != b'%PDF-':
+                    continue
+        except OSError:
+            continue
+        if _pdf_matches(_pdf_first_pages_text(path), doi, title):
+            print(f'Found {name} in {folder} (saved earlier)', file=sys.stderr)
+            _set_pdf_name(name)
+            return path
     limit  = f'{SHADOW_WAIT // 60} min' if SHADOW_WAIT >= 120 else f'{SHADOW_WAIT} s'
     print(f'Opening {label} in your browser: {url}', file=sys.stderr)
-    print(f'Save the PDF to {folder} — waiting up to {limit}...', file=sys.stderr, flush=True)
+    print(f'Save the PDF to {folder} — ' + (f'waiting up to {limit}...' if SHADOW_WAIT else
+          'waiting until it appears (no time limit)...'), file=sys.stderr, flush=True)
     try:
         webbrowser.open(url)
     except Exception:
         pass
     sizes, checked = {}, {}
-    while time.time() < start + SHADOW_WAIT:
+    while not SHADOW_WAIT or time.time() < start + SHADOW_WAIT:
         time.sleep(2)
         try:
             names = os.listdir(folder)
@@ -2660,7 +2684,7 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
                 st = os.stat(path)
             except OSError:
                 continue
-            if name in before and st.st_mtime < start:
+            if name in before and st.st_mtime < since:
                 continue
             if any(n in names for n in (name + '.part', name + '.crdownload', name + '.download')):
                 continue
@@ -5086,6 +5110,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
             if not pdf_path and not content:
                 print('Could not retrieve PDF.', file=sys.stderr)
                 return '', {}, {}
+        _processing_slot()   # in a batch: the paper is here, now wait for a turn to convert it
         if not content and pdf_path:
             content, images_dict, method = converted or pdf_to_markdown(pdf_path)
             with open(pdf_path, 'rb') as f:
@@ -6602,8 +6627,41 @@ PER_LINK = (('--filename', 'filename', None), ('--method', 'method', METHODS), (
             ('--pages', 'pages', None), ('--as', 'as_type', ('doc', 'paper', 'book')))
 
 
+_SLOT = None   # this process's processing slot in a batch: an open file it holds a lock on
+
+
+def _processing_slot():
+    """In a batch, wait for one of its PARALLEL_JOBS processing slots before the heavy work. Links
+    all start at once to fetch their paper or page (browser tabs open at the start), then convert a
+    few at a time. Outside a batch, or without fcntl (Windows), this returns at once."""
+    global _SLOT
+    slots, folder = int(os.environ.get('DEFUDDLE_SLOTS') or 0), os.environ.get('DEFUDDLE_SLOT_DIR')
+    if _SLOT or not slots or not folder:
+        return
+    try:
+        import fcntl
+    except ImportError:
+        return
+    told = False
+    while True:
+        for i in range(slots):
+            f = open(os.path.join(folder, f'slot-{i}'), 'w')
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _SLOT = f   # held until this process ends
+                return
+            except BlockingIOError:
+                f.close()
+        if not told:
+            print('Waiting for a free processing slot...', file=sys.stderr, flush=True)
+            told = True
+        time.sleep(2)
+
+
 def run_batch(urls, argv, per_link=None):
-    """Process several links, PARALLEL_JOBS at a time, each in its own defuddle process.
+    """Process several links, each in its own defuddle process: up to FETCH_JOBS start at once and
+    fetch their paper or page (so browser tabs for PDFs to save open at the start), and the
+    converting runs PARALLEL_JOBS at a time (_processing_slot).
     per_link: {option: values} for the PER_LINK options, one value for every link or one per link.
     Progress lines are prefixed with the link's number; each link's output follows when it is done."""
     per_link = per_link or {}
@@ -6616,14 +6674,18 @@ def run_batch(urls, argv, per_link=None):
             skip = True
         elif not a.startswith(tuple(o + '=' for o in own_opts)) and a not in urls:
             rest.append(a)
-    print(f'Processing {len(urls)} links, {PARALLEL_JOBS} at a time...', file=sys.stderr, flush=True)
+    print(f'Processing {len(urls)} links: fetching all at once, converting {PARALLEL_JOBS} at a time...',
+          file=sys.stderr, flush=True)
+    slot_dir = tempfile.mkdtemp(prefix='defuddle-slots-')
+    env = {**os.environ, 'DEFUDDLE_SLOTS': str(max(1, PARALLEL_JOBS)), 'DEFUDDLE_SLOT_DIR': slot_dir,
+           'DEFUDDLE_BATCH_START': str(time.time())}
 
     def one(n, url):
         with tempfile.TemporaryFile('w+', encoding='utf-8') as out:
             own = [x for opt, vals in per_link.items() if vals and (v := vals[n - 1 if len(vals) > 1 else 0])
                    for x in (opt, v)]
             p = subprocess.Popen([sys.executable, os.path.abspath(__file__), url] + rest + own,
-                                 stdout=out, stderr=subprocess.PIPE, text=True)
+                                 stdout=out, stderr=subprocess.PIPE, text=True, env=env)
             assert p.stderr   # set by stderr=PIPE
             for line in p.stderr:
                 print(f'[{n}] {line}', end='', file=sys.stderr, flush=True)
@@ -6631,7 +6693,7 @@ def run_batch(urls, argv, per_link=None):
             out.seek(0)
             return p.returncode, out.read()
 
-    with ThreadPoolExecutor(max(1, PARALLEL_JOBS)) as ex:
+    with ThreadPoolExecutor(max(1, FETCH_JOBS, PARALLEL_JOBS)) as ex:
         futures = [ex.submit(one, n, u) for n, u in enumerate(urls, 1)]
         codes = []
         for n, (url, fut) in enumerate(zip(urls, futures), 1):
@@ -6639,6 +6701,7 @@ def run_batch(urls, argv, per_link=None):
             codes.append(code)
             print(f'\n=== [{n}] {url}{"" if code == 0 else f" (failed, exit {code})"} ===')
             print(out.strip())
+    shutil.rmtree(slot_dir, ignore_errors=True)
     return 0 if all(c == 0 for c in codes) else 1
 
 
@@ -7830,7 +7893,8 @@ def main(argv=None):
         return
 
     if ENABLE_PAPER and is_paper_url(url):
-        return save_paper(url, args, academia_doi)
+        return save_paper(url, args, academia_doi)   # takes its slot once it has the paper
+    _processing_slot()
     if is_pdf_url(url):
         return save_pdf(url, args)
     if ENABLE_PODCAST and is_apple_podcast(url):
