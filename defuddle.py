@@ -1602,6 +1602,11 @@ def crossref_doi_for_pdf(text, hint='', name=''):
         return f'10.2139/ssrn.{m.group(1)}'
     m = re.match(r'(\d{4}\.\d{4,5})(?:v\d+)?\.pdf$', name or '', re.I)
     if m:
+        # An arXiv copy of a published paper: the journal's DOI (with Crossref's metadata) when arXiv
+        # or DataCite names one and its title is on the PDF, else the arXiv DOI
+        journal = _get_paper_metadata_arxiv(m.group(1)).get('journal_doi', '')
+        if journal and _title_on_pages((get_paper_metadata(journal) or {}).get('title', ''), text):
+            return journal
         return f'10.48550/arXiv.{m.group(1)}'
     # Elsevier PIIs, e.g. 0304-405X(81)90020-9 (often the PDF's Title) or S0304405X14001548
     for src in (hint, text):
@@ -1614,7 +1619,7 @@ def crossref_doi_for_pdf(text, hint='', name=''):
     for query in dict.fromkeys(q for q in (clean_hint, re.sub(r'\s+', ' ', text or '')[:300]) if q and q.strip()):
         msg = _crossref(f'works?query.bibliographic={quote(query)}&rows=5&select=DOI,title')
         hits = [item['DOI'] for item in (msg or {}).get('items', [])
-                if _title_on_pages(' '.join(item.get('title') or []), text)]
+                if _title_on_pages(_crossref_text(' '.join(item.get('title') or [])), text)]
         if hits:
             # Several versions (working paper, journal article): prefer the one whose DOI
             # ends in the file name, e.g. hhx084.pdf -> 10.1093/rfs/hhx084
@@ -1790,8 +1795,33 @@ def extract_arxiv_id_from_url(url):
     m = re.search(r'arxiv\.org/abs/(\d{4}\.\d{4,5}(?:v\d+)?)', url)
     return m.group(1) if m else None
 
+def _arxiv_datacite(arxiv_id):
+    """An arXiv paper's metadata from DataCite, which registers arXiv's DOIs: title, authors, year
+    and the DOI of the published version (journal_doi), or {}. The fallback when the arXiv API is busy
+    (it answers 429/503 under load)."""
+    try:
+        r = curl(f'https://api.datacite.org/dois/10.48550/arxiv.{arxiv_id}', max_time=15)
+        a = json.loads(r.stdout or b'{}')['data']['attributes']
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return {}
+    authors = []
+    for c in a.get('creators') or []:
+        name = f'{c.get("givenName", "")} {c.get("familyName", "")}'.strip() or c.get('name', '')
+        if ',' in name and not c.get('givenName'):
+            last, first = name.split(',', 1)
+            name = f'{first.strip()} {last.strip()}'
+        if name := _clean_author(name):
+            authors.append(name)
+    dates = {d.get('dateType'): d.get('date', '') for d in a.get('dates') or []}
+    version = next((r['relatedIdentifier'] for r in a.get('relatedIdentifiers') or []
+                    if r.get('relationType') == 'IsVersionOf' and r.get('relatedIdentifierType') == 'DOI'), '')
+    return {'title': re.sub(r'\s+', ' ', ((a.get('titles') or [{}])[0].get('title') or '')).strip(), 'authors': authors,
+            'published': (dates.get('Submitted') or str(a.get('publicationYear') or ''))[:10],
+            'journal': '', 'doi': f'10.48550/arXiv.{arxiv_id}', 'journal_doi': version}
+
+
 def _get_paper_metadata_arxiv(arxiv_id):
-    """Fetch paper metadata from the arXiv API (Atom feed)."""
+    """Fetch paper metadata from the arXiv API (Atom feed), else from DataCite."""
     try:
         import xml.etree.ElementTree as ET
         result = curl(f'https://export.arxiv.org/api/query?id_list={arxiv_id}', max_time=10)
@@ -1800,7 +1830,7 @@ def _get_paper_metadata_arxiv(arxiv_id):
               'arxiv': 'http://arxiv.org/schemas/atom'}
         entry = root.find('atom:entry', ns)
         if entry is None:
-            return {}
+            return _arxiv_datacite(arxiv_id)
         title = (entry.findtext('atom:title', '', ns) or '').strip().replace('\n', ' ')
         authors = []
         for a in entry.findall('atom:author', ns):
@@ -1809,10 +1839,13 @@ def _get_paper_metadata_arxiv(arxiv_id):
                 authors.append(name)
         published = (entry.findtext('atom:published', '', ns) or '')[:10]
         journal_ref = (entry.findtext('arxiv:journal_ref', '', ns) or '').strip()
+        if not title:
+            return _arxiv_datacite(arxiv_id)
         return {'title': title, 'authors': authors, 'published': published,
-                'journal': journal_ref, 'doi': f'10.48550/arXiv.{arxiv_id}'}
+                'journal': journal_ref, 'doi': f'10.48550/arXiv.{arxiv_id}',
+                'journal_doi': (entry.findtext('arxiv:doi', '', ns) or '').strip()}
     except Exception:
-        return {}
+        return _arxiv_datacite(arxiv_id)   # busy (429/503 is not XML) or unreachable
 
 _NAME_PARTICLES = {'van', 'von', 'der', 'den', 'de', 'del', 'della', 'di', 'da', 'du', 'la', 'le', 'ten', 'ter'}
 
@@ -1831,6 +1864,14 @@ def _clean_author(name):
         name = ' '.join(word(w, i == 0) for i, w in enumerate(name.split()))
     return name
 
+def _crossref_text(text):
+    """A Crossref title without its markup: <i>, <b>, <sub>, <sup>, <scp>, MathML and the like, with
+    the space Crossref leaves before a small-caps part (C <scp>oz</scp> -> Coz)."""
+    text = re.sub(r'(?<=\b[A-Z]) +(?=<scp>)', '', text or '')
+    text = html.unescape(re.sub(r'<[^>]+>', '', text))
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def get_paper_metadata(doi):
     """Fetch paper metadata from CrossRef API, with arXiv API fallback."""
     # For arXiv DOIs (10.48550/arXiv.XXXX), use the arXiv API directly
@@ -1841,7 +1882,7 @@ def get_paper_metadata(doi):
         result = curl(f'https://api.crossref.org/works/{doi}', '-H', 'User-Agent: defuddle/1.0 (mailto:user@example.com)', max_time=10)
         data = json.loads(result.stdout.decode('utf-8', errors='replace'))
         work = data.get('message', {})
-        title = ' '.join(work.get('title', [''])).strip()
+        title = _crossref_text(' '.join(work.get('title', [''])))
         title = re.sub('[\u2010\u2011]', '-', title)   # Crossref's Unicode hyphens
         title = ieee_symbols(title)                      # IEEE titles: 'The /spl phi/ accrual…'
         authors = []
@@ -1859,7 +1900,7 @@ def get_paper_metadata(doi):
         else:
             pub_date = ''
         container = work.get('container-title', [])
-        journal = container[0] if container else work.get('publisher', '')
+        journal = _crossref_text(container[0]) if container else work.get('publisher', '')
         issns = sorted(work.get('issn-type') or [], key=lambda i: i.get('type') != 'print')
         return {'title': title, 'authors': authors, 'published': pub_date,
                 'journal': journal, 'doi': doi, 'type': work.get('type', ''), 'isbns': work.get('ISBN') or [],
@@ -2614,15 +2655,31 @@ def _title_words_in(title, text, gap=2):
     return False
 
 
+def _ocr_fold(text):
+    """Text for comparing IDs read by OCR: lower case, no white space, and the letters OCR mixes up
+    with digits (O/0, l/I/1) made the same on both sides (SO965-9978(96)… = S0965-9978(96)…)."""
+    return re.sub(r'\s+', '', text.lower()).translate(str.maketrans('oli', '011'))
+
+
 def _pdf_matches(text, doi, title):
-    """True when the text of a PDF's first pages carries this DOI, or else this title."""
+    """True when the text of a PDF's first pages carries this DOI (also as OCR misreads it, or only its
+    long part after the prefix, like an Elsevier PII), or else this title (also when the page cuts it off
+    after most of its words)."""
     text = text.lower()
-    if re.sub(r'\s+', '', doi.lower()) in re.sub(r'\s+', '', text):
+    if _ocr_fold(doi) in _ocr_fold(text):
+        return True
+    # Older papers print only the part after the publisher's prefix: Elsevier's PII (S0965-9978(96)00051-8)
+    suffix = doi.split('/', 1)[-1]
+    if len(re.sub(r'\W', '', suffix)) >= 12 and re.search(r'\d{4}', suffix) and _ocr_fold(suffix) in _ocr_fold(text):
         return True
     # Letters and digits only: survives line breaks and hyphenation in the title
     title = ieee_symbols(title or '')
     key = re.sub(r'[^a-z0-9]', '', _slug(title))
-    return (len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text))) or _title_words_in(title, text)
+    if (len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text))) or _title_words_in(title, text):
+        return True
+    words = [w for w in re.findall(r'[a-z0-9]+', _slug(title)) if len(w) > 1]
+    least = max(6, -(-len(words) * 3 // 5))   # a cut-off title: its first 60% of words, at least 6
+    return any(_title_words_in(' '.join(words[:k]), text) for k in range(len(words) - 1, least - 1, -1))
 
 def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
     """Open the shadow library page (or another page: url, label) in the browser and wait for the user to save the PDF.
@@ -2705,6 +2762,9 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
                 other = extract_doi_from_pdf_text(text)
                 why   = f'it is a different paper (DOI {other})' if other else f'no DOI {doi} or matching title on its first pages'
                 print(f'Skipping {name}: {why}', file=sys.stderr, flush=True)
+                print(f'  If it is this paper after all, stop this run and pass it in by hand:\n'
+                      f'  defuddle.py {shlex.quote(path)} --doi {doi}' + ('' if SHADOW_WAIT else
+                      '  (still waiting for another PDF: no time limit)'), file=sys.stderr, flush=True)
             sizes[name] = st.st_size
     print(f'No PDF for DOI {doi} appeared in {folder} within {limit}.', file=sys.stderr)
     if checked:
@@ -5670,6 +5730,9 @@ def _convert_image(path, base):
     if kind in ('pdf', 'eps'):
         raster = base + '.render.png'
         if not _rasterize(path, kind, raster):
+            if kind == 'eps' and not (shutil.which('gs') or shutil.which('gswin64c') or shutil.which('magick')):
+                print('WARNING: an EPS figure was not converted: it needs Ghostscript '
+                      '(macOS: brew install ghostscript); the note keeps a link to it.', file=sys.stderr)
             return None
         best = _convert_image(raster, base)
         if not best:                     # no sips/ImageMagick to compare formats: the PNG is fine
@@ -7061,24 +7124,148 @@ def isbn13s(candidates):
     return [(d, d) for d in dict.fromkeys(digits) if len(d) == 13]
 
 
+# An ISBN as printed: 'ISBN 978-1-107-09114-6 (Hardback)', 'ISBN-13: 9780…', 'ISBN 0-521-…', with en
+# dashes, and OCR's letters for digits (978 l l 07091146); a bare 978/979 number counts too
+_ISBN_LABELLED = re.compile(r'\bI\s?S\s?B\s?N(?:[-\s]?1[03])?\s*(?:\([^)\n]{0,30}\)\s*)?[:\uff1a]?\s*'
+                            r'((?:[\dlIOo][-\u2010-\u2015\s]?){9,16}[\dXxlIOo])', re.I)
+_ISBN_BARE = re.compile(r'\b97[89](?:[-\u2010-\u2015\s]?[\dlIO]){10}\b')
+
+
+def _isbn_candidates(text):
+    """ISBN candidates printed in text, OCR's letters read as digits; isbn13s() keeps the valid ones."""
+    found = _ISBN_LABELLED.findall(text) + _ISBN_BARE.findall(text)
+    return [c.translate(str.maketrans('lIOo', '1100')) for c in found]
+
+
+def ai_json(prompt, timeout=60):
+    """A JSON object from the AI provider (AI_LLM), else from the Claude CLI; {} when neither answers."""
+    raw = None
+    if AI_API_KEY or AI_LLM == 'ollama':
+        try:
+            raw = ai_request(prompt, timeout=timeout, json_reply=True)
+        except Exception as e:
+            print(f'{AI_LLM} failed ({e}) — falling back to Claude...', file=sys.stderr)
+    if raw is None:
+        cmd = ['claude', '-p', prompt, '--output-format', 'text'] + (['--model', AI_FALLBACK_MODEL] if AI_FALLBACK_MODEL else [])
+        try:
+            raw = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120).stdout
+        except (OSError, subprocess.SubprocessError):
+            return {}
+    try:
+        data = json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', (raw or '').strip()))
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _loc_lookup(isbn):
+    """Title, authors, publisher and year for an ISBN from the Library of Congress catalogue (SRU,
+    MODS records; loc.gov's JSON API turns scripts away); {} when it has no record."""
+    import xml.etree.ElementTree as ET
+    try:
+        r = curl(f'http://lx2.loc.gov:210/lcdb?version=1.1&operation=searchRetrieve&query=bath.isbn={isbn}'
+                 '&maximumRecords=1&recordSchema=mods', max_time=20)
+        mods = ET.fromstring(r.stdout).find('.//{http://www.loc.gov/mods/v3}mods')
+    except (OSError, subprocess.SubprocessError, ET.ParseError):
+        return {}
+    if mods is None:
+        return {}
+    ns = {'m': 'http://www.loc.gov/mods/v3'}
+    def name(text):   # 'Cartea, Álvaro.' / 'Smith, John, 1950-' -> 'Álvaro Cartea' / 'John Smith'
+        parts = [p.strip(' .') for p in unicodedata.normalize('NFC', text).split(',')]
+        parts = [p for p in parts if p and not re.fullmatch(r'[\d\s-]+', p)]
+        return _clean_author(' '.join(parts[1:2] + parts[:1]) if len(parts) > 1 else (parts[0] if parts else ''))
+    authors = []
+    for n in mods.findall('m:name[@type="personal"]', ns):
+        roles = [t.text or '' for t in n.findall('.//m:roleTerm', ns)]
+        roles = [r.strip(' .,') for r in roles if r.strip(' .,')]   # co-authors often carry no role
+        if n.get('usage') == 'primary' or not roles or any(re.match(r'(?:author|editor|creator)', r, re.I) for r in roles):
+            authors.append(name(' '.join(t.text or '' for t in n.findall('m:namePart', ns) if not t.get('type'))))
+    publisher = next((a.findtext('m:namePart', '', ns) for a in mods.findall('.//m:originInfo/m:agent', ns)
+                      if 'publisher' in ' '.join(t.text or '' for t in a.findall('.//m:roleTerm', ns))), '') \
+        or mods.findtext('.//m:originInfo/m:publisher', '', ns)
+    year = re.search(r'\d{4}', ' '.join(d.text or '' for d in mods.findall('.//m:originInfo/m:dateIssued', ns)))
+    return {'title': (mods.findtext('m:titleInfo/m:title', '', ns) or '').strip(' /:'), 'authors': [a for a in authors if a],
+            'publisher': publisher.strip(' ,:;'), 'published': year.group(0) if year else ''}
+
+
+def _isbn_lookup(isbn):
+    """Title, authors, publisher and year for an ISBN-13, combined from Open Library, the Library of
+    Congress and Google Books: the authors from the source that lists the most (LOC keeps only the
+    main author as a name), every other field from the first that has it; {} when none knows it."""
+    found = []
+    try:
+        data = json.loads(curl(f'https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data',
+                               max_time=15).stdout or b'{}').get(f'ISBN:{isbn}')
+    except (OSError, subprocess.SubprocessError, ValueError):
+        data = None
+    if data:
+        year = re.search(r'\d{4}', data.get('publish_date', ''))
+        found.append({'title': data.get('title', ''), 'authors': [a['name'] for a in data.get('authors', [])],
+                      'publisher': (data.get('publishers') or [{}])[0].get('name', ''),
+                      'published': year.group(0) if year else ''})
+    found.append(_loc_lookup(isbn))
+    try:
+        items = json.loads(curl(f'https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}',
+                                max_time=15).stdout or b'{}').get('items') or []
+    except (OSError, subprocess.SubprocessError, ValueError):
+        items = []
+    if items:
+        v = items[0].get('volumeInfo') or {}
+        found.append({'title': v.get('title', ''), 'authors': v.get('authors') or [], 'publisher': v.get('publisher', ''),
+                      'published': (v.get('publishedDate') or '')[:10]})
+    found = [f for f in found if f]
+    if not found:
+        return {}
+    first = lambda k: next((f[k] for f in found if f.get(k)), '')
+    return {'title': first('title'), 'authors': max((f.get('authors') or [] for f in found), key=len),
+            'publisher': first('publisher'), 'published': first('published')}
+
+
 def book_metadata(pdf_path):
-    """Author, publisher and year from the ISBN on the first pages, via Open Library; {} when not found."""
+    """Author(s), publisher, publication date and ISBN-13 of a book: the ISBN printed on its first pages
+    (any form, OCR slips repaired), looked up in Open Library, the Library of Congress or Google Books;
+    what is still missing is
+    read from the title and copyright pages by the AI model, and kept only when the PDF shows it (a
+    name's last name, the year). {} when nothing is found."""
     text = subprocess.run(['pdftotext', '-l', '12', pdf_path, '-'], capture_output=True, text=True,
                           timeout=60).stdout
-    candidates = re.findall(r'97[89][-\s]?(?:\d[-\s]?){9}\d', text) + \
-        re.findall(r'ISBN(?:-10)?:?\s*((?:\d[-\s]?){9}[\dX])\b', text)
-    for isbn, hyphenated in isbn13s(candidates):
-        try:
-            data = json.loads(curl(f'https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data',
-                                   max_time=15).stdout or b'{}').get(f'ISBN:{isbn}')
-        except ValueError:
-            data = None
-        if data:
-            year = re.search(r'\d{4}', data.get('publish_date', ''))
-            return {'title': data.get('title', ''), 'authors': [a['name'] for a in data.get('authors', [])],
-                    'publisher': (data.get('publishers') or [{}])[0].get('name', ''),
-                    'published': year.group(0) if year else '', 'isbn': hyphenated}
-    return {}
+    meta, isbns = {}, isbn13s(_isbn_candidates(text))
+    for isbn, hyphenated in isbns:
+        if found := _isbn_lookup(isbn):
+            meta = {**found, 'isbn': hyphenated}
+            break
+    if isbns and not meta:
+        meta = {'isbn': isbns[0][1]}      # a valid ISBN no catalogue knows: still the book's number
+    if not (meta.get('authors') and meta.get('publisher') and meta.get('published')) and text.strip():
+        pages = re.sub(r'[ \t]+', ' ', text)[:15000]
+        ai = ai_json(f"""These are the first pages of a book (title page, copyright page). Return ONLY a JSON object:
+{{"authors": ["First Last", ...], "publisher": "...", "published": "YYYY or YYYY-MM-DD", "isbn": "..."}}
+Rules:
+- authors: the people named as authors (or editors) on the title page, as "First Last"; an organisation only when no person is named
+- published: the publication date of this edition as printed (copyright year or "first published"), not a reprint year
+- isbn: the ISBN of this edition when printed, else ""
+- use "" or [] for anything the pages do not show; never guess
+
+{pages}""", timeout=90)
+        seen = text.lower()
+        authors = [a for a in ai.get('authors') or [] if isinstance(a, str) and a.split()
+                   and a.split()[-1].lower().strip('.,') in seen]
+        published = str(ai.get('published') or '')
+        published = published if re.fullmatch(r'\d{4}(-\d{2}(-\d{2})?)?', published) and published[:4] in text else ''
+        publisher = str(ai.get('publisher') or '')
+        if not meta.get('authors'):
+            meta['authors'] = authors
+        if not meta.get('published'):
+            meta['published'] = published
+        if not meta.get('publisher') and publisher and publisher.split()[0].lower() in seen:
+            meta['publisher'] = publisher
+        if not meta.get('isbn') and (more := isbn13s(_isbn_candidates(f"ISBN {ai.get('isbn') or ''}"))):
+            meta['isbn'] = more[0][1]
+    if not any(meta.get(k) for k in ('authors', 'publisher', 'published', 'isbn')):
+        return {}
+    return {'title': meta.get('title', ''), 'authors': meta.get('authors') or [], 'publisher': meta.get('publisher', ''),
+            'published': meta.get('published', ''), 'isbn': meta.get('isbn', '')}
 
 
 def book_index(pdf_path, structure):
@@ -7181,7 +7368,7 @@ def bookify_note(note, pdf_path, structure=None):
         extra = ['author:\n' + '\n'.join(f'  - {yaml_str(a)}' for a in meta['authors'])] if meta['authors'] and 'author:' not in fm else []
         extra += [frontmatter_field('published', meta['published'])] if meta['published'] and 'published:' not in fm else []
         extra += [frontmatter_field('publication', meta['publisher'])] if meta['publisher'] and 'publication:' not in fm else []
-        extra += [f'isbn: "{meta["isbn"]}"'] if 'isbn:' not in fm else []
+        extra += [f'isbn: "{meta["isbn"]}"'] if meta['isbn'] and 'isbn:' not in fm else []
         if extra:
             fm = re.sub(r'(\ndescription: .*\n)', lambda x: x.group(1) + '\n'.join(e for e in extra if e) + '\n', fm, count=1)
     return fm + top.rstrip('\n') + '\n' + callout + sep + body, structure
@@ -7213,6 +7400,33 @@ def as_book(note, args, source=None, meta=None):
         return bookify_note(note, path, structure)[0], True
 
 
+_ORGANISATION = re.compile(r'\b(?:Company|Co|Corp(?:oration)?|Inc|Ltd|LLC|plc|GmbH|AG|Bank|Trust|Group|'
+                           r'University|Institute|Association|Society|Council|Committee|Agency|Foundation|'
+                           r'Organi[sz]ation|Office|Department|Ministry|Board|Commission|Press)\b\.?', re.I)
+
+
+_ARTICLES = {'the', 'a', 'an', 'de', 'het', 'een', 'le', 'la', 'les', 'der', 'die', 'das', 'el', 'il', 'lo'}
+_LINK_WORDS = _ARTICLES | {'of', 'for', 'and', 'on', 'in', 'with', 'to', 'at', 'by', 'from', 'as', 'into', 'upon', 'or',
+                           'und', 'fur', 'mit', 'zu', 'zur', 'zum', 'von', 'en', 'van', 'voor', 'met', 'te', 'op', 'bij',
+                           'aan', 'du', 'des', 'et', 'pour', 'sur', 'au', 'aux', 'y', 'di', 'del', 'della', 'da', 'per'}
+
+
+def _author_slug(name):
+    """The file-name part for an author: a person's last name, an organisation's first word after any
+    article, and the next one too when that word is short ('Morgan Guaranty Trust Company' -> morgan,
+    'The MIT Press' -> mit-press)."""
+    words = name.split()
+    if not words:
+        return ''
+    if not _ORGANISATION.search(name):
+        return _slug(words[-1])
+    words = [w for w in (_slug(w) for w in words) if w]
+    while len(words) > 1 and words[0] in _ARTICLES:
+        words.pop(0)
+    second = next((w for w in words[1:] if w not in _LINK_WORDS), '')
+    return f'{words[0]}-{second}' if len(words[0]) < 5 and second else words[0]
+
+
 def book_filename(args, note):
     """{first author's last name}-{AI filename from the title} for a book (or a paper without a DOI),
     unless --filename is given."""
@@ -7221,7 +7435,7 @@ def book_filename(args, note):
     title = re.search(r'^title: "(.*)"$', note, re.M)
     author = re.search(r'^author:\n  - "(.*)"$', note, re.M)
     ai_name = generate_filename(title.group(1) if title else '')
-    last = _slug(author.group(1).split()[-1]) if author else ''
+    last = _author_slug(author.group(1)) if author else ''
     return f'{last}-{ai_name}' if last else ai_name
 
 
@@ -7292,7 +7506,7 @@ def paper_filename(args, meta):
     if args.filename:
         return args.filename
     authors   = meta.get('authors', [])
-    last_name = _slug(authors[0].split()[-1]) if authors else ''
+    last_name = _author_slug(authors[0]) if authors else ''
     ai_name   = generate_filename(meta.get('title', ''))
     return f'{last_name}-{ai_name}' if last_name else ai_name
 

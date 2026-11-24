@@ -9,7 +9,7 @@ Works with:
 - **Apple Podcasts** episodes (macOS)
 - **Academic papers**: DOIs (as a link or plain, e.g. `10.17487/RFC6298` or `doi:10.17487/RFC6298`), arXiv, SSRN and Academia.edu links, article links from publishers like ScienceDirect, Wiley and Springer, PubMed, NBER, university repositories and RFCs
 - **PDFs**: any `.pdf` link or a file on your computer
-- **Books**: PDFs with an ISBN and 50+ pages, or 100+ pages with chapters, are saved as books: headings from the PDF's bookmarks and printed table of contents, a linked Contents table with page numbers, the back-of-book index as a nested list, code listings repaired from the PDF, blank pages left out, and author, publisher, year and ISBN-13 from the ISBN. To override the detection, pass `--as doc`, `--as paper` or `--as book`
+- **Books**: PDFs with an ISBN and 50+ pages, or 100+ pages with chapters, are saved as books: headings from the PDF's bookmarks and printed table of contents, a linked Contents table with page numbers, the back-of-book index as a nested list, code listings repaired from the PDF, blank pages left out, and author, publisher, year and ISBN-13: the ISBN is read in any printed form (also with OCR slips like `978 l l 07…`) and looked up in Open Library, the Library of Congress and Google Books, and what is still missing is read from the title and copyright pages by the AI model (kept only when the PDF shows it). Books are named like papers, `{author}-{a few words}` (an organisation's first word when no person is named). To override the detection, pass `--as doc`, `--as paper` or `--as book`
 
 Every note gets an AI summary, tags and an index, and images can be saved locally.
 
@@ -297,7 +297,7 @@ DOWNLOADS_DIR   = ''    # '' = system default; set a path if your browser saves 
 SHADOW_WAIT     = 600   # seconds to wait for the PDF; 0 = no limit (wait until you save it)
 ```
 
-Shadow libraries usually sit behind a browser check (e.g. DDoS-Guard) that scripts can't pass, so defuddle opens the paper's page in your browser and watches your downloads folder: save the PDF there and processing continues on its own. Only a PDF whose first pages show the paper's DOI (or, failing that, its title) is used, so downloads of other papers are skipped and several runs can wait at once. Text is read with `pdftotext` (poppler), PyMuPDF via `uv`, or a raw byte scan as a last resort. The PDF stays in your downloads folder.
+Shadow libraries usually sit behind a browser check (e.g. DDoS-Guard) that scripts can't pass, so defuddle opens the paper's page in your browser and watches your downloads folder: save the PDF there and processing continues on its own. Only a PDF whose first pages show the paper's DOI (or, failing that, its title) is used, so downloads of other papers are skipped and several runs can wait at once. The DOI may be misread by OCR (O for 0, l for 1) or printed only as its part after the prefix (an Elsevier PII), and a title cut off after most of its words still counts. When a PDF is skipped, defuddle prints the command to pass it in by hand with `--doi`, in case it is the paper after all. Text is read with `pdftotext` (poppler), PyMuPDF via `uv`, or a raw byte scan as a last resort. The PDF stays in your downloads folder.
 
 The default downloads folder is `~/Downloads` on macOS, the Downloads known folder on Windows (also when it was moved), and `xdg-user-dir DOWNLOAD` on Linux (falling back to `~/Downloads`). Partial downloads (`.crdownload`, `.part`, `.download`) are ignored until they finish.
 
