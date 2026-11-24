@@ -17,6 +17,7 @@ BROWSER_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
               '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 
 import io
+import functools
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -1984,7 +1985,8 @@ def get_arxiv_latex(arxiv_id, tmp_dir):
             fpath = os.path.join(root, fname)
             try:
                 with open(fpath, 'r', errors='ignore') as f:
-                    if '\\documentclass' in f.read(1000):
+                    # anywhere outside a comment: templates (IEEEtran) open with a long comment block
+                    if re.search(r'^[ \t]*\\documentclass', f.read(), re.M):
                         tex_files.append(fpath)
             except Exception:
                 pass
@@ -2259,8 +2261,75 @@ def _resolve_toggles(content):
                   lambda m: m.group(2) if state.get(m.group(1)) else m.group(3), content)
 
 
+def _unwrap_subfigures(tex):
+    """Commands pandoc drops together with the images in them -> their content: \\subfigure[..]{body} and
+    \\subfloat[..]{body} (the old subfigure/subfig packages), \\scalebox{f}{body} and
+    \\resizebox{w}{h}{body} (only the size changes). The subfigure environment is left to pandoc."""
+    pattern = re.compile(r'\\(?:sub(?:figure|float)(?![a-zA-Z])\s*(?:\[[^\]]*\])?|scalebox\s*\{[^{}]*\}(?:\s*\[[^\]]*\])?|'
+                         r'resizebox\*?\s*\{[^{}]*\}\s*\{[^{}]*\})\s*(?=\{)')
+    pos = 0
+    while m := pattern.search(tex, pos):
+        end = _braced_end(tex, m.end())
+        if end < 0:
+            break
+        tex = tex[:m.start()] + tex[m.end() + 1:end - 1] + tex[end:]
+        pos = m.start()
+    return tex
+
+
+def _ieee_commands(tex):
+    """IEEE template (IEEEtran) commands pandoc doesn't know, as plain LaTeX: \\IEEEraisesectionheading{x}
+    -> x (pandoc drops the \\section in it), \\IEEEPARstart{T}{he} -> The, \\appendices -> \\appendix,
+    \\ifCLASSOPTIONcompsoc a \\else b \\fi -> the branch the \\documentclass options choose (otherwise
+    both stay, e.g. 'Acknowledgments' twice), and a line break in the \\title -> a space."""
+    if 'IEEE' not in tex and '\\ifCLASSOPTION' not in tex:
+        return tex
+    options = {o.strip() for o in (re.search(r'\\documentclass\[([^\]]*)\]', tex) or ['', ''])[1].split(',')}
+    tex = re.sub(r'\\ifCLASSOPTION(\w+)(.*?)(?:\\else\b(.*?))?\\fi\b',
+                 lambda m: m.group(2) if m.group(1) in options else (m.group(3) or ''), tex, flags=re.S)
+    tex = re.sub(r'\\IEEEPARstart\{([^{}]*)\}\{([^{}]*)\}', r'\1\2', tex)
+    tex = re.sub(r'\\appendices\b', r'\\appendix', tex)
+    pattern = re.compile(r'\\IEEEraisesectionheading\s*(?=\{)')
+    while m := pattern.search(tex):
+        end = _braced_end(tex, m.end())
+        if end < 0:
+            break
+        tex = tex[:m.start()] + tex[m.end() + 1:end - 1] + tex[end:]
+    if t := re.search(r'\\title\s*(?=\{)', tex):
+        end = _braced_end(tex, t.end())
+        if end > 0:
+            tex = tex[:t.end()] + re.sub(r'\s*\\\\\s*', ' ', tex[t.end():end]) + tex[end:]
+    return tex
+
+
+def _listing_figures(tex):
+    """A figure that holds program code (lstlisting, \\lstinputlisting, verbatim, minted) and no image ->
+    the code with its caption after it as a paragraph, '**Figure N.** caption': pandoc writes a code
+    block inside a figure as HTML, which the figure clean-up can't keep. A one-cell table around the
+    code (\\begin{tabular}{c}) goes too."""
+    def fix(m):
+        body = m.group(2)
+        if '\\includegraphics' in body or not re.search(r'\\begin\{(?:lstlisting|verbatim|minted)\}|\\lstinputlisting', body):
+            return m.group(0)
+        caption = ''
+        if c := re.search(r'\\caption(?:\[[^\]]*\])?(?=\{)', body):
+            end = _braced_end(body, c.end())
+            if end > 0:
+                caption = body[c.end() + 1:end - 1].strip()
+                body = body[:c.start()] + body[end:]
+        body = re.sub(r'\\label\{[^}]*\}|\\begin\{tabular\}\{[^}]*\}|\\end\{tabular\}', '', body)
+        caption = re.sub(r'^Figure (\d+)\.\s*', r'\\textbf{Figure \1.} ', caption)
+        return body + (f'\n\n{caption}\n\n' if caption else '')
+    return re.sub(r'\\begin\{figure(\*?)\}(?:\[[^\]]*\])?(.*?)\\end\{figure\1\}', fix, tex, flags=re.S)
+
+
 def _preprocess_latex(content):
     """Preprocess LaTeX so pandoc can parse it without choking."""
+    content = _listing_figures(_unwrap_subfigures(_ieee_commands(content)))
+    # Size and alignment environments only change the look; pandoc makes nested ::: blocks of them,
+    # which hide what is inside (a table, the bibliography) from the clean-up after it
+    content = re.sub(r'\\(?:begin|end)\{(?:tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge|'
+                     r'center|flushleft|flushright)\}', '', content)
     # Expand simple \newcommand macros so structural commands like \begin/\end
     # are visible to _collect_labels even when wrapped in paper-specific shorthands.
     content = _expand_simple_macros(content)
@@ -2295,7 +2364,7 @@ def _run_pandoc(pre_path, out_path, cwd, fmt='latex'):
     """Run pandoc -f {fmt} -t markdown. Returns True on success."""
     try:
         result = subprocess.run(
-            ['pandoc', '-f', fmt, '-t', 'markdown', '--wrap=none', '-o', out_path, pre_path],
+            ['pandoc', '-f', fmt, '-t', 'markdown', '--wrap=none', f'--resource-path={cwd}', '-o', out_path, pre_path],
             capture_output=True, cwd=cwd, timeout=60
         )
     except subprocess.TimeoutExpired:
@@ -2331,6 +2400,17 @@ def _parse_newtheorem(content):
     return env_counter, counter_within
 
 
+def _sec_number(sec, level, appendix):
+    """A section number as LaTeX prints it: 2.1, or after \\appendix A, A.1."""
+    parts = [str(n) for n in sec[:level + 1]]
+    if appendix and sec[0]:
+        parts[0] = chr(64 + sec[0]) if sec[0] <= 26 else parts[0]
+    return '.'.join(parts)
+
+
+_APPENDIX_START = re.compile(r'^[ \t]*\\appendi(?:x|ces)\b')
+
+
 def _collect_labels(content, nt_data=None):
     """Scan preprocessed LaTeX and return {label: number_string}.
 
@@ -2349,7 +2429,10 @@ def _collect_labels(content, nt_data=None):
     labels    = {}
     env_stack = []  # list of (canonical_env_name, number_string)
 
+    appendix = False
     for line in content.split('\n'):
+        if _APPENDIX_START.match(line):   # sections are lettered from here: A, A.1
+            appendix, sec[:] = True, [0, 0, 0]
         # ── Section commands ─────────────────────────────────────────────────
         sec_level = None
         for level, cmd in enumerate(['section', 'subsection', 'subsubsection']):
@@ -2392,7 +2475,7 @@ def _collect_labels(content, nt_data=None):
             if env_stack:
                 ctx_num = env_stack[-1][1]
             elif sec_level is not None:
-                ctx_num = '.'.join(str(sec[i]) for i in range(sec_level + 1))
+                ctx_num = _sec_number(sec, sec_level, appendix)
             else:
                 ctx_num = None
             if ctx_num:
@@ -2445,7 +2528,10 @@ def _inject_ref_numbers(content, labels, nt_data=None):
     eq_cnt  = [0]
 
     out_lines = []
+    appendix = False
     for line in content.split('\n'):
+        if _APPENDIX_START.match(line):   # sections are lettered from here: A, A.1
+            appendix, sec[:] = True, [0, 0, 0]
         # ── Section: inject number into title ────────────────────────────────
         sec_injected = False
         for level, cmd in enumerate(['section', 'subsection', 'subsubsection']):
@@ -2459,7 +2545,7 @@ def _inject_ref_numbers(content, labels, nt_data=None):
                         if w == 'section':
                             thm_cnt[c] = 0
                     eq_cnt[0] = 0
-                    n = '.'.join(str(sec[i]) for i in range(level + 1))
+                    n = _sec_number(sec, level, appendix)
                     # Insert number at start of the section title argument
                     insert_pos = m_sec.end()  # position right after '{'
                     line = line[:insert_pos] + n + '. ' + line[insert_pos:]
@@ -2490,6 +2576,156 @@ def _inject_ref_numbers(content, labels, nt_data=None):
     return '\n'.join(out_lines)
 
 
+_FIGURE_LABELS = {}   # figure file as the LaTeX names it -> the text in it (figure_labels), for the note
+
+
+def _clean_label(text):
+    """A label from a .pstex_t \\put: its text without the font and colour commands around it."""
+    text = re.sub(r'\\(?:SetFigFont\{[^}]*\}\{[^}]*\}\{[^}]*\}\{[^}]*\}\{[^}]*\}|color\[[^\]]*\]\{[^}]*\}|smash|makebox'
+                  r'(?:\([^)]*\))?(?:\[[^\]]*\])?)', '', text)
+    maths = re.findall(r'\$[^$]+\$', text)
+    if maths:                  # the label is its formula; braces around it belonged to the font commands
+        return ' '.join(maths)
+    return re.sub(r'\s+', ' ', text.replace('{', '').replace('}', '')).strip(' %')
+
+
+def _pstex_layout(pstex):
+    """An xfig figure's labels with where they are, as lines: the points along its horizontal axis
+    left to right (the axis: a label at the far left, such as the origin 0, and one at the far right,
+    such as the variable y, at one height; labels close to that height lie on it), then the other
+    labels with their place (top right, middle…). From the \\put positions in the .pstex_t."""
+    pic = re.findall(r'\\begin\{picture\}\((\d+),(\d+)\)\((-?\d+),(-?\d+)\)', pstex)
+    if not pic:
+        return []
+    w, h, x0, y0 = map(int, pic[-1])
+    items = []
+    for x, y, body in re.findall(r'\\put\((-?\d+),(-?\d+)\)\{(.*?)\}%?\s*(?=\\put|%|\\end\{picture\}|$)', pstex, re.S):
+        label = _clean_label(body)
+        if label and w and h:
+            items.append(((int(x) - x0) / w, (int(y) - y0) / h, label))
+    if not items:
+        return []
+    axis = next((ly for lx, ly, _ in items if lx <= 0.05
+                 for rx, ry, _ in items if rx >= 0.9 and abs(ry - ly) <= 0.05), None)
+    on_axis = sorted((it for it in items if axis is not None and abs(it[1] - axis) <= 0.15), key=lambda it: it[0])
+    def place(x, y):
+        v = 'bottom' if y < 1 / 3 else 'top' if y > 2 / 3 else 'middle'
+        u = 'left' if x < 1 / 3 else 'right' if x > 2 / 3 else ''
+        return f'{v} {u}'.strip() if u or v != 'middle' else 'centre'
+    rest = [f'{l} ({place(x, y)})' for x, y, l in items if (x, y, l) not in on_axis
+            and not re.fullmatch(r'\$?-?[\d.]+\$?', l)]
+    lines = ['Along the horizontal axis, left to right: ' + ' · '.join(l for _, _, l in on_axis)] if len(on_axis) >= 3 else []
+    if rest:
+        lines.append(('Elsewhere: ' if lines else '') + ' · '.join(rest))
+    if not lines:   # no axis found: every label with its place
+        lines = [' · '.join(f'{l} ({place(x, y)})' for x, y, l in items if not re.fullmatch(r'\$?-?[\d.]+\$?', l))]
+    return [l for l in lines if l]
+
+
+def figure_labels(path, pstex=None):
+    """The text in a figure as lines, for readers that can't see it (Claude, search): the LaTeX labels of
+    an xfig figure (its .pstex_t) with where they are (_pstex_layout), else the text Ghostscript finds
+    in an EPS/PS/PDF figure on one line, keeping only what
+    reads well: legends and labels with a word of three letters or an '=' (axis numbers, and the
+    loose letters that rotated or sub/superscript text breaks into, are left out). [] for bitmaps or when nothing usable is found."""
+    if pstex:
+        return _pstex_layout(pstex)
+    else:
+        gs = shutil.which('gs') or shutil.which('gswin64c')
+        if not gs or not re.search(r'\.(?:e?ps|pdf)$', path, re.I):
+            return []
+        try:
+            text = subprocess.run([gs, '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-sDEVICE=txtwrite', '-sOutputFile=-', path],
+                                  capture_output=True, timeout=60).stdout.decode('utf-8', 'replace')
+        except (OSError, subprocess.SubprocessError):
+            return []
+        labels = [t.strip() for line in text.splitlines() for t in re.split(r'\s{2,}', line)
+                  if re.search(r'[A-Za-z\u0370-\u03ff]{3,}|\S\s*=\s*\S', t) and not re.fullmatch(r'[-−\d.\s,]+', t.strip())]
+    labels = list(dict.fromkeys(labels))
+    return [' · '.join(labels)] if labels else []
+
+
+def figure_text_callout(labels):
+    """The text in a figure as a callout under it: one line as a normal callout, more as a folded one.
+    labels: [(sub-figure label or '', [lines])]."""
+    lines = [(f'{name}: ' if name else '') + line for name, figure in labels for line in figure]
+    if not lines:
+        return ''
+    if len(lines) == 1 and len(lines[0]) <= 160:
+        return f'> [!info] Text in the figure\n> {lines[0]}'
+    return '> [!info]- Text in the figure\n' + '\n'.join(f'> {l}' for l in lines)
+
+
+def _render_pstex(name, source_dir, macros=''):
+    """An xfig figure exported for LaTeX (X.pstex_t: the labels as LaTeX over the drawing X.ps) as a PNG
+    in source_dir, the labels typeset: Ghostscript turns the drawing into a PDF, Tectonic typesets the
+    figure, the PDF is rendered (_rasterize). Without Tectonic only the drawing, unlabelled. Returns the
+    PNG's file name, or None."""
+    gs = shutil.which('gs') or shutil.which('gswin64c')
+    base = os.path.splitext(name)[0]
+    try:
+        with open(os.path.join(source_dir, name), encoding='utf-8', errors='replace') as f:
+            pstex = f.read()
+    except OSError:
+        return None
+    out = os.path.join(source_dir, f'{base}-pstex.png')
+    drawings = re.findall(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', pstex)
+    with tempfile.TemporaryDirectory() as tmp:
+        for d in drawings:
+            src = next((os.path.join(source_dir, d + e) for e in ('', '.ps', '.eps', '.pdf')
+                        if os.path.isfile(os.path.join(source_dir, d + e))), None)
+            if not src:
+                return None
+            if src.endswith('.pdf'):
+                shutil.copy(src, os.path.join(tmp, os.path.basename(src)))
+                continue
+            if not gs:
+                return None
+            pdf = os.path.splitext(os.path.basename(src))[0] + '.pdf'
+            if subprocess.run([gs, '-q', '-dSAFER', '-dBATCH', '-dNOPAUSE', '-dEPSCrop', '-sDEVICE=pdfwrite',
+                               f'-sOutputFile={os.path.join(tmp, pdf)}', src], capture_output=True).returncode:
+                return None
+            pstex = pstex.replace('{' + d + '}', '{' + pdf + '}')
+        if shutil.which('tectonic'):
+            with open(os.path.join(tmp, 'figure.pstex_t'), 'w', encoding='utf-8') as f:
+                f.write(pstex)
+            for extra in ('', macros):          # the paper's own macros only when the labels need them
+                doc = ('\\documentclass[border=2pt]{standalone}\n\\usepackage{graphicx,color,amsmath,amssymb}\n'
+                       + extra + '\n\\begin{document}\n\\input{figure.pstex_t}\n\\end{document}\n')
+                with open(os.path.join(tmp, 'figure.tex'), 'w', encoding='utf-8') as f:
+                    f.write(doc)
+                try:
+                    r = subprocess.run(['tectonic', '-X', 'compile', 'figure.tex'], cwd=tmp, capture_output=True, timeout=600)
+                except subprocess.TimeoutExpired:
+                    break
+                if r.returncode == 0 and _rasterize(os.path.join(tmp, 'figure.pdf'), 'pdf', out):
+                    _FIGURE_LABELS[os.path.basename(out)] = figure_labels(out, pstex)
+                    return os.path.basename(out)
+                if not macros:
+                    break
+        print(f'WARNING: the labels of figure {base} were not typeset (' + ('Tectonic failed' if shutil.which('tectonic')
+              else 'needs Tectonic: brew install tectonic') + '); the drawing is shown without them.', file=sys.stderr)
+        pdfs = [f for f in os.listdir(tmp) if f.endswith('.pdf') and f != 'figure.pdf']
+        if pdfs and _rasterize(os.path.join(tmp, pdfs[0]), 'pdf', out):
+            _FIGURE_LABELS[os.path.basename(out)] = figure_labels(out, pstex)
+            return os.path.basename(out)
+    return None
+
+
+def _render_pstex_figures(tex, source_dir):
+    """\\input{X.pstex_t} (xfig figures with LaTeX labels, which pandoc drops) -> \\includegraphics of the
+    figure rendered as a PNG (_render_pstex)."""
+    if '.pstex_t' not in tex:
+        return tex
+    preamble = tex.split('\\begin{document}', 1)[0]
+    macros = '\n'.join(l for l in preamble.splitlines()
+                        if re.match(r'\s*\\(?:(?:re)?newcommand|DeclareMathOperator|def\\)', l))
+    def sub(m):
+        png = _render_pstex(m.group(2).strip(), source_dir, macros)
+        return m.group(1) + (f'\\includegraphics{{{png}}}' if png else m.group(0)[len(m.group(1)):])
+    return re.sub(r'^([^%\n]*)\\input\{([^}]+\.pstex_t)\}', sub, tex, flags=re.MULTILINE)
+
+
 def latex_to_markdown(tex_path, tmp_dir):
     """Convert LaTeX to Markdown using pandoc (gfm output, markxiv approach)."""
     with open(tex_path, encoding='utf-8', errors='replace') as f:
@@ -2498,6 +2734,7 @@ def latex_to_markdown(tex_path, tmp_dir):
     # sharing info (e.g. \newtheorem{cor}[thm]{Corollary}).
     source_dir = os.path.dirname(tex_path)
     raw = _inline_inputs(raw, source_dir)
+    raw = _render_pstex_figures(raw, source_dir)
     macros = _source_macros(raw, source_dir)
     nt_data = _parse_newtheorem(raw)
     raw, fig_labels = _number_figures(raw)
@@ -2527,9 +2764,16 @@ def latex_to_markdown(tex_path, tmp_dir):
         bbl_path = _find_bbl(names)
         if bbl_path:
             with open(bbl_path, encoding='utf-8', errors='replace') as bf:
-                return bf.read()
+                # pandoc takes \newblock for a command with an argument and drops the {\em Journal} after it
+                return re.sub(r'\\newblock\b\s*', ' ', bf.read())
         return m.group(0)
     preprocessed = re.sub(r'\\bibliography\{([^}]+)\}', _sub_bbl, preprocessed)
+    for name in re.findall(r'^[^%\n]*?\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', preprocessed, re.M):
+        name = name.strip()
+        path = next((os.path.join(source_dir, name + e) for e in ('', '.eps', '.ps', '.pdf')
+                     if os.path.isfile(os.path.join(source_dir, name + e))), None)
+        if name not in _FIGURE_LABELS and path:
+            _FIGURE_LABELS[name] = figure_labels(path)
     pre_path = os.path.join(tmp_dir, 'preprocessed.tex')
     with open(pre_path, 'w', encoding='utf-8') as f:
         f.write(preprocessed)
@@ -2545,7 +2789,18 @@ def latex_to_markdown(tex_path, tmp_dir):
         md = f.read()
     # Strip YAML frontmatter pandoc may emit
     md = re.sub(r'^---\n.*?\n---\n\n?', '', md, count=1, flags=re.DOTALL)
+    md = pandoc_grid_tables(md)
     return _strip_ensuremath(_expand_macros(md, macros)).strip()
+
+
+def pandoc_grid_tables(md):
+    """pandoc's grid tables (written when a cell spans rows) as markdown tables Obsidian shows. A grid
+    table with cells merged across columns stays as it is. The ': caption' under a table is numbered
+    with all the others later (fix_paper_markdown)."""
+    def table(m):
+        pipe = grid_table(m.group(1).rstrip('\n').split('\n'), wrapped=True)
+        return m.group(0) if pipe is None else pipe + '\n'
+    return re.sub(r'^((?:[+|].*[+|][ \t]*\n?)+)', table, md, flags=re.M)
 
 def openalex_free(doi):
     """Free copies of a paper according to OpenAlex: (direct PDF links, page with the free
@@ -3739,13 +3994,70 @@ def fix_list_markers(md):
     return '\n'.join(out)
 
 
+_ROMAN = {'i': 1, 'v': 5, 'x': 10, 'l': 50}
+
+
+def _roman(s):
+    """The value of a lower-case Roman numeral up to l (50), or 0 when it isn't one."""
+    if not re.fullmatch(r'l?x{0,3}(?:ix|iv|v?i{0,3})', s or '') or not s:
+        return 0
+    vals = [_ROMAN[c] for c in s]
+    return sum(-v if i + 1 < len(vals) and v < vals[i + 1] else v for i, v in enumerate(vals))
+
+
+def label_lists(md):
+    """Paragraphs labelled (i), (ii), (iii)… or (a), (b), (c)… or i., ii., iii.… (pandoc writes LaTeX's
+    enumerate[(i)] like that; Obsidian doesn't see a list in it) as list items that keep their label:
+    '- (i) …'. Only a run of at least two labels in sequence that starts at (i) or (a), with no heading
+    in between, counts; (i) is a Roman one or the letter after (h) depending on its neighbours. Code
+    blocks are left alone."""
+    lines = md.split('\n')
+    marker = re.compile(r'^(\(([a-z]|[ivxl]{1,6})\)|([ivxl]{1,6})\.)(?:[ \t]+(?=\S)|[ \t]*$)')   # text may follow on the next line
+    cands, fence = [], False                     # (line index, label, style)
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(('```', '~~~')):
+            fence = not fence
+        elif fence:
+            continue
+        elif line.startswith('#'):
+            cands.append((i, None, None))        # a heading ends a run
+        elif (m := marker.match(line)) and (i == 0 or not lines[i - 1].strip()):
+            cands.append((i, m.group(2) or m.group(3), 'paren' if m.group(2) else 'dot'))
+    def follows(a, b, roman):
+        if roman:
+            return _roman(b) == _roman(a) + 1 > 1
+        return len(a) == len(b) == 1 and ord(b) == ord(a) + 1
+    k = 0
+    while k < len(cands):
+        i, label, style = cands[k]
+        if label in ('i', 'a'):
+            for roman in ((True, False) if label == 'i' else (False,)):
+                run = [cands[k]]
+                for nxt in cands[k + 1:]:
+                    if nxt[1] is None or nxt[2] != style or not follows(run[-1][1], nxt[1], roman):
+                        break
+                    run.append(nxt)
+                if len(run) >= 2:
+                    for j, _, _ in run:
+                        lines[j] = '- ' + lines[j]
+                    k += len(run) - 1
+                    break
+        k += 1
+    return '\n'.join(lines)
+
+
 def drop_empty_quotes(md):
-    """Remove blockquotes with nothing in them but line breaks ('> \\', '>'), which pandoc makes of
-    LaTeX's \\\\ in an empty quote or centre block. Code blocks are left alone."""
-    parts = re.split(r'(^```.*?^```[ \t]*$)', md, flags=re.S | re.M)
+    """Remove blocks with nothing in them but line breaks: quotes of '> \\' or '>' lines and paragraphs
+    of bare '\\' lines, which pandoc makes of LaTeX's \\\\ (in an empty quote or centre block, or left
+    behind when a keywords line is taken out). Code blocks and $$ formula blocks are left alone."""
+    parts = re.split(r'(^```.*?^```[ \t]*$|^\$\$.*?^\$\$[ \t]*$)', md, flags=re.S | re.M)
     for i in range(0, len(parts), 2):
-        parts[i] = re.sub(r'(?:^>[ \t]*\\?[ \t]*\n)+(?:\n|\Z)', lambda m: '' if m.start() else m.group(0),
-                          parts[i], flags=re.M)
+        paras = re.split(r'(\n[ \t]*\n)', parts[i])
+        for j in range(0, len(paras), 2):
+            lines = paras[j].strip('\n').split('\n')
+            if paras[j].strip() and all(re.fullmatch(r'[ \t]*(?:>[ \t]*)?\\?[ \t]*', l) for l in lines):
+                paras[j] = ''
+        parts[i] = re.sub(r'\n{3,}', '\n\n', ''.join(paras))
     return ''.join(parts)
 
 
@@ -4459,7 +4771,10 @@ def fix_paper_markdown(md, latex=False):
         caps = [_caption_text(c) for c in re.findall(r'<figcaption>(.*?)</figcaption>', block, re.DOTALL)]
         captions = [_caption_md(c) for c in ([c for c in caps if re.match(r'Figure \d+\.', c)] or caps[-1:])]
         images = '\n'.join(f'![]({s})' for s in srcs)
-        return '\n' + '\n\n'.join(x for x in [images, *captions] if x) + '\n'
+        found = [s for s in srcs if _FIGURE_LABELS.get(s.strip())]
+        text = figure_text_callout([(f'({chr(97 + srcs.index(s))})' if len(srcs) > 1 else '', _FIGURE_LABELS[s.strip()])
+                                    for s in found]) if latex else ''
+        return '\n' + '\n\n'.join(x for x in [images, *captions, text] if x) + '\n'
     md = re.sub(r'<figure[^>]*>.*?</figure>', _figure_to_md, md, flags=re.DOTALL)
     if latex:
         md = re.sub(r'^!\[(.+)\]\(([^)\n]+)\)(?:\{[^}\n]*\})?[ \t]*$',
@@ -4550,7 +4865,8 @@ def fix_paper_markdown(md, latex=False):
                     j -= 1
                 if j >= 0 and result[j].lstrip().startswith('|'):
                     table_n += 1
-                    result.append(f'Table {table_n}: {m.group(1)}')
+                    text = re.sub(r'\s*\{#[^}]*\}\s*$', '', m.group(1))   # pandoc's {#tab:label}
+                    result.append(f'**Table {table_n}.** {text}')
                     continue
             result.append(line)
         return '\n'.join(result)
@@ -4723,12 +5039,23 @@ _HTML_TAG = re.compile(r'</?[a-zA-Z!][^<>]*>')
 
 
 def _strip_html_preserve_math(text):
-    """Strip HTML tags while leaving $...$ and $$...$$ content untouched."""
+    """Strip HTML tags while leaving $...$ and $$...$$ content, code blocks and `inline code` untouched
+    (#include <mpfr.h>, vector<int> are code, not tags)."""
     result = []
     i = 0
     while i < len(text):
+        # Preserve ``` code blocks (to the closing fence line) and `inline code`
+        if text.startswith('```', i) and (i == 0 or text[i - 1] == '\n'):
+            close = text.find('\n```', i + 3)
+            end = text.find('\n', close + 4) if close != -1 else -1
+            end = len(text) if end == -1 else end
+            result.append(text[i:end])
+            i = end
+        elif text[i] == '`' and (end := text.find('`', i + 1)) != -1 and '\n' not in text[i:end]:
+            result.append(text[i:end + 1])
+            i = end + 1
         # Preserve $$...$$
-        if text[i:i+2] == '$$':
+        elif text[i:i+2] == '$$':
             end = text.find('$$', i + 2)
             if end == -1:
                 result.append(text[i:])
@@ -4806,50 +5133,78 @@ def _rfc_render(text, number, headings, refs, code=False):
     return ''.join(out)
 
 
-def _rfc_grid_table(lines):
-    """A +---+ grid table drawn in an RFC as a markdown table, or None when it isn't one, has
-    one column or has merged cells. The header is the part above the first inner border, its lines joined (else line
-    one). Below it each line is a row; a line with an empty first cell continues the row above,
-    empty lines are dropped."""
+def grid_table(lines, wrapped=False, escape=None):
+    """A +---+ grid table as a markdown table, or None when it isn't one, has one column or has cells
+    merged across columns. Two kinds:
+    - drawn in text, as in RFCs (wrapped=False): each line is a row, a line with an empty first cell
+      continues the row above, and the header is the part above the first inner border, its lines
+      joined (else line one); rows drawn a bit off are split on '|'
+    - pandoc's grid tables (wrapped=True): the lines between two borders are one row with wrapped
+      cells, the header ends at the '+===+' line, which also gives the alignment, and a cell merged
+      across rows (a partial border '|    +----+', most columns split) stays in its first row, the rows
+      below empty; a border through a few columns only ('+----+    |') joins their lines into one row
+    Empty rows are dropped; escape(cell) prepares the text of a cell (RFC prose needs its markdown
+    characters escaped)."""
     indent = min(len(l) - len(l.lstrip()) for l in lines)
     lines = [l[indent:].rstrip() for l in lines]
-    border = re.compile(r'\+(?:[-=]+\+)+')
-    if not (border.fullmatch(lines[0]) and border.fullmatch(lines[-1])):
+    full = re.compile(r'\+(?:[-=:]+\+)+')
+    if not (full.fullmatch(lines[0]) and full.fullmatch(lines[-1])):
         return None
     cols = [i for i, c in enumerate(lines[0]) if c == '+']
     if len(cols) < 3:
         return None            # one column: a box with text laid out inside, not a table
-    sections, cells = [], []   # the lines between borders, as cells
+    sections, cells, head_end, align = [], [], None, None   # the lines between borders, as cells
     for l in lines[1:]:
-        if border.fullmatch(l):
-            if [i for i, c in enumerate(l) if c == '+'] != cols:
+        split = wrapped and not full.fullmatch(l) and '-' in l and re.fullmatch(r'[+|][-=: +|]*', l)
+        if split:              # a border through some columns only: the others span both rows
+            if [i for i, c in enumerate(l) if c in '+|'] != cols:
+                return None
+            segments = [l[a + 1:b] for a, b in zip(cols, cols[1:])]
+            if sum('-' in g for g in segments) * 2 < len(segments):
+                continue       # most columns go on: one row, its split cells joined (a two-line header)
+        if full.fullmatch(l) or split:
+            if [i for i, c in enumerate(l) if c in '+|'] != cols:
                 return None
             sections.append(cells)
             cells = []
+            if '=' in l:       # pandoc's header separator: alignment per column
+                head_end = len(sections)
+                align = [(':' if l[a + 1] == ':' else '') + '---' + (':' if l[b - 1] == ':' else '')
+                         for a, b in zip(cols, cols[1:])]
         elif len(l) == cols[-1] + 1 and all(l[i] == '|' for i in cols):
             cells.append([re.sub(r'\s+', ' ', l[a + 1:b]).strip() for a, b in zip(cols, cols[1:])])
-        elif l.startswith('|') and l.endswith('|') and l.count('|') == len(cols):   # a row drawn a bit off
-            cells.append([re.sub(r'\s+', ' ', c).strip() for c in l[1:-1].split('|')])
+        elif not wrapped and l.startswith('|') and l.endswith('|') and l.count('|') == len(cols):
+            cells.append([re.sub(r'\s+', ' ', c).strip() for c in l[1:-1].split('|')])   # a row drawn a bit off
         else:
-            return None
-    sections = [[c for c in sec if any(c)] for sec in sections]
-    sections = [sec for sec in sections if sec]
-    if not sections:
-        return None
-    head = None
-    if len(sections) > 1:
-        head = [' '.join(c for c in col if c) for col in zip(*sections.pop(0))]
-    body = []
-    for c in (c for sec in sections for c in sec):
-        if body and not c[0]:
-            body[-1] = [x + y if re.search(r'\w-$', x) and y else f'{x} {y}'.strip()   # "client-" "formatted"
-                        for x, y in zip(body[-1], c)]
-        else:
-            body.append(c)
+            return None        # a cell spanning columns
+    join = lambda a, b: [x + y if re.search(r'\w-$', x) and y else f'{x} {y}'.strip()   # "client-" "formatted"
+                         for x, y in zip(a, b)]
+    def rows(section):         # the rows of a section, its lines joined as each kind needs
+        section = [c for c in section if any(c)]
+        if wrapped:
+            return [functools.reduce(join, section)] if section else []
+        out = []
+        for c in section:
+            out = out[:-1] + [join(out[-1], c)] if out and not c[0] else out + [c]
+        return out
+    if head_end is None and not wrapped:
+        sections = [sec for sec in sections if any(any(c) for c in sec)]
+        head_end = 1 if len(sections) > 1 else None
+        if head_end:           # RFC header lines are joined, also when the first cell is empty
+            sections[0] = [functools.reduce(join, [c for c in sections[0] if any(c)])]
+    head = [r for sec in sections[:head_end or 0] for r in rows(sec)]
+    body = [r for sec in sections[head_end or 0:] for r in rows(sec)]
+    head = functools.reduce(join, head) if head else (body.pop(0) if body else None)
     if head is None:
-        head, body = body[0], body[1:]
-    row = lambda cells: '| ' + ' | '.join(_rfc_md_escape(c).replace('|', '\\|') for c in cells) + ' |'
-    return '\n'.join([row(head), '|' + '---|' * len(head)] + [row(r) for r in body])
+        return None
+    esc = escape or (lambda c: c)
+    row = lambda cells: '| ' + ' | '.join(esc(c).replace('|', '\\|') for c in cells) + ' |'
+    return '\n'.join([row(head), '|' + '|'.join(align or ['---'] * len(head)) + '|'] + [row(r) for r in body])
+
+
+def _rfc_grid_table(lines):
+    """A +---+ grid table drawn in an RFC as a markdown table (grid_table), its text escaped."""
+    return grid_table(lines, escape=_rfc_md_escape)
 
 
 def _rfc_text_markdown(page, number):
@@ -5275,12 +5630,15 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
     authors = meta.get('authors', [])
     ai_desc, _, ai_tags, _ = ai_enrich(title, ', '.join(authors[:3]), gemini_context)
 
-    # Replace citation keys with numbers from .bbl (e.g. [GWW] → [4], [Wu11 Thm 1] → [16, Thm 1])
+    # Replace citation keys with numbers from .bbl (e.g. [GWW] → [4], [Wu11 Thm 1] → [16, Thm 1],
+    # [anthony1998mean, larsen2007diffusion] → [3, 24]: every key of a list, not just the first)
     if bbl_key_map:
         _keys_pat = '|'.join(re.escape(k) for k in sorted(bbl_key_map, key=len, reverse=True))
         def _replace_cite(m):
             key, rest = m.group(1), m.group(2) or ''
             num = bbl_key_map.get(key)
+            rest = re.sub(r'(,\s*)(' + _keys_pat + r')(?=\s*(?:,|$))',
+                          lambda r: f'{r.group(1)}{bbl_key_map[r.group(2)]}', rest)
             return f'[{num}{rest}]' if num else m.group(0)
         content = re.sub(r'\[(' + _keys_pat + r')([\s,][^\]]+)?\]', _replace_cite, content)
 
@@ -5878,8 +6236,11 @@ def _find_image(images_dict, src):
         return images_dict[min(same_name, key=len)]
     order = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.pdf', '.eps', '.ps']
     rank = lambda k: order.index(os.path.splitext(k)[1].lower()) if os.path.splitext(k)[1].lower() in order else len(order)
+    stem = os.path.splitext(name)[0].lower()
     for match in (lambda k: os.path.splitext(k)[0] == ref,
-                  lambda k: os.path.splitext(os.path.basename(k))[0] == name):
+                  lambda k: os.path.splitext(os.path.basename(k))[0] == name,
+                  # LaTeX on Windows and macOS ignores case: \includegraphics{kurtosis} finds kurtosis.PNG
+                  lambda k: os.path.splitext(os.path.basename(k))[0].lower() in (name.lower(), stem)):
         hits = [k for k in images_dict if match(k)]
         if hits:
             return images_dict[min(hits, key=rank)]
@@ -7560,7 +7921,7 @@ def save_note(note, args, subdir, filename, images_dict=None, source_url=None, f
         note = download_images(note, save_dir, filename, images_dict=images_dict, source_url=source_url)
     if finish:
         note = finish(note, save_dir, filename)
-    note = drop_empty_quotes(fix_reference_list(_dedup_note_tags(note)))
+    note = label_lists(drop_empty_quotes(fix_reference_list(_dedup_note_tags(note))))
     with open(os.path.join(save_dir, f'{filename}.md'), 'w', encoding='utf-8') as f:
         f.write(note)
     print(f'Saved to {format_saved_path(args.category, args.project, subdir, filename)}')
