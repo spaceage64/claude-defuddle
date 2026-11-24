@@ -120,6 +120,9 @@ IMAGE_JOBS    = 6
 PDF_PROCESSOR = 'local_first'
 # ║  MARKER_PRECISE: False = normal (quick, but inline math can break).          ║
 # ║  True = precise: full-page OCR, inline math re-read by the LLM (slower).     ║
+# ║  'auto' = precise, except for a PDF that clearly has no math (no formula     ║
+# ║  fonts or math characters, a native text layer): there quick mode, which     ║
+# ║  is faster and keeps code as printed.                                        ║
 MARKER_PRECISE = False
 # ║  marker's load on the Mac: MARKER_NICE = CPU priority (0 normal – 19 lowest, ║
 # ║  so other work goes first); MARKER_THREADS = CPU threads per marker run      ║
@@ -2729,9 +2732,15 @@ def _pdf_to_markdown(pdf_path, convert_path):
             print(f'Datalab error: {e}', file=sys.stderr)
         return None
 
-    def _try_local(precise=MARKER_PRECISE):
+    def _try_local(precise=None):
         if not shutil.which('marker_single'):
             return None
+        if precise is None:
+            precise = MARKER_PRECISE
+            if MARKER_PRECISE == 'auto':
+                precise, why = _pdf_needs_precise(convert_path)
+                print(f'marker: {"full-page OCR" if precise else "quick mode"} ({why})', file=sys.stderr)
+        used['precise'] = precise
         _MARKER_LLM = {   # service, API key flag, model flag
             'gemini': ('marker.services.gemini.GoogleGeminiService', '--gemini_api_key', '--gemini_model_name'),
             'openai': ('marker.services.openai.OpenAIService',       '--openai_api_key', '--openai_model'),
@@ -2778,6 +2787,8 @@ def _pdf_to_markdown(pdf_path, convert_path):
                         pass
             return markdown, images_dict, 'marker'
 
+    used = {'precise': False}   # the mode the last local marker run used
+
     def _convert():
         return _convert_with_processor(_try_local, _try_datalab)
 
@@ -2789,7 +2800,7 @@ def _pdf_to_markdown(pdf_path, convert_path):
             # Try another route instead of the same one again: what trips up one usually converts with
             # another (e.g. full-page OCR losing every page after a merged-in cover page)
             others = []
-            if result[2] == 'marker' and MARKER_PRECISE:
+            if result[2] == 'marker' and used['precise']:
                 others.append(('local marker without full-page OCR', lambda: _try_local(precise=False)))
             if result[2] == 'marker' and PDF_PROCESSOR != 'local':
                 others.append(('Datalab', _try_datalab))
@@ -3035,6 +3046,67 @@ def _number_ranges(nums):
         out.append(f'({nums[i]})' if i == j else f'({nums[i]})–({nums[j]})')
         i = j + 1
     return ', '.join(out)
+
+# Fonts that set formulas (TeX's CMMI/CMSY/MSBM…, Latin Modern Math, Word's Cambria Math, publishers'
+# AdvMT/MTMI/TeX-…MI sets, Symbol), OCR text layers, and font names that say nothing (AdvP4C4E46, F1, T3)
+_MATH_FONT = re.compile(r'CM(?:MI|SY|EX|BSY|MIB)\d|MSBM|MSAM|EU[FSRX]M|RSFS|Math|_(?:MI|SY|EX)$|TeX-\w*(?:MI|SY|EX)\b'
+                        r'|AdvMT|AdvPi|MT(?:MI|SY|EX)|Euclid|STIX|XITS|Asana|Symbol', re.I)
+_OCR_FONT = re.compile(r'OCR|GlyphLess|Tesseract', re.I)
+_OPAQUE_FONT = re.compile(r'AdvP[0-9A-F]{4,}|[A-Z]{1,2}\d+(?:_\d+)?$|Type3', re.I)
+_MATH_CHARS = re.compile('[\u0391-\u03a9\u03b1-\u03c9\u2200-\u22ff\u221a\u221e]')
+
+
+def _pdf_scanned_share(path):
+    """Share of the pages whose images together cover most of the page (a scan, perhaps cut into
+    strips, perhaps with an invisible text layer on top as on JSTOR), from pdfimages' sizes and
+    resolutions."""
+    try:
+        info = subprocess.run(['pdfinfo', path], capture_output=True, text=True, timeout=60).stdout
+        w, h = map(float, re.search(r'^Page size:\s+([\d.]+) x ([\d.]+)', info, re.M).groups())
+        pages = int(re.search(r'^Pages:\s+(\d+)', info, re.M).group(1))
+        rows = subprocess.run(['pdfimages', '-list', path], capture_output=True, text=True, timeout=120).stdout.splitlines()[2:]
+    except (OSError, subprocess.SubprocessError, AttributeError, ValueError):
+        return 0.0
+    covered = {}   # page -> area its images cover, in points²
+    for r in rows:
+        c = r.split()
+        try:
+            page, iw, ih, xppi, yppi = int(c[0]), int(c[3]), int(c[4]), float(c[12]), float(c[13])
+        except (IndexError, ValueError):
+            continue
+        if xppi and yppi:
+            covered[page] = covered.get(page, 0) + (iw / xppi * 72) * (ih / yppi * 72)
+    return sum(a >= 0.6 * w * h for a in covered.values()) / pages if pages else 0.0
+
+
+def _pdf_needs_precise(path):
+    """Whether marker should read this PDF with full-page OCR (MARKER_PRECISE = 'auto'), and why.
+    Full-page OCR is what lets marker find inline math (it re-reads only lines OCR marked as math),
+    but it costs time and can garble code. So only a PDF that clearly has no math gets the quick
+    mode: a native text layer (not a scan), no formula fonts, no math characters, no fonts that hide
+    their names."""
+    try:
+        fonts = subprocess.run(['pdffonts', path], capture_output=True, text=True, timeout=60).stdout.splitlines()[2:]
+        text = subprocess.run(['pdftotext', path, '-'], capture_output=True, text=True, timeout=120).stdout
+        pages = int(re.search(r'^Pages:\s+(\d+)', subprocess.run(['pdfinfo', path], capture_output=True, text=True,
+                                                                  timeout=60).stdout, re.M).group(1))
+    except (OSError, subprocess.SubprocessError, AttributeError, ValueError):
+        return True, 'PDF could not be checked'
+    names = [re.sub(r'^[A-Z]{6}\+', '', f.split()[0]) for f in fonts if f.split()]
+    if len(text.split()) < 50 * pages:
+        return True, 'little or no text layer'
+    if _pdf_scanned_share(path) >= 0.5:
+        return True, 'scanned pages (an image per page under the text)'
+    if any(_OCR_FONT.search(n) for n in names):
+        return True, 'text layer from an earlier OCR'
+    if (math := sorted({n for n in names if _MATH_FONT.search(n)})):
+        return True, f'formula fonts ({", ".join(math[:3])})'
+    if len(_MATH_CHARS.findall(text)) >= 0.5 * pages:
+        return True, 'math characters in the text'
+    if any(_OPAQUE_FONT.fullmatch(n) or _OPAQUE_FONT.match(n) for n in names):
+        return True, 'font names that hide what they are'
+    return False, 'no math found, native text layer'
+
 
 def _pdf_text_words(path):
     """Word count of a PDF's text layer (pdftotext), or None when it has none or pdftotext is missing."""
