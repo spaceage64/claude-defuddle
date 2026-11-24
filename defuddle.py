@@ -1868,7 +1868,7 @@ def _clean_author(name):
 def _crossref_text(text):
     """A Crossref title without its markup: <i>, <b>, <sub>, <sup>, <scp>, MathML and the like, with
     the space Crossref leaves before a small-caps part (C <scp>oz</scp> -> Coz)."""
-    text = re.sub(r'(?<=\b[A-Z]) +(?=<scp>)', '', text or '')
+    text = re.sub(r'(?<=\b[A-Z])\s+(?=<scp>)', '', text or '')   # also a line break and indent before it
     text = html.unescape(re.sub(r'<[^>]+>', '', text))
     return re.sub(r'\s+', ' ', text).strip()
 
@@ -1885,10 +1885,12 @@ _TITLE_ABBREVIATIONS = {'ARMA', 'ARIMA', 'GARCH', 'ARCH', 'VAR', 'VAR(1)', 'VWAP
 
 
 def title_case(title):
-    """A title written entirely in capitals ('OPTIMAL MEAN REVERSION TRADING WITH TRANSACTION COSTS') in
-    title case ('Optimal Mean Reversion Trading with Transaction Costs'); any other title unchanged."""
+    """A title written entirely in capitals ('OPTIMAL MEAN REVERSION TRADING WITH TRANSACTION COSTS') or in
+    lower case (Crossref subtitles) in title case ('Optimal Mean Reversion Trading with Transaction
+    Costs'); any other title unchanged."""
     letters = [c for c in title if c.isalpha()]
-    if len(letters) < 8 or sum(c.isupper() for c in letters) < 0.9 * len(letters):
+    lower = len(letters) >= 8 and sum(c.islower() for c in letters) == len(letters)   # all lower case (a subtitle)
+    if not lower and (len(letters) < 8 or sum(c.isupper() for c in letters) < 0.9 * len(letters)):
         return title
     if len([w for w in re.findall(r'[A-Za-z]{4,}', title) if w.upper() not in _TITLE_ABBREVIATIONS]) < 2:
         return title      # mostly codes and numbers (DIN EN ISO 3166-1:2007): not a sentence
@@ -1922,6 +1924,10 @@ def get_paper_metadata(doi):
         data = json.loads(result.stdout.decode('utf-8', errors='replace'))
         work = data.get('message', {})
         title = title_case(_crossref_text(' '.join(work.get('title', ['']))))
+        # Crossref keeps a subtitle apart ('Coz' + 'finding code that counts with causal profiling')
+        subtitle = title_case(_crossref_text(' '.join(work.get('subtitle') or [])))
+        if subtitle and subtitle.lower() not in title.lower():
+            title = f'{title.rstrip(":")}{"" if title.endswith(("?", "!")) else ":"} {subtitle}'
         title = re.sub('[\u2010\u2011]', '-', title)   # Crossref's Unicode hyphens
         title = ieee_symbols(title)                      # IEEE titles: 'The /spl phi/ accrual…'
         authors = []
