@@ -3129,6 +3129,14 @@ def _pdf_matches(text, doi, title):
     least = max(6, -(-len(words) * 3 // 5))   # a cut-off title: its first 60% of words, at least 6
     return any(_title_words_in(' '.join(words[:k]), text) for k in range(len(words) - 1, least - 1, -1))
 
+def _known_site(url):
+    """' (arxiv.org)' or ' (rfc-editor.org)' for a page on one of those open archives, for progress
+    messages; '' for any other site, whose name the messages leave out."""
+    host = urlparse(url or '').netloc.lower().removeprefix('www.')
+    site = next((s for s in ('arxiv.org', 'rfc-editor.org') if host == s or host.endswith('.' + s)), '')
+    return f' ({site})' if site else ''
+
+
 def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
     """Open the shadow library page (or another page: url, label) in the browser and wait for the user to save the PDF.
 
@@ -5735,7 +5743,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 # free page in the browser (publishers like ams.org block scripts)
                 free_pdfs, free_page = openalex_free(doi)
                 for link in free_pdfs:
-                    print('Trying a free copy...', file=sys.stderr)
+                    print(f'Trying a free copy{_known_site(link)}...', file=sys.stderr)
                     pdf_path = _download_pdf(link, tmp_dir)
                     if pdf_path:
                         break
@@ -5747,7 +5755,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 if not free_page or free_page.lower().rstrip('/') != landing.lower():
                     pages.append((landing, meta.get('type') not in _ARTICLE_TYPES))
                 for page, allow_self in pages if not pdf_path else []:
-                    print('Looking for the full text as a web page...', file=sys.stderr)
+                    print(f'Looking for the full text as a web page{_known_site(page)}...', file=sys.stderr)
                     web = fulltext_from_page(page, allow_self)
                     if web:
                         print(f'Full text found as a web page: {web["url"]}', file=sys.stderr)
