@@ -2900,10 +2900,12 @@ def latex_to_markdown(tex_path, tmp_dir):
         bbl_path = _find_bbl(names)
         if bbl_path:
             with open(bbl_path, encoding='utf-8', errors='replace') as bf:
-                # pandoc takes \newblock for a command with an argument and drops the {\em Journal} after it
-                return re.sub(r'\\newblock\b\s*', ' ', bf.read())
+                return bf.read()
         return m.group(0)
     preprocessed = re.sub(r'\\bibliography\{([^}]+)\}', _sub_bbl, preprocessed)
+    # pandoc takes \newblock for a command with an argument and drops the {\em Journal} after it
+    # (in a .bbl and in a thebibliography written in the .tex itself)
+    preprocessed = re.sub(r'\\newblock\b\s*', ' ', preprocessed)
     for name in re.findall(r'^[^%\n]*?\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', preprocessed, re.M):
         name = name.strip()
         path = next((os.path.join(source_dir, name + e) for e in ('', '.eps', '.ps', '.pdf')
@@ -5238,6 +5240,7 @@ def _fix_paper_structure(content, title='', authors=None, ai_paragraphs=False):
 
 
 _HTML_TAG = re.compile(r'</?[a-zA-Z!][^<>]*>')
+_AUTOLINK = re.compile(r'<(?:https?|ftp)://[^\s<>]+>|<mailto:[^\s<>]+>')
 
 
 def _strip_html_preserve_math(text):
@@ -5272,6 +5275,10 @@ def _strip_html_preserve_math(text):
                 break
             result.append(text[i:end + 1])
             i = end + 1
+        # Keep autolinks (pandoc writes \url{…} as <http://…>)
+        elif text[i] == '<' and (link := _AUTOLINK.match(text, i)):
+            result.append(link.group())
+            i = link.end()
         # Strip HTML tags (a real tag only: "<90% error ... >1000" is text)
         elif text[i] == '<' and (tag := _HTML_TAG.match(text, i)):
             i = tag.end()
