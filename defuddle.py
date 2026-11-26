@@ -18,6 +18,7 @@ BROWSER_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
 
 import io
 import functools
+import threading
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -3144,7 +3145,7 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
     folder = downloads_dir()
     if not os.path.isdir(folder):
         print(f'Downloads folder not found: {folder} (set DOWNLOADS_DIR).', file=sys.stderr)
-        print(f'Download the PDF manually and pass the local file to defuddle: {url}', file=sys.stderr)
+        print(f'Download the PDF for DOI {doi} manually and pass the local file to defuddle.', file=sys.stderr)
         return None
     start  = time.time()
     since  = min(start, float(os.environ.get('DEFUDDLE_BATCH_START') or start))
@@ -3166,9 +3167,11 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
             _set_pdf_name(name)
             return path
     limit  = f'{SHADOW_WAIT // 60} min' if SHADOW_WAIT >= 120 else f'{SHADOW_WAIT} s'
-    print(f'Opening {label} in your browser: {url}', file=sys.stderr)
-    print(f'Save the PDF to {folder} — ' + (f'waiting up to {limit}...' if SHADOW_WAIT else
-          'waiting until it appears (no time limit)...'), file=sys.stderr, flush=True)
+    # The DOI, not the page's address: the address is only for the browser (run_batch sums these lines up)
+    home = os.path.expanduser('~')
+    shown = '~' + folder[len(home):] if folder.startswith(home + os.sep) else folder
+    print(f'Browser opened for DOI {doi} — save the PDF to {shown}; ' + (f'waiting up to {limit}...'
+          if SHADOW_WAIT else 'waiting until it appears...'), file=sys.stderr, flush=True)
     try:
         webbrowser.open(url)
     except Exception:
@@ -7340,6 +7343,7 @@ def run_batch(urls, argv, per_link=None):
     env = {**os.environ, 'DEFUDDLE_SLOTS': str(max(1, PARALLEL_JOBS)), 'DEFUDDLE_SLOT_DIR': slot_dir,
            'DEFUDDLE_BATCH_START': str(time.time())}
 
+    opened, lock = [], threading.Lock()   # DOIs whose page a link opened in the browser
     def one(n, url):
         with tempfile.TemporaryFile('w+', encoding='utf-8') as out:
             own = [x for opt, vals in per_link.items() if vals and (v := vals[n - 1 if len(vals) > 1 else 0])
@@ -7349,6 +7353,13 @@ def run_batch(urls, argv, per_link=None):
             assert p.stderr   # set by stderr=PIPE
             for line in p.stderr:
                 print(f'[{n}] {line}', end='', file=sys.stderr, flush=True)
+                if m := re.match(r'Browser opened for DOI (\S+)', line):
+                    with lock:   # one line with every page opened so far, for whoever relays it
+                        opened.append(m.group(1))
+                        k = len(opened)
+                        print(f'Browser: {k} page{"s" if k > 1 else ""} opened, for DOI{"s" if k > 1 else ""} '
+                              f'{", ".join(opened)} — save the PDF{"s" if k > 1 else ""} to your Downloads folder.',
+                              file=sys.stderr, flush=True)
             p.wait()
             out.seek(0)
             return p.returncode, out.read()
