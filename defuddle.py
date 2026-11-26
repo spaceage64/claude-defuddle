@@ -3006,6 +3006,25 @@ print(json.dumps(found))
 '''
 
 
+def _split_side_by_side(tex):
+    """A figure block holding several figures side by side, each in a minipage with its own caption ->
+    one figure block per minipage, so each keeps its image and caption (pandoc keeps only one caption
+    per block). Captions of sub-figures, algorithms or tables inside the block don't count."""
+    def split(m):
+        block, star = m.group(0), m.group(1)
+        if len(_figure_numbers(block)) < 2:
+            return block
+        parts = list(re.finditer(r'\\begin\{minipage\}.*?\\end\{minipage\}', block, re.S))
+        if len(parts) < 2 or not all(len(_figure_numbers(p.group(0))) == 1 for p in parts):
+            return block
+        if len(_figure_numbers(block)) != len(parts):
+            return block                                     # a caption outside the minipages too
+        head = re.match(r'\\begin\{figure\*?\}(\[[^\]]*\])?', block).group(0)
+        inner = lambda p: re.sub(r'^\\begin\{minipage\}(?:\[[^\]]*\])*(?:\{[^{}]*\})?|\\end\{minipage\}$', '', p.group(0))
+        return '\n'.join(f'{head}\n\\centering{inner(p)}\n\\end{{figure{star}}}' for p in parts)
+    return re.sub(r'\\begin\{figure(\*?)\}.*?\\end\{figure\1\}', split, tex, flags=re.DOTALL)
+
+
 def _figure_numbers(block):
     """The numbers' places in a figure block: one per top-level \\caption (not in sub-figures, tables
     or algorithms inside it), counted the way _number_figures counts them."""
@@ -3218,6 +3237,7 @@ def latex_to_markdown(tex_path, tmp_dir, pdf=None):
     # sharing info (e.g. \newtheorem{cor}[thm]{Corollary}).
     source_dir = os.path.dirname(tex_path)
     raw = _inline_inputs(raw, source_dir)
+    raw = _split_side_by_side(raw)
     if pdf:
         raw = _crop_drawn_figures(raw, source_dir, pdf)
     raw = _render_pstex_figures(raw, source_dir)
