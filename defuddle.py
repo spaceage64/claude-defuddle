@@ -3334,6 +3334,7 @@ def _pdf_to_markdown(pdf_path, convert_path):
                             images_dict[os.path.basename(img_file)] = base64.b64encode(f.read()).decode()
                     except Exception:
                         pass
+            _fix_mislabelled_figures(images_dict, convert_path)
             return markdown, images_dict, 'marker'
 
     used = {'precise': False}   # the mode the last local marker run used
@@ -3628,6 +3629,57 @@ def _pdf_scanned_share(path):
     return sum(a >= 0.6 * w * h for a in covered.values()) / pages if pages else 0.0
 
 
+def _jpeg_components(data):
+    """The number of colour components in a JPEG's frame header (SOF), or None."""
+    i = 2
+    while i + 9 < len(data) and data[i] == 0xFF:
+        marker = data[i + 1]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return data[i + 9]
+        i += 2 + int.from_bytes(data[i + 2:i + 4], 'big')
+    return None
+
+
+def _mislabelled_jpegs(path):
+    """{page: [JPEG bytes]} for photos whose PDF colour space has a different number of components
+    than the JPEG itself (an RGB JPEG labelled as CMYK): every renderer trusts the label and draws
+    black or a striped picture repeated side by side, while the JPEG on its own is fine."""
+    try:
+        rows = subprocess.run(['pdfimages', '-list', path], capture_output=True, text=True, timeout=120).stdout.splitlines()[2:]
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    suspects = {}   # page -> [(num, comp)]
+    for r in rows:
+        c = r.split()
+        if len(c) > 8 and c[2] == 'image' and c[8] == 'jpeg' and c[6].isdigit():
+            suspects.setdefault(int(c[0]), []).append((int(c[1]), int(c[6])))
+    found = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for page, images in suspects.items():
+            subprocess.run(['pdfimages', '-f', str(page), '-l', str(page), '-j', '-p', path, os.path.join(tmp, 'i')],
+                           capture_output=True, timeout=120)
+            for num, comp in images:
+                p = os.path.join(tmp, f'i-{page:03d}-{num:03d}.jpg')
+                if os.path.exists(p):
+                    with open(p, 'rb') as f:
+                        data = f.read()
+                    if _jpeg_components(data) not in (None, comp):
+                        found.setdefault(page, []).append(data)
+    return found
+
+
+def _fix_mislabelled_figures(images_dict, path):
+    """Marker's figures of the photos _mislabelled_jpegs finds, replaced by the JPEGs themselves (when a
+    page has as many marker pictures as such photos, matched in order)."""
+    for page, jpegs in _mislabelled_jpegs(path).items():
+        names = sorted((n for n in images_dict if re.match(rf'_page_{page - 1}_(?:Picture|Figure)_\d+\.', n)),
+                       key=lambda n: int(re.search(r'_(\d+)\.\w+$', n).group(1)))
+        if len(names) == len(jpegs):
+            for name, data in zip(names, jpegs):
+                images_dict[name] = base64.b64encode(data).decode()
+                print(f'figure {name}: the PDF mislabels its colours, used the photo itself', file=sys.stderr)
+
+
 def _pdf_needs_precise(path):
     """Whether marker should read this PDF with full-page OCR (MARKER_PRECISE = 'auto'), and why.
     Full-page OCR is what lets marker find inline math (it re-reads only lines OCR marked as math),
@@ -3774,6 +3826,7 @@ _QUOTE_DEBRIS = re.compile(r"^\s*['’‘\"]{1,3}(?:\s+['’‘\"]{1,3})?\s*,?\s
 
 
 _CONFUSABLE = str.maketrans({'l': '1', 'I': '1', '|': '1', 'O': '0', 'o': '0', '’': "'", '‘': "'", '“': '"', '”': '"'})
+_STRAIGHT_QUOTES = str.maketrans({'’': "'", '‘': "'", '“': '"', '”': '"'})   # code never has typeset quotes
 
 
 def correct_code_from_pdf(md, pdf_path):
@@ -3796,9 +3849,10 @@ def correct_code_from_pdf(md, pdf_path):
             fence = not fence
         elif fence and len(line.strip()) >= 8 and squash(line) not in exact:
             pdf_line = lookalike.get(squash(line).translate(_CONFUSABLE))
-            if pdf_line and squash(pdf_line) != squash(line):
+            good = squash(pdf_line or '').translate(_STRAIGHT_QUOTES)
+            if pdf_line and good != squash(line):
                 # Swap only the look-alike characters; the note's spacing stays (the PDF's can be off)
-                chars, good = list(line), iter(squash(pdf_line))
+                chars, good = list(line), iter(good)
                 for n, ch in enumerate(chars):
                     if not ch.isspace():
                         chars[n] = next(good)
