@@ -2111,16 +2111,23 @@ def _expand_simple_macros(content):
     return content
 
 
-def _inline_inputs(content, source_dir, depth=0):
+def _inline_inputs(content, source_dir, depth=0, dirs=None):
     """Replace \\input/\\include of .tex files in the source folder with their text, so figures and
-    labels in separate files are numbered together."""
+    labels in separate files are numbered together. Also found in the folders of \\graphicspath
+    (which a paper can make \\input's search path too)."""
+    if dirs is None:
+        m = re.search(r'^[^%\n]*\\graphicspath\{((?:\{[^}]*\})+)\}', content, re.MULTILINE)
+        dirs = [''] + (re.findall(r'\{([^}]*)\}', m.group(1)) if m else [])
+    root = os.path.realpath(source_dir)
     def _sub(m):
         name = m.group(2).strip()
-        path = os.path.realpath(os.path.join(source_dir, name if name.endswith('.tex') else name + '.tex'))
-        if depth >= 5 or not path.startswith(os.path.realpath(source_dir) + os.sep) or not os.path.isfile(path):
+        name = name if name.endswith('.tex') else name + '.tex'
+        path = next((p for p in (os.path.realpath(os.path.join(source_dir, d, name)) for d in dirs)
+                     if p.startswith(root + os.sep) and os.path.isfile(p)), None)
+        if depth >= 5 or not path:
             return m.group(0)
         with open(path, encoding='utf-8', errors='replace') as f:
-            return m.group(1) + _inline_inputs(f.read(), source_dir, depth + 1)
+            return m.group(1) + _inline_inputs(f.read(), source_dir, depth + 1, dirs)
     return re.sub(r'^([^%\n]*)\\(?:input|include)\{([^}]+)\}', _sub, content, flags=re.MULTILINE)
 
 
@@ -2418,14 +2425,35 @@ def _algorithms(tex):
     return re.sub(r'\\begin\{algorithmic\}.*?\\end\{algorithmic\}', fix, tex, flags=re.S)   # outside a float
 
 
+def _alltt(tex):
+    """alltt (code with LaTeX commands in it, e.g. bold keywords) -> lstlisting: the commands' text kept,
+    escaped characters plain, so the code becomes a fenced code block like any listing (C when its
+    lines end in ';', else text)."""
+    def plain(m):
+        code = m.group(1)
+        for _ in range(3):           # nested \textbf{\emph{…}}
+            code = re.sub(r'\\(?:textbf|textit|texttt|textrm|textsf|emph|underline|mbox|text|textcolor\{[^{}]*\})'
+                          r'\{((?:[^{}]|\\[{}])*)\}', r'\1', code)
+        code = re.sub(r'\$\\(gg|ll|ge|le|neq)\$', lambda e: {'gg': '>>', 'll': '<<', 'ge': '>=', 'le': '<=', 'neq': '!='}[e.group(1)], code)
+        code = re.sub(r'\\textbackslash(?:\{\})?', '\\\\', code)
+        code = re.sub(r'\\(?:textasciitilde|~)(?:\{\})?', '~', code)
+        code = re.sub(r'\\\^(?:\{\})?', '^', code)
+        code = re.sub(r'\\([{}_%&#$])', r'\1', code)
+        code = re.sub(r'^\s*\\(?:small|footnotesize|scriptsize|normalsize)\s*$\n?', '', code, flags=re.M)
+        language = 'c' if re.search(r';\s*$', code, re.M) else 'text'
+        return f'\\begin{{lstlisting}}[language={language}]' + code + '\\end{lstlisting}'
+    return re.sub(r'\\begin\{alltt\}(.*?)\\end\{alltt\}', plain, tex, flags=re.S)
+
+
 def _listing_figures(tex):
-    """A figure that holds program code (lstlisting, \\lstinputlisting, verbatim, minted) and no image ->
-    the code with its caption after it as a paragraph, '**Figure N.** caption': pandoc writes a code
-    block inside a figure as HTML, which the figure clean-up can't keep. A one-cell table around the
-    code (\\begin{tabular}{c}) goes too."""
+    """A figure that holds program code (lstlisting, \\lstinputlisting, verbatim, minted) or a table and
+    no image -> the code or table with its caption after it as a paragraph, '**Figure N.** caption':
+    pandoc writes them inside a figure as HTML, which the figure clean-up can't keep. A one-cell table
+    around code (\\begin{tabular}{c}) goes too. (A table drawn as a diagram is cut from the PDF first.)"""
     def fix(m):
         body = m.group(2)
-        if '\\includegraphics' in body or not re.search(r'\\begin\{(?:lstlisting|verbatim|minted)\}|\\lstinputlisting', body):
+        code = re.search(r'\\begin\{(?:lstlisting|verbatim|minted)\}|\\lstinputlisting', body)
+        if '\\includegraphics' in body or not (code or '\\begin{tabular' in body):
             return m.group(0)
         caption = ''
         if c := re.search(r'\\caption(?:\[[^\]]*\])?(?=\{)', body):
@@ -2433,7 +2461,9 @@ def _listing_figures(tex):
             if end > 0:
                 caption = body[c.end() + 1:end - 1].strip()
                 body = body[:c.start()] + body[end:]
-        body = re.sub(r'\\label\{[^}]*\}|\\begin\{tabular\}\{[^}]*\}|\\end\{tabular\}', '', body)
+        body = re.sub(r'\\label\{[^}]*\}|\\(?:begin|end)\{minipage\}(?:\[[^\]]*\])?(?:\{[^{}]*\})?', '', body)
+        if code:
+            body = re.sub(r'\\begin\{tabular\}\{[^}]*\}|\\end\{tabular\}', '', body)
         caption = re.sub(r'^Figure (\d+)\.\s*', r'\\textbf{Figure \1.} ', caption)
         return body + (f'\n\n{caption}\n\n' if caption else '')
     return re.sub(r'\\begin\{figure(\*?)\}(?:\[[^\]]*\])?(.*?)\\end\{figure\1\}', fix, tex, flags=re.S)
@@ -2441,7 +2471,7 @@ def _listing_figures(tex):
 
 def _preprocess_latex(content):
     """Preprocess LaTeX so pandoc can parse it without choking."""
-    content = _algorithms(_listing_figures(_unwrap_subfigures(_ieee_commands(content))))
+    content = _algorithms(_listing_figures(_alltt(_unwrap_subfigures(_ieee_commands(content)))))
     # Size and alignment environments only change the look; pandoc makes nested ::: blocks of them,
     # which hide what is inside (a table, the bibliography) from the clean-up after it
     content = re.sub(r'\\(?:begin|end)\{(?:tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge|'
@@ -2454,6 +2484,25 @@ def _preprocess_latex(content):
     content = re.sub(r'\\\\(\[\s*-?[\d.]+\s*(?:pt|em|ex|cm|mm|in|bp|pc|sp)\s*\])', r'\\\\', content)   # also \\[-0.3cm]
     # Strip \iffalse...\fi blocks (commented-out code)
     content = re.sub(r'\\iffalse\b.*?\\fi\b', '', content, flags=re.DOTALL)
+    # tcolorbox definitions (#1 in their options stops pandoc); the boxes then pass as plain environments
+    for m in reversed(list(re.finditer(r'\\(?:(?:re)?newtcb\w*|(?:re)?newtcolorbox|(?:New|Renew|Declare|Provide)T(?:ColorBox|CB\w*)|tcbset)\b', content))):
+        i = m.end()
+        while True:
+            rest = content[i:].lstrip()
+            i = len(content) - len(rest)
+            if rest.startswith('['):
+                i = _bracket_end(content, i)
+            elif rest.startswith('{'):
+                end = _braced_end(content, i)
+                i = end
+                if m.group(0) == '\\tcbset' or not re.match(r'\s*[\[{]', content[i:]):
+                    break
+            else:
+                break
+            if i < 0:
+                break
+        if i > 0:
+            content = content[:m.start()] + content[i:]
     # Strip \newtheorem declarations so pandoc does not add its own sequential
     # numbering before our injected \textbf{N} markers.  Counter information is
     # parsed from the *raw* source (before this step) in latex_to_markdown.
@@ -2788,8 +2837,15 @@ def figure_text_callout(labels):
     if not lines:
         return ''
     if len(lines) == 1 and len(lines[0]) <= 160:
-        return f'> [!info] Text in the figure\n> {lines[0]}'
-    return '> [!info]- Text in the figure\n' + '\n'.join(f'> {l}' for l in lines)
+        return f'> [!info] Text in the figure (for AI)\n> {lines[0]}'
+    return '> [!info]- Text in the figure (for AI)\n' + '\n'.join(f'> {l}' for l in lines)
+
+
+def figure_data_callout(lines):
+    """The data of a plot (_pgfplots_data) as a folded callout under the figure."""
+    if not lines:
+        return ''
+    return '> [!info]- Data in the figure (for AI)\n' + '\n'.join(f'> {l}'.rstrip() for l in lines)
 
 
 def _render_pstex(name, source_dir, macros=''):
@@ -2862,14 +2918,308 @@ def _render_pstex_figures(tex, source_dir):
     return re.sub(r'^([^%\n]*)\\input\{([^}]+\.pstex_t)\}', sub, tex, flags=re.MULTILINE)
 
 
-def latex_to_markdown(tex_path, tmp_dir):
-    """Convert LaTeX to Markdown using pandoc (gfm output, markxiv approach)."""
+# ─── Figures drawn in LaTeX ───────────────────────────────────────────────────
+# A figure drawn in the source (TikZ, pgfplots, PSTricks, picture, xymatrix, an xfig .pstex_t) has
+# no image file and pandoc drops it. It is cut from the paper's PDF instead: the drawings above its
+# caption, as a small PDF that becomes a PNG like any PDF figure. Its text for the AI comes from the
+# source where that knows it better (xfig labels, pgfplots data), else from the cut-out PDF.
+
+_FIGURE_DATA = {}   # rendered figure file -> lines of its "Data in the figure" callout (pgfplots)
+_DRAWN = re.compile(r'\\begin\{(tikzpicture|pspicture|picture)\}|\\xymatrix\s*\{|\\input\{[^}]+\.pstex_t\}')
+# A figure of code or an algorithm stays text; any other figure without an image file (also one built
+# from a tabular: a diagram of boxes) is looked for in the PDF, which only finds it when there are
+# drawings above its caption
+_TEXT_FIGURE = re.compile(r'\\begin\{(?:lstlisting|verbatim|Verbatim|alltt|minted|algorithmic|algorithm2e|listing)\}'
+                          r'|\\lstinputlisting|\\inputminted|\\verbatiminput')
+DATA_ROWS_MAX = 30   # a plot with more points is summed up (count and ranges) instead of tabled
+
+_FIGURE_CROP = r'''
+import sys, json, re, collections, pymupdf
+pymupdf.TOOLS.mupdf_display_errors(False)
+src, out_dir, numbers = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+doc = pymupdf.open(src)
+sizes = collections.Counter()
+for page in doc:
+    for b in page.get_text('dict')['blocks']:
+        for l in b.get('lines', []):
+            for sp in l['spans']:
+                sizes[round(sp['size'], 1)] += len(sp['text'])
+body = sizes.most_common(1)[0][0] if sizes else 10
+
+def region_above(page, cap):
+    # the drawings above a caption, with the text between them (sub-captions, labels), up to body text
+    W, H = page.rect.width, page.rect.height
+    left, right = (0, W) if cap.width > 0.55 * W else ((0, W / 2 + 5) if cap.x1 <= W / 2 + 20 else (W / 2 - 5, W))
+    col = right - left
+    inside = lambda r: r.y1 <= cap.y0 + 3 and r.x0 >= left - 5 and r.x1 <= right + 5
+    margin = lambda r: r.y1 < 0.08 * H or r.y0 > 0.92 * H
+    lines = [d for d in page.get_drawings()     # without the rules of a running header or footer
+             if not (margin(d['rect']) and d['rect'].height < 2 and d['rect'].width > 0.3 * W)]
+    items = [(r, 'drawing') for r in page.cluster_drawings(drawings=lines) if inside(r) and not (r.height < 2 and r.width > 0.5 * W)]
+    items += [(pymupdf.Rect(i['bbox']), 'drawing') for i in page.get_image_info() if inside(pymupdf.Rect(i['bbox']))]
+    headers = []
+    for b in page.get_text('dict')['blocks']:
+        r = pymupdf.Rect(b['bbox'])
+        if b['type'] != 0 or not inside(r) or r.y1 > cap.y0 - 1:
+            continue
+        spans = [sp for l in b['lines'] for sp in l['spans'] if sp['text'].strip()]
+        size = max(spans, key=lambda sp: len(sp['text']))['size'] if spans else 0
+        beside = any(d.y0 < r.y1 - 2 and r.y0 + 2 < d.y1 for d, k in items if k == 'drawing')   # at a drawing's height
+        prose = size >= body - 0.3 and not beside
+        prose = prose or re.match(r'\s*(?:Figure|Fig\.?|Table)\s*\d+\s*[.:|\u2014\u2013-]',   # another float's caption
+                                  ''.join(sp['text'] for sp in spans[:3]), re.I) is not None
+        framed = any(d.contains(r) for d, k in items if k == 'drawing')     # text in a drawn box
+        if margin(r) and not any(d.intersects(r) for d, k in items if k == 'drawing'):
+            headers.append(r)                                              # running header or footer
+            continue
+        items.append((r, 'body' if prose and not framed else 'text'))
+    region = None
+    for r, kind in sorted(items, key=lambda it: -it[0].y1):
+        if r.y1 < (region.y0 if region else cap.y0) - 30 or kind == 'body':
+            break
+        region = r if region is None else region | r
+    if region is None or not any(k == 'drawing' and r.intersects(region) for r, k in items) or region.height < 10:
+        return None
+    region = (region + (-3, -3, 3, 3)) & page.rect
+    for h in headers:
+        if h.y1 < 0.5 * H and h.y1 > region.y0:
+            region.y0 = h.y1 + 2             # and the rule under it
+    return region
+
+found = {}
+for n in numbers:
+    pat = re.compile(r'^\s*(?:Figure|Fig\.?)\s*' + str(n) + r'\s*[.:|—–-]', re.I)
+    for page in doc:
+        caps = [pymupdf.Rect(b[:4]) for b in page.get_text('blocks') if b[6] == 0 and pat.match(b[4])]
+        region = next((r for r in (region_above(page, c) for c in caps) if r), None)
+        if region:
+            break
+    if not region:
+        continue
+    out = pymupdf.open()
+    p = out.new_page(width=region.width, height=region.height)
+    p.show_pdf_page(p.rect, doc, page.number, clip=region)
+    path = f'{out_dir}/drawn-figure-{n}.pdf'
+    out.save(path)
+    found[n] = path
+print(json.dumps(found))
+'''
+
+
+def _figure_numbers(block):
+    """The numbers' places in a figure block: one per top-level \\caption (not in sub-figures, tables
+    or algorithms inside it), counted the way _number_figures counts them."""
+    nested = [s.span() for s in re.finditer(r'\\begin\{(subfigure|algorithm\*?|table\*?)\}.*?\\end\{\1\}', block, re.DOTALL)]
+    return [m for m in re.finditer(r'\\caption(?:of\{figure\}|(\*?))(?:\[[^\]]*\])?\{', block)
+            if not m.group(1) and not any(a <= m.start() < b for a, b in nested)]
+
+
+def _option(opts, key):
+    """The value of key=value in a pgfplots option list, braces and outer $…$ kept as LaTeX."""
+    m = re.search(r'(?:^|[,\[\s])' + re.escape(key) + r'\s*=\s*', opts)
+    if not m:
+        return ''
+    i = m.end()
+    if opts[i:i + 1] == '{':
+        end = _braced_end(opts, i)
+        return opts[i + 1:end - 1].strip() if end > 0 else ''
+    return re.match(r'[^,\]]*', opts[i:]).group(0).strip()
+
+
+def _bracket_end(text, i):
+    """Index just after the [...] group opening at text[i] (nested brackets and braces counted)."""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] in '[{':
+            depth += 1
+        elif text[j] in ']}':
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+
+def _number(v):
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
+def _pgfplots_data(block, source_dir):
+    """The data of the pgfplots plots in a figure, as callout lines: axis titles, then the points as a
+    table (one column per plot when they share their x values), a formula with its domain, or the
+    count and ranges of a long series."""
+    lines = []
+    for name, value in re.findall(r'\\def\\(\w+)\{([^{}]*)\}', block):     # \def\xmax{7} in the figure
+        block = re.sub(r'\\' + name + r'(?![A-Za-z])', lambda _: value, block)
+    plain = lambda t: re.sub(r'\\(?:textsc|textbf|textit|emph|text|mathrm)\{([^{}]*)\}', r'\1', t).strip()
+    for ax in re.finditer(r'\\begin\{(axis|semilogxaxis|semilogyaxis|loglogaxis)\}', block):
+        end = block.find('\\end{' + ax.group(1) + '}', ax.end())
+        body = block[ax.end():end if end > 0 else len(block)]
+        opts = ''
+        if body.lstrip().startswith('['):
+            k = body.index('[')
+            close = _bracket_end(body, k)
+            opts, body = body[k:close], body[close:]
+        xlabel, ylabel = _option(opts, 'xlabel'), _option(opts, 'ylabel')
+        legend = [l.strip() for l in _option(opts, 'legend entries').split(',') if l.strip()]
+        m = re.search(r'\\legend\{', body)
+        if m:
+            e = _braced_end(body, m.end() - 1)
+            legend = [l.strip() for l in body[m.end():e - 1].split(',')]
+        plots, i = [], 0
+        for p in re.finditer(r'\\addplot3?\+?', body):
+            if p.start() < i:
+                continue
+            j = p.end()
+            popts = ''
+            while body[j:j + 1].isspace():
+                j += 1
+            if body[j:j + 1] == '[':
+                close = _bracket_end(body, j)
+                popts, j = body[j:close], close
+            rest = body[j:].lstrip()
+            j = len(body) - len(rest)
+            name = ''
+            entry = re.search(r'\\addlegendentry\{([^}]*)\}', body[j:].split('\\addplot')[0])
+            if entry:
+                name = entry.group(1).strip()
+            if rest.startswith('coordinates'):
+                k = rest.index('{')
+                e = _braced_end(rest, k)
+                pts = re.findall(r'\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*(?:,[^()]*)?\)', rest[k:e])
+                plots.append({'name': name, 'points': pts})
+            elif rest.startswith('table'):
+                t = rest[5:].lstrip()
+                topts = ''
+                if t.startswith('['):
+                    close = _bracket_end(t, 0)
+                    topts, t = t[:close], t[close:].lstrip()
+                if t.startswith('{'):
+                    e = _braced_end(t, 0)
+                    arg = t[1:e - 1].strip()
+                    path = os.path.realpath(os.path.join(source_dir, arg))
+                    text = arg
+                    if '\n' not in arg and path.startswith(os.path.realpath(source_dir) + os.sep) and os.path.isfile(path):
+                        with open(path, encoding='utf-8', errors='replace') as f:
+                            text = f.read()
+                    rows = [re.split(r'[\s,;]+', l.strip()) for l in text.replace('\\\\', '\n').splitlines()
+                            if l.strip() and not l.lstrip().startswith(('%', '#'))]
+                    head = rows[0] if rows and not all(_number(v) is not None for v in rows[0]) else None
+                    rows = rows[1:] if head else rows
+                    cols = head or []
+                    xi = cols.index(_option(topts, 'x')) if _option(topts, 'x') in cols else 0
+                    yi = cols.index(_option(topts, 'y')) if _option(topts, 'y') in cols else 1
+                    pts = [(r[xi], r[yi]) for r in rows if len(r) > max(xi, yi)]
+                    plots.append({'name': name, 'points': pts})
+            elif rest.startswith('{'):
+                e = _braced_end(rest, 0)
+                dom = lambda key: _option(popts, key) or _option(opts, key)
+                plots.append({'name': name, 'formula': rest[1:e - 1].strip(), 'three': p.group(0).startswith('\\addplot3'),
+                              'domain': dom('domain'), 'ydomain': dom('y domain')})
+            i = j
+        if not plots:
+            continue
+        xlabel, ylabel = plain(xlabel), plain(ylabel)
+        for k, p in enumerate(plots):
+            p['name'] = plain(p['name'] or (legend[k] if k < len(legend) else f'Plot {k + 1}' if len(plots) > 1 else ''))
+        if lines:
+            lines.append('')                                # the next plot area in the figure
+        if xlabel or ylabel:
+            lines.append(' · '.join(x for x in [f'x-axis: {xlabel}' if xlabel else '', f'y-axis: {ylabel}' if ylabel else ''] if x))
+        for p in plots:
+            if 'formula' in p:
+                ranges = [f', {v} from {d.split(":")[0].strip()} to {d.split(":")[1].strip()}'
+                          for v, d in (('x', p['domain']), ('y', p['ydomain'] if p['three'] else '')) if ':' in d]
+                lines.append((f"{p['name']}: " if p['name'] else '') + ('z' if p['three'] else 'y')
+                             + f" = {p['formula']}" + ''.join(ranges))
+        series = [p for p in plots if p.get('points')]
+        xs = [x for x, _ in series[0]['points']] if series else []
+        if series and all([x for x, _ in p['points']] == xs for p in series) and len(xs) <= DATA_ROWS_MAX:
+            lines += ['', '| ' + ' | '.join([xlabel or 'x'] + [p['name'] or ylabel or 'y' for p in series]) + ' |',
+                      '|' + '---|' * (len(series) + 1)]
+            lines += ['| ' + ' | '.join([x] + [p['points'][r][1] for p in series]) + ' |' for r, x in enumerate(xs)]
+        else:
+            for p in series:
+                pts = p['points']
+                if len(pts) <= DATA_ROWS_MAX:
+                    lines += ['', f"{p['name']}:", ''] if p['name'] else ['']
+                    lines += [f"| {xlabel or 'x'} | {ylabel or 'y'} |", '|---|---|']
+                    lines += [f'| {x} | {y} |' for x, y in pts]
+                else:
+                    nx = [v for v in (_number(x) for x, _ in pts) if v is not None]
+                    ny = [v for v in (_number(y) for _, y in pts) if v is not None]
+                    lines += ['', f"{p['name'] + ': ' if p['name'] else ''}{len(pts)} points" + (f', x from {min(nx):g} to {max(nx):g}' if nx else '')
+                                 + (f', y from {min(ny):g} to {max(ny):g}' if ny else '')]
+    return [l for l in lines if l is not None]
+
+
+def _crop_drawn_figures(tex, source_dir, pdf):
+    """Figures drawn in the source (see _DRAWN) -> \\includegraphics of the figure cut from the paper's
+    PDF; pdf() gives the PDF's path (downloaded on first use) or None. A figure that can't be found
+    in the PDF is left as it is (xfig figures are then typeset by _render_pstex_figures)."""
+    tex = re.sub(r'^[ \t]*%.*\n', '', tex, flags=re.MULTILINE)          # as _number_figures counts
+    tex = re.sub(r'\\iffalse\b.*?\\fi\b', '', tex, flags=re.DOTALL)
+    blocks, count = [], 0
+    for m in re.finditer(r'\\begin\{figure(\*?)\}.*?\\end\{figure\1\}', tex, re.DOTALL):
+        caps = _figure_numbers(m.group(0))
+        if len(caps) == 1 and not _TEXT_FIGURE.search(m.group(0)) and \
+                ('\\includegraphics' not in m.group(0) or _DRAWN.search(m.group(0))):   # a picture inside a drawing
+            blocks.append((count + 1, m.span()))
+        count += len(caps)
+    path = pdf() if blocks and shutil.which('uv') else None
+    if not path:
+        return tex
+    out_dir = tempfile.mkdtemp(dir=source_dir)
+    try:
+        r = subprocess.run(['uv', 'run', '--no-project', '--quiet', '--with', 'pymupdf', 'python', '-c', _FIGURE_CROP,
+                            path, out_dir, json.dumps([n for n, _ in blocks])], capture_output=True, text=True, timeout=600)
+        crops = json.loads(r.stdout or '{}')
+    except (subprocess.SubprocessError, ValueError):
+        crops = {}
+    for n, (a, b) in reversed(blocks):
+        crop = crops.get(str(n))
+        png = f'drawn-figure-{n}.png'
+        if not crop or not _rasterize(crop, 'pdf', os.path.join(source_dir, png)):
+            continue
+        block = tex[a:b]
+        pstex = re.search(r'\\input\{([^}]+\.pstex_t)\}', block)
+        source = ''
+        if pstex:
+            try:
+                with open(os.path.join(source_dir, pstex.group(1).strip()), encoding='utf-8', errors='replace') as f:
+                    source = f.read()
+            except OSError:
+                pass
+        _FIGURE_LABELS[png] = figure_labels(crop, source or None)
+        _FIGURE_DATA[png] = _pgfplots_data(block, source_dir)
+        # the figure is now the image with its caption and labels (the drawing code, sub-figures and
+        # macros are in the image)
+        cap = _figure_numbers(block)[0]
+        end = _braced_end(block, cap.end() - 1)
+        caption = block[cap.start():end] if end > 0 else ''
+        env = re.match(r'\\begin\{(figure\*?)\}(\[[^\]]*\])?', block)
+        labels = ''.join(re.findall(r'\\label\{[^}]+\}', block))
+        block = (f'{env.group(0)}\n\\centering\n\\includegraphics{{{png}}}\n{caption}{labels}\n'
+                 f'\\end{{{env.group(1)}}}')
+        tex = tex[:a] + block + tex[b:]
+        print(f'Figure {n}: drawn in LaTeX, cut from the PDF', file=sys.stderr)
+    shutil.rmtree(out_dir, ignore_errors=True)   # the cut-out PDFs would count as figures of the source
+    return tex
+
+
+def latex_to_markdown(tex_path, tmp_dir, pdf=None):
+    """Convert LaTeX to Markdown using pandoc (gfm output, markxiv approach). pdf: a function giving the
+    paper's PDF (downloaded on first use), for figures drawn in LaTeX (_crop_drawn_figures)."""
     with open(tex_path, encoding='utf-8', errors='replace') as f:
         raw = f.read()
     # Parse \newtheorem BEFORE preprocessing strips them, to preserve counter-
     # sharing info (e.g. \newtheorem{cor}[thm]{Corollary}).
     source_dir = os.path.dirname(tex_path)
     raw = _inline_inputs(raw, source_dir)
+    if pdf:
+        raw = _crop_drawn_figures(raw, source_dir, pdf)
     raw = _render_pstex_figures(raw, source_dir)
     macros = _source_macros(raw, source_dir)
     nt_data = _parse_newtheorem(raw)
@@ -4954,6 +5304,8 @@ def _convert_simple_tables(md):
                     out.append('')
                     out.append(lines[i].strip())
                     i += 1
+                elif i < len(lines):
+                    out.append('')          # no caption: the next paragraph keeps its blank line
                 continue
         out.append(line)
         i += 1
@@ -4962,6 +5314,8 @@ def _convert_simple_tables(md):
 def fix_paper_markdown(md, latex=False):
     """Sanitise pandoc markdown output for Obsidian compatibility.
     latex: the markdown comes from LaTeX source, so an image's alt text is the figure caption."""
+    # Code fences with pandoc attributes (``` {.c language="c"}) -> ``` c
+    md = re.sub(r'^([ \t]*`{3,})[ \t]*\{\.([\w+#-]+)[^}\n]*\}[ \t]*$', r'\1 \2', md, flags=re.MULTILINE)
     # 0. Convert standalone $\eqref{label}$ / $\ref{label}$ to plain (label) —
     #    Obsidian MathJax does not support \eqref and renders (???)
     md = re.sub(r'\$\\(?:eqref|ref)\{([^}]+)\}\$', r'(\1)', md)
@@ -5032,11 +5386,17 @@ def fix_paper_markdown(md, latex=False):
         found = [s for s in srcs if _FIGURE_LABELS.get(s.strip())]
         text = figure_text_callout([(f'({chr(97 + srcs.index(s))})' if len(srcs) > 1 else '', _FIGURE_LABELS[s.strip()])
                                     for s in found]) if latex else ''
-        return '\n' + '\n\n'.join(x for x in [images, *captions, text] if x) + '\n'
+        data = '\n\n'.join(figure_data_callout(_FIGURE_DATA.get(s.strip()))
+                             for s in srcs if _FIGURE_DATA.get(s.strip())) if latex else ''
+        return '\n' + '\n\n'.join(x for x in [images, *captions, text, data] if x) + '\n'
     md = re.sub(r'<figure[^>]*>.*?</figure>', _figure_to_md, md, flags=re.DOTALL)
     if latex:
-        md = re.sub(r'^!\[(.+)\]\(([^)\n]+)\)(?:\{[^}\n]*\})?[ \t]*$',
-                    lambda m: f'![]({m.group(2)})\n\n{_caption_md(m.group(1))}', md, flags=re.MULTILINE)
+        def _image_md(m):
+            src = m.group(2).strip()
+            extra = [figure_text_callout([('', _FIGURE_LABELS[src])]) if _FIGURE_LABELS.get(src) else '',
+                     figure_data_callout(_FIGURE_DATA.get(src))]
+            return '\n\n'.join(x for x in [f'![]({m.group(2)})', _caption_md(m.group(1)), *extra] if x)
+        md = re.sub(r'^!\[(.+)\]\(([^)\n]+)\)(?:\{[^}\n]*\})?[ \t]*$', _image_md, md, flags=re.MULTILINE)
     # Pandoc attributes after an image: ![](a.png){#fig:a width="\\linewidth"}
     md = re.sub(r'(!\[[^\n]*?\]\([^)\n]*\))\{[^}\n]*\}', r'\1', md)
     # Stray <embed> outside a <figure> (e.g. a PDF figure inside a table)
@@ -5757,7 +6117,16 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                     if doi:
                         meta['doi'] = doi
                     print('Converting LaTeX → Markdown via pandoc...', file=sys.stderr)
-                    content = latex_to_markdown(tex_path, tmp_dir)
+                    arxiv_pdf = []
+                    def _arxiv_pdf():
+                        # the paper's PDF, for figures drawn in LaTeX: downloaded once, when needed
+                        if not arxiv_pdf:
+                            path = os.path.join(tmp_dir, 'arxiv.pdf')
+                            ctype, _ = curl_pdf(f'https://arxiv.org/pdf/{arxiv_id}', path, 60)
+                            arxiv_pdf.append(path if 'pdf' in ctype.lower() and os.path.isfile(path)
+                                             and os.path.getsize(path) > 1000 else None)
+                        return arxiv_pdf[0]
+                    content = latex_to_markdown(tex_path, tmp_dir, _arxiv_pdf)
                     if content:
                         content = fix_paper_markdown(content, latex=True)
                         method  = 'arxiv'

@@ -178,7 +178,8 @@ A concise AI-generated summary of the article's key points...
 | poppler | Sharp arXiv PDF figures (200 dpi); reads PDF text for the shadow library check; renders PDF pages to re-read broken formulas | `brew install poppler` |
 | Node.js | Checks formulas with MathJax (installed automatically into `~/.cache/defuddle/mathjax` on first use) | `brew install node` |
 | Ghostscript | Renders EPS figures of arXiv papers (skipped with a warning without it) | `brew install ghostscript` |
-| [uv](https://docs.astral.sh/uv/) | Runs PyMuPDF in isolation for PDF compression | `brew install uv` |
+| [uv](https://docs.astral.sh/uv/) | Runs PyMuPDF in isolation for PDF compression, and to cut figures drawn in LaTeX from an arXiv paper's PDF | `brew install uv` |
+| [Tectonic](https://tectonic-typesetting.github.io/) | Typesets xfig figures (`.pstex_t`) of arXiv papers when they can't be cut from the PDF | `brew install tectonic` |
 
 **Images:**
 
@@ -288,6 +289,10 @@ Times are from an Apple Silicon Mac. The setting has no effect on Datalab, or on
 **Several links at once.** Pass several links in one command and each runs in its own process. They all start at once (up to `FETCH_JOBS`, default 16) to fetch their paper or page, so every browser tab for a PDF you have to save opens at the start of the batch: save them all in one go and walk away. Converting then runs `PARALLEL_JOBS` at a time (default 4). A PDF you save before its link asks for it is still found, since every PDF saved after the batch started counts. Mostly the waiting (downloads, AI calls, the shadow library) overlaps, so a batch of papers finishes roughly 2–3× faster. Local marker runs one at a time, though: each run loads its own models (several GB) and they all share one GPU, so the other links wait for it while their other steps go on. It runs at the lowest CPU priority (`MARKER_NICE = 19`) with at most `MARKER_THREADS` CPU threads (default 4), so the computer stays usable during a batch. `--filename`, `--doi`, `--as`, `--pages` and `--method` can be given once for every link or once per link in the same order (`''` = none for that link), so a batch with its own names still runs as one command: `defuddle.py a.pdf b.pdf --filename name-a --filename name-b`.
 
 **Paper figures.** For arXiv papers converted from LaTeX, figures are collected from every subfolder (e.g. `figures/`) and matched by path, file name or name without extension (as `\includegraphics` often omits it). PDF and EPS figures are rendered at 200 dpi and saved as PNG or JPG; figures made of several sub-figures keep all of them.
+
+**Figures drawn in LaTeX.** A figure without an image file, drawn in the source with TikZ, pgfplots, PSTricks, `picture`, `xymatrix` or as an xfig `.pstex_t`, is cut from the paper's arXiv PDF (downloaded only when needed): PyMuPDF finds its caption ("Figure 3:"), takes the drawings above it with their labels and sub-captions, stopping at body text, another caption or the running header, and the area is rendered at 200 dpi. A figure that can't be found that way is left out; an xfig figure is then typeset with Tectonic. Figures of code (also `alltt`, with its bold keywords and colours dropped) or algorithms stay text, as code blocks below their caption's place; a figure that is a plain table without drawn lines becomes a markdown table.
+
+**Figure text for the AI.** Under a figure goes what an AI (or search) can't see in the image, in callouts titled "(for AI)": *Text in the figure* holds its labels (an xfig figure's LaTeX labels with their place, such as the points along its horizontal axis; otherwise the text of the PDF or EPS figure), and *Data in the figure* holds a pgfplots plot's data from the source: the axis titles, the points as a table with one column per plot (up to `DATA_ROWS_MAX`, 30, points; a longer series as its count and ranges), and a plotted formula with its domain. One line is shown as a normal callout, more as a folded one.
 
 **Shadow library.** Set `SHADOW_BASE_URL` to use one for paywalled papers (`''` disables it). It needs to support this URL format: `https://example.domain/10.1103/PhysRevB.57.6107`
 
