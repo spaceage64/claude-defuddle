@@ -69,10 +69,10 @@ ENABLE_PODCAST  = True
 ENABLE_PAPER    = True
 ENABLE_PDF      = True   # Enables plain PDF URL support
 # ║                                                                              ║
-# ║  Shadow library — Optional shadow library base URL for paywalled papers      ║
+# ║  Shadow — Optional shadow base URL for paywalled papers      ║
 # ║  (e.g. https://sci-hub.example). Set to '' to disable.                       ║
 SHADOW_BASE_URL = ''
-# ║  Downloads folder — watched for the PDF you save from the shadow library.    ║
+# ║  Downloads folder — watched for the PDF you save from the shadow.    ║
 # ║  '' = the system default (macOS, Windows, Linux XDG). Example: '~/Downloads' ║
 DOWNLOADS_DIR = ''
 # ║  Seconds to wait for that PDF before giving up; 0 = wait until it appears.   ║
@@ -3134,7 +3134,7 @@ _SHADOW_SITE = re.compile(r'sci-?hub|libgen|library\.lol|annas-archive|z-lib|zli
 
 def _known_site(url):
     """' (site)' for a page's site in progress messages: arxiv.org, rfc-editor.org, a publisher; '' for a
-    shadow library (SHADOW_BASE_URL's site, or one of the known ones), which the messages leave out."""
+    shadow (SHADOW_BASE_URL's site, or one of the known ones), which the messages leave out."""
     host = urlparse(url or '').netloc.lower().removeprefix('www.')
     shadow = urlparse(SHADOW_BASE_URL or '').netloc.lower().removeprefix('www.')
     if not host or (shadow and (host == shadow or host.endswith('.' + shadow))) or _SHADOW_SITE.search(host):
@@ -3142,10 +3142,10 @@ def _known_site(url):
     return f' ({host})'
 
 
-def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
-    """Open the shadow library page (or another page: url, label) in the browser and wait for the user to save the PDF.
+def wait_for_shadow_pdf(doi, title='', url=None, label='shadow'):
+    """Open the shadow page (or another page: url, label) in the browser and wait for the user to save the PDF.
 
-    Shadow libraries sit behind JavaScript browser checks (e.g. DDoS-Guard) that curl
+    Shadows sit behind JavaScript browser checks (e.g. DDoS-Guard) that curl
     can't pass, so the download happens in the user's browser. Returns the path of the
     new PDF in the downloads folder whose first pages show this DOI (or title), or None
     after SHADOW_WAIT (0: no limit). PDFs of other papers are skipped, so several runs can wait at
@@ -5744,7 +5744,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 print('Trying direct PDF download...', file=sys.stderr)
                 pdf_path = fetch_doi_pdf(doi, tmp_dir)
             if not pdf_path and doi:
-                # A free copy (OpenAlex) before the shadow library: a direct PDF link, else the
+                # A free copy (OpenAlex) before the shadow: a direct PDF link, else the
                 # free page in the browser (publishers like ams.org block scripts)
                 free_pdfs, free_page = openalex_free(doi)
                 for link in free_pdfs:
@@ -5773,7 +5773,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 if SHADOW_BASE_URL:
                     pdf_path = wait_for_shadow_pdf(doi, meta.get('title', ''))
                 else:
-                    print('Paper is not publicly accessible and no shadow library is configured (set SHADOW_BASE_URL).', file=sys.stderr)
+                    print('Paper is not publicly accessible and no shadow is configured (set SHADOW_BASE_URL).', file=sys.stderr)
             if not pdf_path and not content:
                 print('Could not retrieve PDF.', file=sys.stderr)
                 return '', {}, {}
@@ -8179,7 +8179,7 @@ def parse_args(argv):
                         help='max audio bitrate in kbps, e.g. 64 or 64k; 0 = video without sound '
                              '(implies --download; default: highest)')
     parser.add_argument('--doi', action='append', default=None,
-                        help='PDFs: the paper\'s DOI when it is known (e.g. a PDF saved from a shadow library); '
+                        help='PDFs: the paper\'s DOI when it is known (e.g. a PDF saved from a shadow); '
                              'saves it as a paper without searching')
     parser.add_argument('--pages', action='append', default=None, metavar='FIRST-LAST',
                         help='PDFs: convert only these pages, e.g. 305-393 (1-based, as in a PDF viewer); '
@@ -8230,7 +8230,7 @@ def parse_args(argv):
 
 
 def route_academia(url, args):
-    """Academia.edu: save the page's PDF, or continue with the paper's DOI through the shadow library.
+    """Academia.edu: save the page's PDF, or continue with the paper's DOI through the shadow.
     Returns (url to continue with or None when done, the paper's DOI if found)."""
     print('Detected Academia.edu page — extracting PDF URL...', file=sys.stderr)
     pdf_url, academia_doi = extract_academia_pdf_url(url)
@@ -8248,7 +8248,7 @@ def route_academia(url, args):
             save_original_pdf(save_dir, filename, source=pdf_url)
         return None, academia_doi
     if ENABLE_PAPER and academia_doi and SHADOW_BASE_URL:
-        print(f'PDF not publicly available — trying shadow library for DOI {academia_doi}...', file=sys.stderr)
+        print(f'PDF not publicly available — trying shadow for DOI {academia_doi}...', file=sys.stderr)
         # Continue with the paper pipeline
         return SHADOW_BASE_URL.rstrip('/') + '/' + academia_doi, academia_doi
     msg = 'PDF requires login.'
@@ -8260,7 +8260,7 @@ def route_academia(url, args):
 
 
 def paper_url(url, raw_url):
-    """Rewrite paper links (SSRN, arXiv PDF/HTML, publisher and index pages, shadow library,
+    """Rewrite paper links (SSRN, arXiv PDF/HTML, publisher and index pages, shadow,
     doi.org variants) to the form the paper pipeline expects. Returns None to stop."""
     if not ENABLE_PAPER:
         return url
@@ -8288,13 +8288,13 @@ def paper_url(url, raw_url):
             print('Paper page detected but no DOI found (the site may block scripts); '
                   'pass the DOI link instead. Reading it as an article...', file=sys.stderr)
 
-    # Normalize shadow library URLs to canonical doi.org form
+    # Normalize shadow URLs to canonical doi.org form
     if is_shadow_url(url):
         doi_part = extract_doi_from_shadow(url)
         if doi_part:
             url = f'https://doi.org/{doi_part}'
         else:
-            print('Shadow library URL detected but no DOI found in path.', file=sys.stderr)
+            print('Shadow URL detected but no DOI found in path.', file=sys.stderr)
 
     # Normalize doi.org URLs to canonical form (strip dx., www., etc.)
     if 'doi.org' in url and 'arxiv.org' not in url:
@@ -8305,7 +8305,7 @@ def paper_url(url, raw_url):
 
 
 def save_paper(url, args, academia_doi=None, pdf_file=None, converted=None, pdf_source=None):
-    """Academic papers (DOI / arXiv / shadow library) → papers/. pdf_file and converted reuse a PDF
+    """Academic papers (DOI / arXiv / shadow) → papers/. pdf_file and converted reuse a PDF
     and its conversion that the caller already has; pdf_source is where that PDF came from."""
     if read_only(args):
         note, _, _ = build_paper(url, None, args.created, pdf_file=pdf_file, converted=converted)
@@ -8315,7 +8315,7 @@ def save_paper(url, args, academia_doi=None, pdf_file=None, converted=None, pdf_
     note, images_dict, meta = build_paper(url, args.project, args.created, pdf_file=pdf_file, converted=converted)
     if not note:
         if academia_doi:
-            print(f'Paper not found in shadow library either. Download the PDF manually and pass the local file location to defuddle. DOI: {academia_doi}', file=sys.stderr)
+            print(f'Paper not found in shadow either. Download the PDF manually and pass the local file location to defuddle. DOI: {academia_doi}', file=sys.stderr)
         return
     note, book = as_book(note, args, None if pdf_file is None else pdf_file, meta)
     filename = book_filename(args, note) if book else paper_filename(args, meta)

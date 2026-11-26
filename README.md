@@ -175,7 +175,7 @@ A concise AI-generated summary of the article's key points...
 | [marker-pdf](https://github.com/VikParuchuri/marker) | Local PDF→Markdown (default); version 2 also needs `llama-server` | `pipx install marker-pdf` and `brew install llama.cpp` |
 | Datalab API key | Cloud PDF→Markdown fallback | [datalab.to](https://datalab.to): free accounts get $10 in credits (roughly 10–15 cents per paper) |
 | tesseract | OCR text layer for scanned PDFs (`OCR_PDF`) | `brew install tesseract` |
-| poppler | Sharp arXiv PDF figures (200 dpi); reads PDF text for the shadow library check; renders PDF pages to re-read broken formulas | `brew install poppler` |
+| poppler | Sharp arXiv PDF figures (200 dpi); reads PDF text for the shadow check; renders PDF pages to re-read broken formulas | `brew install poppler` |
 | Node.js | Checks formulas with MathJax (installed automatically into `~/.cache/defuddle/mathjax` on first use) | `brew install node` |
 | Ghostscript | Renders EPS figures of arXiv papers (skipped with a warning without it) | `brew install ghostscript` |
 | [uv](https://docs.astral.sh/uv/) | Runs PyMuPDF in isolation for PDF compression | `brew install uv` |
@@ -251,7 +251,7 @@ Supported sources:
 - **Paper indexes and preprints** — NBER, PubMed, PMC, Europe PMC, bioRxiv, medRxiv, OpenAlex and Semantic Scholar links are turned into their DOI
 - **RFCs** — rfc-editor.org and IETF links (`/rfc/rfc6298.html`, `.txt`, `/info/rfc6298`, `datatracker.ietf.org/doc/html/rfc6298`) are turned into their DOI and saved as papers: the RFC Editor's HTML becomes markdown with headings, paragraphs, lists, tables drawn with +---+ borders as markdown tables, figures as text blocks, links to other RFCs and links to sections and references inside the note (older and newer RFC formats)
 - **University repositories and other scholarly pages** — any page with Google Scholar meta tags (DSpace, EPrints, Zenodo and most university repositories) goes through the paper pipeline when it names a DOI, or through the PDF pipeline with its PDF link when it doesn't (e.g. theses)
-- **Academia.edu** — `https://www.academia.edu/{id}/...` (public PDF if available, otherwise the shadow library via DOI)
+- **Academia.edu** — `https://www.academia.edu/{id}/...` (public PDF if available, otherwise the shadow via DOI)
 - **Any `.pdf` link** — the first page is scanned for a DOI and sent through the paper pipeline if one is found
 - **A local file** — pass the path to a PDF on your computer
 
@@ -263,7 +263,7 @@ Papers get a note with the abstract, keywords as tags and the bibliography. For 
 4. Looks for a free copy in [OpenAlex](https://openalex.org) (publisher, repository or author version) and downloads it
 5. Works published as a web page instead of a PDF (RFCs, reports, open-access HTML articles): reads the full text from the free page or the DOI's own landing page, through its HTML / Full text / Plain text link or the page itself. A journal article's landing page only counts through such a link, so an abstract page is never saved as the paper
 6. Opens the free copy's page in your browser when that site blocks scripts
-7. Optionally opens a shadow library in your browser for paywalled papers (see below)
+7. Optionally opens a shadow in your browser for paywalled papers (see below)
 
 The PDF processor order is set by `PDF_PROCESSOR` (default `local_first`). To use Datalab, set `DATALAB_API_KEY` (in the script or your keys file).
 
@@ -285,19 +285,19 @@ Times are from an Apple Silicon Mac. The setting has no effect on Datalab, or on
 
 **PDFs without a DOI on them.** Older scans and working papers often don't print their DOI. defuddle then looks for one in the file name (Elsevier `1-s2.0-…-main.pdf`, SSRN `ssrn-….pdf`, arXiv IDs), the PDF's metadata (Elsevier PIIs) and finally Crossref's title search, and only uses a result whose title appears on the PDF's first pages. A local PDF is then converted as a paper with full metadata, without downloading it again. Scans without a text layer are looked up again after conversion, with the OCR'd text. If you already know the DOI, pass `--doi` and no search is needed. If a converted note has under 70% of the words in the PDF's own text layer, the conversion is retried once and otherwise saved with a `WARNING`. It also warns when equation numbers or appendix titles printed in the PDF are missing from the note (a gap in the middle that the word count hides), and when a display equation has unbalanced brackets. Marker's heading levels are tidied up from the section numbering (1., I., A., a), (i), 2.1 …), and bold lines that are section titles become headings.
 
-**Several links at once.** Pass several links in one command and each runs in its own process. They all start at once (up to `FETCH_JOBS`, default 16) to fetch their paper or page, so every browser tab for a PDF you have to save opens at the start of the batch: save them all in one go and walk away. Converting then runs `PARALLEL_JOBS` at a time (default 4). A PDF you save before its link asks for it is still found, since every PDF saved after the batch started counts. Mostly the waiting (downloads, AI calls, the shadow library) overlaps, so a batch of papers finishes roughly 2–3× faster. Local marker runs one at a time, though: each run loads its own models (several GB) and they all share one GPU, so the other links wait for it while their other steps go on. It runs at the lowest CPU priority (`MARKER_NICE = 19`) with at most `MARKER_THREADS` CPU threads (default 4), so the computer stays usable during a batch. `--filename`, `--doi`, `--as`, `--pages` and `--method` can be given once for every link or once per link in the same order (`''` = none for that link), so a batch with its own names still runs as one command: `defuddle.py a.pdf b.pdf --filename name-a --filename name-b`.
+**Several links at once.** Pass several links in one command and each runs in its own process. They all start at once (up to `FETCH_JOBS`, default 16) to fetch their paper or page, so every browser tab for a PDF you have to save opens at the start of the batch: save them all in one go and walk away. Converting then runs `PARALLEL_JOBS` at a time (default 4). A PDF you save before its link asks for it is still found, since every PDF saved after the batch started counts. Mostly the waiting (downloads, AI calls, the shadow) overlaps, so a batch of papers finishes roughly 2–3× faster. Local marker runs one at a time, though: each run loads its own models (several GB) and they all share one GPU, so the other links wait for it while their other steps go on. It runs at the lowest CPU priority (`MARKER_NICE = 19`) with at most `MARKER_THREADS` CPU threads (default 4), so the computer stays usable during a batch. `--filename`, `--doi`, `--as`, `--pages` and `--method` can be given once for every link or once per link in the same order (`''` = none for that link), so a batch with its own names still runs as one command: `defuddle.py a.pdf b.pdf --filename name-a --filename name-b`.
 
 **Paper figures.** For arXiv papers converted from LaTeX, figures are collected from every subfolder (e.g. `figures/`) and matched by path, file name or name without extension (as `\includegraphics` often omits it). PDF and EPS figures are rendered at 200 dpi and saved as PNG or JPG; figures made of several sub-figures keep all of them.
 
-**Shadow library.** Set `SHADOW_BASE_URL` to use one for paywalled papers (`''` disables it). It needs to support this URL format: `https://example.domain/10.1103/PhysRevB.57.6107`
+**Shadow.** Set `SHADOW_BASE_URL` to use one for paywalled papers (`''` disables it). It needs to support this URL format: `https://example.domain/10.1103/PhysRevB.57.6107`
 
 ```python
-SHADOW_BASE_URL = 'https://your-shadow-library.example'
+SHADOW_BASE_URL = 'https://your-shadow.example'
 DOWNLOADS_DIR   = ''    # '' = system default; set a path if your browser saves elsewhere
 SHADOW_WAIT     = 600   # seconds to wait for the PDF; 0 = no limit (wait until you save it)
 ```
 
-Shadow libraries usually sit behind a browser check (e.g. DDoS-Guard) that scripts can't pass, so defuddle opens the paper's page in your browser and watches your downloads folder: save the PDF there and processing continues on its own. Only a PDF whose first pages show the paper's DOI (or, failing that, its title) is used, so downloads of other papers are skipped and several runs can wait at once. The DOI may be misread by OCR (O for 0, l for 1) or printed only as its part after the prefix (an Elsevier PII), and a title cut off after most of its words still counts. When a PDF is skipped, defuddle prints the command to pass it in by hand with `--doi`, in case it is the paper after all. Text is read with `pdftotext` (poppler), PyMuPDF via `uv`, or a raw byte scan as a last resort. The PDF stays in your downloads folder.
+Shadows usually sit behind a browser check (e.g. DDoS-Guard) that scripts can't pass, so defuddle opens the paper's page in your browser and watches your downloads folder: save the PDF there and processing continues on its own. Only a PDF whose first pages show the paper's DOI (or, failing that, its title) is used, so downloads of other papers are skipped and several runs can wait at once. The DOI may be misread by OCR (O for 0, l for 1) or printed only as its part after the prefix (an Elsevier PII), and a title cut off after most of its words still counts. When a PDF is skipped, defuddle prints the command to pass it in by hand with `--doi`, in case it is the paper after all. Text is read with `pdftotext` (poppler), PyMuPDF via `uv`, or a raw byte scan as a last resort. The PDF stays in your downloads folder.
 
 The default downloads folder is `~/Downloads` on macOS, the Downloads known folder on Windows (also when it was moved), and `xdg-user-dir DOWNLOAD` on Linux (falling back to `~/Downloads`). Partial downloads (`.crdownload`, `.part`, `.download`) are ignored until they finish.
 
