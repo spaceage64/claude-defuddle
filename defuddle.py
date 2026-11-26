@@ -5735,7 +5735,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 # free page in the browser (publishers like ams.org block scripts)
                 free_pdfs, free_page = openalex_free(doi)
                 for link in free_pdfs:
-                    print(f'Trying free copy ({urlparse(link).netloc})...', file=sys.stderr)
+                    print('Trying a free copy...', file=sys.stderr)
                     pdf_path = _download_pdf(link, tmp_dir)
                     if pdf_path:
                         break
@@ -5747,7 +5747,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
                 if not free_page or free_page.lower().rstrip('/') != landing.lower():
                     pages.append((landing, meta.get('type') not in _ARTICLE_TYPES))
                 for page, allow_self in pages if not pdf_path else []:
-                    print(f'Looking for the full text on {urlparse(page).netloc}...', file=sys.stderr)
+                    print('Looking for the full text as a web page...', file=sys.stderr)
                     web = fulltext_from_page(page, allow_self)
                     if web:
                         print(f'Full text found as a web page: {web["url"]}', file=sys.stderr)
