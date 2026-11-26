@@ -3129,12 +3129,17 @@ def _pdf_matches(text, doi, title):
     least = max(6, -(-len(words) * 3 // 5))   # a cut-off title: its first 60% of words, at least 6
     return any(_title_words_in(' '.join(words[:k]), text) for k in range(len(words) - 1, least - 1, -1))
 
+_SHADOW_SITE = re.compile(r'sci-?hub|libgen|library\.lol|annas-archive|z-lib|zlibrary|booksc|1lib|singlelogin|libstc|nexus', re.I)
+
+
 def _known_site(url):
-    """' (arxiv.org)' or ' (rfc-editor.org)' for a page on one of those open archives, for progress
-    messages; '' for any other site, whose name the messages leave out."""
+    """' (site)' for a page's site in progress messages: arxiv.org, rfc-editor.org, a publisher; '' for a
+    shadow library (SHADOW_BASE_URL's site, or one of the known ones), which the messages leave out."""
     host = urlparse(url or '').netloc.lower().removeprefix('www.')
-    site = next((s for s in ('arxiv.org', 'rfc-editor.org') if host == s or host.endswith('.' + s)), '')
-    return f' ({site})' if site else ''
+    shadow = urlparse(SHADOW_BASE_URL or '').netloc.lower().removeprefix('www.')
+    if not host or (shadow and (host == shadow or host.endswith('.' + shadow))) or _SHADOW_SITE.search(host):
+        return ''
+    return f' ({host})'
 
 
 def wait_for_shadow_pdf(doi, title='', url=None, label='shadow library'):
