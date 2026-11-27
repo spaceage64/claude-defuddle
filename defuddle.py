@@ -8,7 +8,7 @@ Usage:
         --url "<url>" --project "<project>" --created "YYYY-MM-DD"
 """
 
-import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64, difflib, gzip
+import sys, json, re, argparse, subprocess, os, html, glob, shutil, shlex, tempfile, time, unicodedata, base64, difflib, gzip, random
 from urllib.parse import urlparse, urlunparse, quote, unquote, urljoin, urlencode
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -1634,15 +1634,22 @@ def crossref_doi_for_pdf(text, hint='', name=''):
             return (named or hits)[0]
     return None
 
-def _crossref(path):
-    """GET a Crossref API path and return its 'message', or None (one retry: it occasionally doesn't answer)."""
-    for attempt in range(2):
+def _crossref(path, max_time=15):
+    """GET a Crossref API path and return its 'message', or None. Retried with a growing, random wait:
+    the public API allows only 3 requests at a time and answers more (a batch's parallel runs) with
+    429 Too Many Requests, without a Retry-After; it also occasionally doesn't answer."""
+    for attempt in range(6):
         try:
-            r = curl(f'https://api.crossref.org/{path}')
-            return json.loads(r.stdout.decode('utf-8', errors='replace'))['message']
+            r = curl(f'https://api.crossref.org/{path}', '-H', 'User-Agent: defuddle/1.0 (mailto:user@example.com)',
+                     '-w', '\n%{http_code}', max_time=max_time)
+            body, _, status = r.stdout.decode('utf-8', errors='replace').rpartition('\n')
+            if status in ('400', '404'):   # unknown DOI or bad query: asking again won't help
+                return None
+            return json.loads(body)['message']
         except Exception:
-            if attempt == 0:
-                time.sleep(2)
+            if attempt < 5:
+                time.sleep(min(2 ** attempt, 10) * (0.5 + random.random()))
+    print(f'Crossref did not answer for {path}', file=sys.stderr)
     return None
 
 def _get_json(url):
@@ -1925,9 +1932,9 @@ def get_paper_metadata(doi):
     if arxiv_id:
         return _get_paper_metadata_arxiv(arxiv_id)
     try:
-        result = curl(f'https://api.crossref.org/works/{doi}', '-H', 'User-Agent: defuddle/1.0 (mailto:user@example.com)', max_time=10)
-        data = json.loads(result.stdout.decode('utf-8', errors='replace'))
-        work = data.get('message', {})
+        work = _crossref(f'works/{doi}', max_time=10)
+        if not isinstance(work, dict):
+            return {}
         title = title_case(_crossref_text(' '.join(work.get('title', ['']))))
         # Crossref keeps a subtitle apart ('Coz' + 'finding code that counts with causal profiling')
         subtitle = title_case(_crossref_text(' '.join(work.get('subtitle') or [])))
