@@ -107,10 +107,14 @@ KEEP_PDF = False
 # ║  and images downloaded at the same time for one note.                        ║
 # ║  FETCH_JOBS: links that start at once to fetch their paper or page, so every ║
 # ║  browser tab for a PDF you have to save opens at the start of a batch. The   ║
-# ║  converting then runs PARALLEL_JOBS at a time.                               ║
+# ║  converting then runs PARALLEL_JOBS at a time, counted over every defuddle   ║
+# ║  run on this computer (batches started one after another share the turns).   ║
+# ║  MIN_FREE_MEMORY: % of the computer's memory that must be free before a      ║
+# ║  conversion or a marker run starts; it waits until there is (0 = no check).  ║
 PARALLEL_JOBS = 4
 FETCH_JOBS    = 16
 IMAGE_JOBS    = 6
+MIN_FREE_MEMORY = 25
 # ║                                                                              ║
 # ║  Datalab — converts paper PDFs to markdown via cloud API.                    ║
 # ║  Get key at https://datalab.to — free accounts get $10 in credits.           ║
@@ -133,7 +137,7 @@ MARKER_PRECISE = False
 # ║  marker's load on the Mac: MARKER_NICE = CPU priority (0 normal – 19 lowest, ║
 # ║  so other work goes first); MARKER_THREADS = CPU threads per marker run      ║
 # ║  (0 = torch's default, all performance cores). Links in one batch run        ║
-# ║  marker one at a time either way.                                            ║
+# ║  marker one at a time (all defuddle runs on this computer) either way.       ║
 MARKER_NICE = 19
 MARKER_THREADS = 4
 # ║                                                                              ║
@@ -3526,6 +3530,7 @@ def wait_for_shadow_pdf(doi, title='', url=None, label='shadow'):
     Partial downloads (.crdownload, .part, .download) are ignored; the file is left in place.
     """
     import webbrowser
+    _release_slot()   # no converting while waiting for the user; build_paper takes a slot again
     url    = url or f'{SHADOW_BASE_URL.rstrip("/")}/{doi}'
     folder = downloads_dir()
     if not os.path.isdir(folder):
@@ -3849,6 +3854,7 @@ def _run_marker(cmd, timeout=4 * 3600):
             fcntl.flock(lock, fcntl.LOCK_EX)
     except (ImportError, OSError):   # Windows, or no cache folder: run without waiting
         pass
+    _wait_for_memory('marker run')
     env = {**os.environ, **({k: str(MARKER_THREADS) for k in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')}
                             if MARKER_THREADS else {})}
     nice = (lambda: os.nice(MARKER_NICE)) if MARKER_NICE and hasattr(os, 'nice') else None
@@ -6227,7 +6233,7 @@ def build_paper(url, project, created, pdf_file=None, converted=None):
             if not pdf_path and not content:
                 print('Could not retrieve PDF.', file=sys.stderr)
                 return '', {}, {}
-        _processing_slot()   # in a batch: the paper is here, now wait for a turn to convert it
+        _processing_slot()   # the paper is here, now wait for a turn to convert it
         if not content and pdf_path:
             content, images_dict, method = converted or pdf_to_markdown(pdf_path)
             with open(pdf_path, 'rb') as f:
@@ -7753,41 +7759,84 @@ PER_LINK = (('--filename', 'filename', None), ('--method', 'method', METHODS), (
             ('--pages', 'pages', None), ('--as', 'as_type', ('doc', 'paper', 'book')))
 
 
-_SLOT = None   # this process's processing slot in a batch: an open file it holds a lock on
+_SLOT = None   # this process's processing slot: an open file it holds a lock on
 
 
 def _processing_slot():
-    """In a batch, wait for one of its PARALLEL_JOBS processing slots before the heavy work. Links
-    all start at once to fetch their paper or page (browser tabs open at the start), then convert a
-    few at a time. Outside a batch, or without fcntl (Windows), this returns at once."""
+    """Wait for one of the PARALLEL_JOBS processing slots before the heavy work, then for enough
+    free memory (MIN_FREE_MEMORY). The slots are shared by every defuddle run on this computer, so
+    batches started one after another, and single links, still convert PARALLEL_JOBS at a time.
+    Links in a batch all start at once to fetch their paper or page (browser tabs open at the start)
+    and only then take a slot. Without fcntl (Windows) only the memory check applies."""
     global _SLOT
-    slots, folder = int(os.environ.get('DEFUDDLE_SLOTS') or 0), os.environ.get('DEFUDDLE_SLOT_DIR')
-    if _SLOT or not slots or not folder:
+    if _SLOT:
         return
     try:
         import fcntl
-    except ImportError:
-        return
+        folder = os.path.join(os.path.expanduser('~/.cache/defuddle'), 'slots')
+        os.makedirs(folder, exist_ok=True)
+    except (ImportError, OSError):
+        folder = None
     told = False
-    while True:
-        for i in range(slots):
+    while folder and not _SLOT:
+        for i in range(max(1, PARALLEL_JOBS)):
             f = open(os.path.join(folder, f'slot-{i}'), 'w')
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                _SLOT = f   # held until this process ends
-                return
+                _SLOT = f   # held until this process ends or _release_slot
+                break
             except BlockingIOError:
                 f.close()
-        if not told:
-            print('Waiting for a free processing slot...', file=sys.stderr, flush=True)
-            told = True
-        time.sleep(2)
+        else:
+            if not told:
+                print('Waiting for a free processing slot (other defuddle runs are converting)...',
+                      file=sys.stderr, flush=True)
+                told = True
+            time.sleep(2)
+    _wait_for_memory()
+
+
+def _release_slot():
+    """Give this process's processing slot back (e.g. while it waits for a browser download)."""
+    global _SLOT
+    if _SLOT:
+        _SLOT.close()   # closing the file drops its lock
+        _SLOT = None
+
+
+def _free_memory_percent():
+    """Share of the computer's memory that is free for new work, in %, or None when unknown."""
+    try:
+        if sys.platform == 'darwin':   # the figure macOS's memory pressure is based on
+            out = subprocess.run(['sysctl', '-n', 'kern.memorystatus_level'], capture_output=True,
+                                 text=True, timeout=5).stdout
+            return int(out.strip())
+        with open('/proc/meminfo') as f:
+            info = {k: int(v.split()[0]) for k, v in (line.split(':', 1) for line in f)}
+        return 100 * info['MemAvailable'] // info['MemTotal']
+    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def _wait_for_memory(what='conversion'):
+    """Wait until MIN_FREE_MEMORY % of memory is free, so heavy work doesn't push the computer into
+    swap. Says so once, and every 5 minutes while it keeps waiting."""
+    if not MIN_FREE_MEMORY:
+        return
+    start, said = time.time(), None
+    while (free := _free_memory_percent()) is not None and free < MIN_FREE_MEMORY:
+        minutes = int((time.time() - start) // 300) * 5
+        if said != minutes:
+            print(f'Waiting for free memory before the {what}: {free}% free, {MIN_FREE_MEMORY}% needed'
+                  + (f' ({minutes} min so far)' if minutes else '') + '...', file=sys.stderr, flush=True)
+            said = minutes
+        time.sleep(10)
 
 
 def run_batch(urls, argv, per_link=None):
     """Process several links, each in its own defuddle process: up to FETCH_JOBS start at once and
     fetch their paper or page (so browser tabs for PDFs to save open at the start), and the
-    converting runs PARALLEL_JOBS at a time (_processing_slot).
+    converting runs PARALLEL_JOBS at a time over all defuddle runs (_processing_slot).
     per_link: {option: values} for the PER_LINK options, one value for every link or one per link.
     Progress lines are prefixed with the link's number; each link's output follows when it is done."""
     per_link = per_link or {}
@@ -7798,13 +7847,11 @@ def run_batch(urls, argv, per_link=None):
             skip = False
         elif a in own_opts:
             skip = True
-        elif not a.startswith(tuple(o + '=' for o in own_opts)) and a not in urls:
-            rest.append(a)
+        elif not a.startswith(tuple(o + '=' for o in own_opts)) and doi_link(a) not in urls:
+            rest.append(a)   # (a plain DOI is in urls as its doi.org link)
     print(f'Processing {len(urls)} links: fetching all at once, converting {PARALLEL_JOBS} at a time...',
           file=sys.stderr, flush=True)
-    slot_dir = tempfile.mkdtemp(prefix='defuddle-slots-')
-    env = {**os.environ, 'DEFUDDLE_SLOTS': str(max(1, PARALLEL_JOBS)), 'DEFUDDLE_SLOT_DIR': slot_dir,
-           'DEFUDDLE_BATCH_START': str(time.time())}
+    env = {**os.environ, 'DEFUDDLE_BATCH_START': str(time.time()), 'DEFUDDLE_BATCH_CHILD': '1'}
 
     opened, lock = [], threading.Lock()   # DOIs whose page a link opened in the browser
     def one(n, url):
@@ -7835,7 +7882,6 @@ def run_batch(urls, argv, per_link=None):
             codes.append(code)
             print(f'\n=== [{n}] {url}{"" if code == 0 else f" (failed, exit {code})"} ===')
             print(out.strip())
-    shutil.rmtree(slot_dir, ignore_errors=True)
     return 0 if all(c == 0 for c in codes) else 1
 
 
@@ -9175,6 +9221,8 @@ def main(argv=None):
     if args.project and not args.category:   # an existing project folder saves under its category
         args.category = project_category(args.project)
     if len(args.urls) > 1:
+        if os.environ.get('DEFUDDLE_BATCH_CHILD'):   # never a batch inside a batch: that multiplies
+            sys.exit(f'Error: a batch link was given {len(args.urls)} links: {" ".join(args.urls)}')
         sys.exit(run_batch(args.urls, argv, args.per_link))
     raw_url = args.urls[0]
 
