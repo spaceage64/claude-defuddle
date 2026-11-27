@@ -1592,6 +1592,19 @@ def _title_on_pages(title, text):
     key = re.sub(r'[^a-z0-9]', '', _slug(title or ''))
     return len(key) >= 15 and key in re.sub(r'[^a-z0-9]', '', _slug(text or ''))
 
+def _crossref_hit_on_pages(item, text):
+    """True when a Crossref search result is this PDF: its title is on the pages, and a short title
+    (under 4 words, like the book chapters 'Table of Contents' or 'Frequently Asked Questions', which
+    any manual carries) only with one of its authors' surnames on the pages too."""
+    title = _crossref_text(' '.join(item.get('title') or []))
+    if not _title_on_pages(title, text):
+        return False
+    if len([w for w in re.findall(r'[a-z0-9]+', _slug(title)) if len(w) > 1]) >= 4:
+        return True
+    page = set(re.findall(r'[a-z0-9]+', _slug(text or '')))
+    return any(len(s) > 2 and s in page for a in item.get('author') or []
+               for s in re.findall(r'[a-z0-9]+', _slug(a.get('family', ''))))
+
 def crossref_doi_for_pdf(text, hint='', name=''):
     """DOI for a PDF without a printed one: search Crossref with its title (or first-page
     text) and accept a result only if that result's title appears on the PDF's first pages.
@@ -1623,9 +1636,8 @@ def crossref_doi_for_pdf(text, hint='', name=''):
                 return doi
     clean_hint = '' if re.match(r'(PII|DOI)\b', hint or '', re.I) else hint
     for query in dict.fromkeys(q for q in (clean_hint, re.sub(r'\s+', ' ', text or '')[:300]) if q and q.strip()):
-        msg = _crossref(f'works?query.bibliographic={quote(query)}&rows=5&select=DOI,title')
-        hits = [item['DOI'] for item in (msg or {}).get('items', [])
-                if _title_on_pages(_crossref_text(' '.join(item.get('title') or [])), text)]
+        msg = _crossref(f'works?query.bibliographic={quote(query)}&rows=5&select=DOI,title,author')
+        hits = [item['DOI'] for item in (msg or {}).get('items', []) if _crossref_hit_on_pages(item, text)]
         if hits:
             # Several versions (working paper, journal article): prefer the one whose DOI
             # ends in the file name, e.g. hhx084.pdf -> 10.1093/rfs/hhx084
@@ -6482,6 +6494,19 @@ def build_pdf(url, project, created, skip_doi=False):
     if title_match:
         title = title_match.group(1).strip()
         content = content[title_match.end():].lstrip('\n')
+        # A cover title set over several lines in different sizes becomes several headings
+        # ('Web API Specification for the' / 'OTC Reporting Facility' / 'File Downloads - ORF'):
+        # the next heading belongs to it while it ends in a word no title ends with, and so does one
+        # right after that continuation in the same size
+        level = None
+        while True:
+            nxt = re.match(r'(#{1,6})\s+(.+)\n*', content)
+            dangling = re.search(r'\b(?:the|a|an|of|for|and|or|to|in|on|with|from|by|at)$|[-–&:,]$', title, re.I)
+            if not nxt or not (dangling or nxt.group(1) == level):
+                break
+            level = nxt.group(1)
+            title = f'{title} {nxt.group(2).strip()}'
+            content = content[nxt.end():]
     else:
         title = pdf_title or re.sub(r'[-_]+', ' ', os.path.splitext(pdf_name)[0]).strip()
     title = clean_heading_text(title)
