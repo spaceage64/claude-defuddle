@@ -1587,6 +1587,17 @@ def _pdf_meta_title(path, raw=False):
         return ''
     return title
 
+def _pdf_first_line_title(path):
+    """The first line of the PDF's text layer when it reads like a title (2–15 words, no closing full stop,
+    not a page number, date or link), or ''. Marker can drop a title at the top of a page as a page header
+    ('Nasdaq’s List of Fifth Character Symbol Suffixes')."""
+    line = next((l.strip() for l in _pdf_first_pages_text(path).splitlines() if l.strip()), '')
+    words = line.split()
+    if not 2 <= len(words) <= 15 or line.endswith('.') or re.search(r'https?://|www\.|@|^page\b|^\d', line, re.I) \
+            or len(re.findall(r'\d', line)) > 6:   # a stamp or reference number ('Release 2002/01/11 : CIA-RDP84-…')
+        return ''
+    return line if any(len(w) >= 4 and w.isalpha() for w in words) else ''
+
 def _title_on_pages(title, text):
     """True when this title appears in the text (letters and digits only, so line breaks don't matter)."""
     key = re.sub(r'[^a-z0-9]', '', _slug(title or ''))
@@ -6453,6 +6464,7 @@ def build_pdf(url, project, created, skip_doi=False):
         first_page = b' '.join(re.findall(rb'[\x20-\x7e]{4,}', raw)).decode('ascii', errors='ignore')
         doi = extract_doi_from_pdf_text(first_page)
         pdf_title = _pdf_meta_title(pdf_path)
+        first_line = _pdf_first_line_title(pdf_path)
         if not doi and not skip_doi:
             # Text layer of the first pages (raw bytes are usually compressed), then Crossref
             text = _pdf_first_pages_text(pdf_path)
@@ -6508,7 +6520,9 @@ def build_pdf(url, project, created, skip_doi=False):
             title = f'{title} {nxt.group(2).strip()}'
             content = content[nxt.end():]
     else:
-        title = pdf_title or re.sub(r'[-_]+', ' ', os.path.splitext(pdf_name)[0]).strip()
+        # The first line of the text layer when the conversion dropped it (marker took it for a page header)
+        dropped = first_line and _slug(first_line) not in _slug(' '.join(content.split()[:60]))
+        title = pdf_title or (first_line if dropped else '') or re.sub(r'[-_]+', ' ', os.path.splitext(pdf_name)[0]).strip()
     title = clean_heading_text(title)
 
     words = len(content.split())

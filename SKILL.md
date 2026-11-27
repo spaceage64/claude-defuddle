@@ -15,6 +15,7 @@ python3 ~/.claude/skills/defuddle/defuddle.py "<url>" ["<url2>" ...]
 
 > [!important] Several links → one command
 > Pass all links — and local PDF paths — to **one** `defuddle.py` call. The script runs them in parallel (`PARALLEL_JOBS` at a time, default 4, shared by all defuddle runs, and only while enough memory is free) and prints each link's output under `=== [n] url ===`. Never loop over links in the shell or start them one after another, not even to give each its own name or DOI: `--filename`, `--doi`, `--as`, `--pages` and `--method` can be given once per link (see below). For papers and batches, run that one command in the background.
+> Never filter its output (`| grep saved`, `| tail -2`): the `WARNING:` lines (incomplete conversion, missing pages, skipped PDFs) only reach the user through you. Read the full output, or save it to a log and check that for `WARNING` too.
 
 Use the output to answer the user's question or complete the task. The script automatically detects the source type (article, YouTube, podcast, paper) and handles fetching accordingly. For articles, it falls back to a Googlebot fetch and archived copies (Wayback Machine, archive.is, Arquivo.pt, Common Crawl) if the page is JS-rendered, paywalled or shows an error page ("Page Not Found", "Page Not Available", ...).
 
